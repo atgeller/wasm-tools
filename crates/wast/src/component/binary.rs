@@ -59,7 +59,7 @@ fn encode_core_type(encoder: CoreTypeEncoder, ty: &CoreTypeDef) {
         CoreTypeDef::Def(core::TypeDef::Func(f)) => {
             encoder.function(
                 f.params.iter().map(|(_, _, ty)| (*ty).into()),
-                f.results.iter().copied().map(Into::into),
+                f.results.iter().map(|(_, _, ty)| (*ty).into()),
             );
         }
         CoreTypeDef::Def(core::TypeDef::Struct(_)) | CoreTypeDef::Def(core::TypeDef::Array(_)) => {
@@ -716,7 +716,7 @@ impl From<&ModuleType<'_>> for wasm_encoder::ModuleType {
                 ModuleTypeDecl::Type(t) => match &t.def {
                     core::TypeDef::Func(f) => encoded.ty().function(
                         f.params.iter().map(|(_, _, ty)| (*ty).into()),
-                        f.results.iter().copied().map(Into::into),
+                        f.results.iter().map(|(_, _, ty)| (*ty).into()),
                     ),
                     core::TypeDef::Struct(_) | core::TypeDef::Array(_) => {
                         todo!("encoding of GC proposal types not yet implemented")

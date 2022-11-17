@@ -56,6 +56,371 @@ impl<'a> Peek for ValType<'a> {
     }
 }
 
+/// An indexed type
+#[allow(missing_docs)]
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct IndexedType<'a> {
+    t: ValType<'a>,
+    alpha: Id<'a>,
+}
+
+impl<'a> Parse<'a> for IndexedType<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        parser.parens(|p: Parser| {
+            let t = p.parse::<ValType>()?;
+            let alpha = p.parse::<Id>()?;
+            Ok(Self {t, alpha} )
+        })
+    }
+}
+
+impl<'a> Peek for IndexedType<'a> {
+    fn peek(cursor: Cursor<'_>) -> bool {
+        if let Some(next) = cursor.lparen() {
+            return ValType::peek(next) && Id::peek2(next)
+        }
+
+        false
+    }
+
+    fn display() -> &'static str {
+        "indexed type"
+    }
+}
+
+macro_rules! index_expr {
+    (pub enum $enum:ident {
+        $(
+            $name:ident $(($($arg:tt)*))? : [$($binary:tt)*] : $instr:tt,
+        )*
+    }) => (
+        /// A listing of all WebAssembly instructions that can be in a module
+        /// that this crate currently parses.
+        #[allow(missing_docs)]
+        #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+        pub enum $enum {
+            $(
+                $name $(( $($arg)* ))?,
+            )*
+        }
+
+        #[allow(non_snake_case)]
+        impl Parse<'_> for $enum {
+            fn parse(parser: Parser) -> Result<Self> {
+                $(
+                    fn $name<'a>(_parser: Parser<'a>) -> Result<$enum> {
+                        Ok($enum::$name $((
+                            $(_parser.parse::<$arg>())*?
+                        ))?)
+                    }
+                )*
+                let parse_remainder = parser.step(|c| {
+                    let (kw, rest) = match c.keyword() {
+                        Some(pair) => pair,
+                        None => return Err(c.error(stringify!(expected an $enum))),
+                    };
+                    match kw {
+                        $($instr => Ok(($name as fn(_) -> _, rest)),)*
+                        _ => return Err(c.error("unknown operator or unexpected token")),
+                    }
+                })?;
+                parse_remainder(parser)
+            }
+        }
+
+        impl Peek for $enum {
+            fn peek(cursor: Cursor<'_>) -> bool {
+                match cursor.keyword() {
+                    $(Some(($instr, _)) => true,)*
+                    _ => false,
+                }
+            }
+
+            fn display() -> &'static str {
+                stringify!(indexed term - $enum)
+            }
+        }
+        /*
+        impl Encode for Instruction<'_> {
+            #[allow(non_snake_case)]
+            fn encode(&self, v: &mut Vec<u8>) {
+                match self {
+                    $(
+                        Instruction::$name $((instructions!(@first x $($arg)*)))? => {
+                            fn encode<'a>($(arg: &instructions!(@ty $($arg)*),)? v: &mut Vec<u8>) {
+                                instructions!(@encode v $($binary)*);
+                                $(<instructions!(@ty $($arg)*) as Encode>::encode(arg, v);)?
+                            }
+                            encode($( instructions!(@first x $($arg)*), )? v)
+                        }
+                    )*
+                }
+            }
+        }*/
+    );
+}
+
+index_expr! {
+    pub enum BinOp {
+        I32Add : [0x6a] : "i32.add",
+        I32Sub : [0x6b] : "i32.sub",
+        I32Mul : [0x6c] : "i32.mul",
+        I32DivS : [0x6d] : "i32.div_s",
+        I32DivU : [0x6e] : "i32.div_u",
+        I32RemS : [0x6f] : "i32.rem_s",
+        I32RemU : [0x70] : "i32.rem_u",
+        I32And : [0x71] : "i32.and",
+        I32Or : [0x72] : "i32.or",
+        I32Xor : [0x73] : "i32.xor",
+        I32Shl : [0x74] : "i32.shl",
+        I32ShrS : [0x75] : "i32.shr_s",
+        I32ShrU : [0x76] : "i32.shr_u",
+        I32Rotl : [0x77] : "i32.rotl",
+        I32Rotr : [0x78] : "i32.rotr",
+        I64Add : [0x7c] : "i64.add",
+        I64Sub : [0x7d] : "i64.sub",
+        I64Mul : [0x7e] : "i64.mul",
+        I64DivS : [0x7f] : "i64.div_s",
+        I64DivU : [0x80] : "i64.div_u",
+        I64RemS : [0x81] : "i64.rem_s",
+        I64RemU : [0x82] : "i64.rem_u",
+        I64And : [0x83] : "i64.and",
+        I64Or : [0x84] : "i64.or",
+        I64Xor : [0x85] : "i64.xor",
+        I64Shl : [0x86] : "i64.shl",
+        I64ShrS : [0x87] : "i64.shr_s",
+        I64ShrU : [0x88] : "i64.shr_u",
+        I64Rotl : [0x89] : "i64.rotl",
+        I64Rotr : [0x8a] : "i64.rotr",
+    }
+}
+
+index_expr! {
+    pub enum RelOp {
+        I32Eq : [0x46] : "i32.eq",
+        I32Ne : [0x47] : "i32.ne",
+        I32LtS : [0x48] : "i32.lt_s",
+        I32LtU : [0x49] : "i32.lt_u",
+        I32GtS : [0x4a] : "i32.gt_s",
+        I32GtU : [0x4b] : "i32.gt_u",
+        I32LeS : [0x4c] : "i32.le_s",
+        I32LeU : [0x4d] : "i32.le_u",
+        I32GeS : [0x4e] : "i32.ge_s",
+        I32GeU : [0x4f] : "i32.ge_u",
+        I64Eq : [0x51] : "i64.eq",
+        I64Ne : [0x52] : "i64.ne",
+        I64LtS : [0x53] : "i64.lt_s",
+        I64LtU : [0x54] : "i64.lt_u",
+        I64GtS : [0x55] : "i64.gt_s",
+        I64GtU : [0x56] : "i64.gt_u",
+        I64LeS : [0x57] : "i64.le_s",
+        I64LeU : [0x58] : "i64.le_u",
+        I64GeS : [0x59] : "i64.ge_s",
+        I64GeU : [0x5a] : "i64.ge_u",
+    }
+}
+
+index_expr! {
+    pub enum UnOp {
+        I32Clz : [0x67] : "i32.clz",
+        I32Ctz : [0x68] : "i32.ctz",
+        I32Popcnt : [0x69] : "i32.popcnt",
+        I64Clz : [0x79] : "i64.clz",
+        I64Ctz : [0x7a] : "i64.ctz",
+        I64Popcnt : [0x7b] : "i64.popcnt",
+    }
+}
+
+index_expr! {
+    pub enum TestOp {
+        I32Eqz : [0x45] : "i32.eqz",
+        I64Eqz : [0x50] : "i64.eqz",
+    }
+}
+
+index_expr! {
+    pub enum Constant {
+        I32Const(i32) : [0x41] : "i32",
+        I64Const(i64) : [0x42] : "i64",
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum IndexTerm<'a> {
+    IBinOp(BinOp, Box<IndexTerm<'a>>, Box<IndexTerm<'a>>),
+    IRelOp(RelOp, Box<IndexTerm<'a>>, Box<IndexTerm<'a>>),
+    ITestOp(TestOp, Box<IndexTerm<'a>>),
+    IUnOp(UnOp, Box<IndexTerm<'a>>),
+    Alpha(Id<'a>),
+    // Alpha will get resolved into one of the following two, they are not parseable ATM
+    Pre(Index<'a>),
+    Post(Index<'a>),
+    Local(Index<'a>),
+    IConstant(Constant)
+}
+
+impl<'a> Parse<'a> for IndexTerm<'a> {
+    #[allow(non_snake_case)]
+    fn parse(parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+        fn IBinOp<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            let bop = _parser.parse::<BinOp>()?;
+            let x = _parser.parse::<IndexTerm>()?;
+            let y = _parser.parse::<IndexTerm>()?;
+            Ok(IndexTerm::IBinOp(bop, Box::new(x),Box::new(y)))
+        }
+        fn IRelOp<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            let rop = _parser.parse::<RelOp>()?;
+            let x = _parser.parse::<IndexTerm>()?;
+            let y = _parser.parse::<IndexTerm>()?;
+            Ok(IndexTerm::IRelOp(rop, Box::new(x),Box::new(y)))
+        }
+        fn ITestOp<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            let testop = _parser.parse::<TestOp>()?;
+            let x = _parser.parse::<IndexTerm>()?;
+            Ok(IndexTerm::ITestOp(testop, Box::new(x)))
+        }
+        fn IUnOp<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            let uop = _parser.parse::<UnOp>()?;
+            let x = _parser.parse::<IndexTerm>()?;
+            Ok(IndexTerm::IUnOp(uop, Box::new(x)))
+        }
+        fn Alpha<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            let id = _parser.parse::<Id>()?;
+            Ok(IndexTerm::Alpha(id))
+        }
+        fn Constant<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            //let vty = _parser.parse::<ValType>()?;
+            let constant = _parser.parse::<Constant>()?;
+            Ok(IndexTerm::IConstant(constant))
+        }
+        fn Local<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            //let vty = _parser.parse::<ValType>()?;
+            _parser.parse::<kw::local>()?;
+            Ok(IndexTerm::Local(_parser.parse()?))
+        }
+
+        if parser.peek::<Id>() {
+            return Alpha(parser);
+        }
+
+        parser.parens(|inner| {
+            //let cursor = inner.cursor();
+
+            if inner.peek::<BinOp>() {
+                return IBinOp(inner);
+            } else if inner.peek::<RelOp>() {
+                return IRelOp(inner);
+            } else if inner.peek::<UnOp>() {
+                return IUnOp(inner);
+            } else if inner.peek::<TestOp>() {
+                return ITestOp(inner);
+            } else if parser.peek::<Constant>() { // This looks blatantly incorrect but works somehow???
+                return Constant(parser);
+            } else if inner.peek::<kw::local>() {
+                return Local(inner);
+            }
+
+            return Err(inner.error("expected index term"))
+        })
+    }
+}
+
+impl<'a> Peek for IndexTerm<'a> {
+    #[allow(non_snake_case)]
+    fn peek(cursor: Cursor<'_>) -> bool {
+        if let Some(_) = cursor.id() {
+            return true
+        }
+
+        if let Some(next) = cursor.lparen() {
+            if let Some(("local", _)) = next.keyword() {
+                return true
+            };
+
+            return BinOp::peek(next) || RelOp::peek(next)
+            || TestOp::peek(next) || UnOp::peek(next)
+            || ValType::peek(next);
+        }
+
+        false
+    }
+
+    fn display() -> &'static str {
+        "index term"
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum Constraint<'a> {
+    Eq(IndexTerm<'a>, IndexTerm<'a>),
+    And(Box<Constraint<'a>>, Box<Constraint<'a>>),
+    Or(Box<Constraint<'a>>, Box<Constraint<'a>>),
+    If(Box<Constraint<'a>>,Box<Constraint<'a>>,Box<Constraint<'a>>),
+    Not(Box<Constraint<'a>>),
+}
+
+impl<'a> Parse<'a> for Constraint<'a> {
+    #[allow(non_snake_case)]
+    fn parse(parser: Parser<'a>) -> Result<Constraint<'a>> {
+        parser.parens(|inner| {
+            let mut l = parser.lookahead1();
+            if l.peek::<kw::eq>() {
+                parser.parse::<kw::eq>()?;
+                let x = parser.parse::<IndexTerm>()?;
+                let y = parser.parse::<IndexTerm>()?;
+                return Ok(Constraint::Eq(x, y));
+            } else if l.peek::<kw::and>() {
+                parser.parse::<kw::and>()?;
+                let x = parser.parse::<Constraint>()?;
+                let y = parser.parse::<Constraint>()?;
+                return Ok(Constraint::And(Box::new(x), Box::new(y)));
+            } else if l.peek::<kw::or>() {
+                parser.parse::<kw::or>()?;
+                let x = parser.parse::<Constraint>()?;
+                let y = parser.parse::<Constraint>()?;
+                return Ok(Constraint::Or(Box::new(x), Box::new(y)));
+            } else if l.peek::<kw::not>() {
+                parser.parse::<kw::not>()?;
+                let x = parser.parse::<Constraint>()?;
+                return Ok(Constraint::Not(Box::new(x)));
+            } else if l.peek::<kw::r#if>() {
+                parser.parse::<kw::r#if>()?;
+                let i = parser.parse::<Constraint>()?;
+                let t = parser.parse::<Constraint>()?;
+                let e = parser.parse::<Constraint>()?;
+                return Ok(Constraint::If(Box::new(i), Box::new(t), Box::new(e)));
+            }
+
+            return Err(inner.error("expected constraint"));
+        })
+    }
+}
+
+impl<'a> Peek for Constraint<'a> {
+    #[allow(non_snake_case)]
+    fn peek(cursor: Cursor<'_>) -> bool {
+
+        if let Some(next) = cursor.lparen() {
+            return match next.keyword() {
+                Some(("eq",_)) => true,
+                Some(("if",_)) => true,
+                Some(("and",_)) => true,
+                Some(("or",_)) => true,
+                Some(("not",_)) => true,
+                _ => false,
+            };
+        }
+
+        false
+    }
+
+    fn display() -> &'static str {
+        "constraint"
+    }
+}
+
 /// A heap type for a reference type
 #[allow(missing_docs)]
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -417,6 +782,131 @@ impl<'a> Parse<'a> for MemoryType {
     }
 }
 
+// TODO: support non-indexed types
+/// A function type with parameters and results.
+#[derive(Clone, Debug, Default)]
+pub struct IndexedFunctionType<'a> {
+    /// The parameters of a function, optionally each having an identifier for
+    /// name resolution and a name for the custom `name` section.
+    pub params: Box<[(Option<Id<'a>>, Option<NameAnnotation<'a>>, ValType<'a>)]>,
+    /// Constraints in the pre-condition
+    pub pre_constraints: Box<[Constraint<'a>]>,
+    /// The results types of a function.
+    pub results: Box<[(Option<Id<'a>>, Option<NameAnnotation<'a>>, ValType<'a>)]>,
+    /// Constraints in the post-condition
+    pub post_constraints: Box<[Constraint<'a>]>,
+}
+
+impl<'a> IndexedFunctionType<'a> {
+    fn finish_parse(&mut self, parser: Parser<'a>) -> Result<()> {
+        let mut params = Vec::from(mem::take(&mut self.params));
+        let mut pre_constraints: Vec<Constraint> = Vec::from(mem::take(&mut self.pre_constraints));
+        let mut results = Vec::from(mem::take(&mut self.results));
+        let mut post_constraints: Vec<Constraint> = Vec::from(mem::take(&mut self.post_constraints));
+    
+        while parser.peek2::<kw::pre>() || parser.peek2::<kw::post>() || parser.peek2::<kw::param>() || parser.peek2::<kw::result>() {
+            parser.parens(|p| {
+                let mut l = p.lookahead1();
+
+                if l.peek::<kw::param>() {
+                    if results.len() > 0 {
+                        return Err(p.error(
+                            "result before parameter (or unexpected token): \
+                             cannot list params after results",
+                        ));
+                    }
+                    p.parse::<kw::param>()?;
+                    if p.is_empty() {
+                        return Ok(());
+                    }
+                    let id = p.parse::<Option<_>>()?;
+                    let name = p.parse::<Option<_>>()?;
+                    let parse_more = id.is_none() && name.is_none();
+                    let ty = p.parse()?;
+                    params.push((id, name, ty));
+                    while parse_more && !p.is_empty() {
+                        params.push((None, None, p.parse()?));
+                    }
+                } else if l.peek::<kw::result>() {
+                    p.parse::<kw::result>()?;
+                    if p.is_empty() {
+                        return Ok(());
+                    }
+                    let id = p.parse::<Option<_>>()?;
+                    let name = p.parse::<Option<_>>()?;
+                    let parse_more = id.is_none() && name.is_none();
+                    let ty = p.parse()?;
+                    results.push((id, name, ty));
+                    while parse_more && !p.is_empty() {
+                        results.push((None, None, p.parse()?));
+                    }
+                } else if l.peek::<kw::pre>() {
+                    p.parse::<kw::pre>()?;
+                    /*p.parens(|inner| {
+                        while let Ok(it) = inner.parse::<IndexedType>() {
+                            params.push(it);
+                        }
+                        Ok(())
+                    })?;*/
+                    while !p.is_empty() {
+                        pre_constraints.push(p.parse()?);
+                    }
+                } else if l.peek::<kw::post>() {
+                    p.parse::<kw::post>()?;
+                    /*p.parens(|inner| {
+                        while !inner.is_empty() {
+                            results.push(inner.parse()?);
+                        }
+                        Ok(())
+                    })?;*/
+                    while !p.is_empty() {
+                        post_constraints.push(p.parse()?);
+                    }
+                } else {
+                    return Err(l.error());
+                };
+                Ok(())
+            })?;
+        }
+        self.params = params.into();
+        self.pre_constraints = pre_constraints.into();
+        self.results = results.into();
+        self.post_constraints = post_constraints.into();
+        Ok(())
+    }
+}
+
+impl<'a> Parse<'a> for IndexedFunctionType<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        let mut ret = IndexedFunctionType {
+            params: Box::new([]),
+            pre_constraints: Box::new([]),
+            results: Box::new([]),
+            post_constraints: Box::new([]),
+        };
+        ret.finish_parse(parser)?;
+        Ok(ret)
+    }
+}
+
+impl<'a> Peek for IndexedFunctionType<'a> {
+    fn peek(cursor: Cursor<'_>) -> bool {
+        if let Some(next) = cursor.lparen() {
+            match next.keyword() {
+                Some(("pre", _)) | Some(("post", _)) | Some(("param", _)) | Some(("result", _)) => return true,
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn display() -> &'static str {
+        "indexed function type"
+    }
+}
+
+// Won't need this once block types are implemented
 /// A function type with parameters and results.
 #[derive(Clone, Debug, Default)]
 pub struct FunctionType<'a> {
@@ -632,7 +1122,7 @@ impl<'a> Parse<'a> for ExportType<'a> {
 #[derive(Debug)]
 pub enum TypeDef<'a> {
     /// A function type definition.
-    Func(FunctionType<'a>),
+    Func(IndexedFunctionType<'a>),
     /// A struct type definition.
     Struct(StructType<'a>),
     /// An array type definition.
@@ -644,7 +1134,8 @@ impl<'a> Parse<'a> for TypeDef<'a> {
         let mut l = parser.lookahead1();
         if l.peek::<kw::func>() {
             parser.parse::<kw::func>()?;
-            Ok(TypeDef::Func(parser.parse()?))
+            let ift = parser.parse::<IndexedFunctionType>()?;
+            Ok(TypeDef::Func(ift.into()))
         } else if l.peek::<kw::r#struct>() {
             parser.parse::<kw::r#struct>()?;
             Ok(TypeDef::Struct(parser.parse()?))
@@ -765,7 +1256,7 @@ impl<'a, T: Peek + Parse<'a>> Parse<'a> for TypeUse<'a, T> {
         };
         let inline = parser.parse()?;
 
-        Ok(TypeUse { index, inline })
+        Ok(TypeUse { index, inline: inline})
     }
 }
 
@@ -774,6 +1265,25 @@ impl<'a> From<TypeUse<'a, FunctionTypeNoNames<'a>>> for TypeUse<'a, FunctionType
         TypeUse {
             index: src.index,
             inline: src.inline.map(|x| x.into()),
+        }
+    }
+}
+
+impl<'a> From<TypeUse<'a, IndexedFunctionType<'a>>> for TypeUse<'a, FunctionType<'a>> {
+    fn from(src: TypeUse<'a, IndexedFunctionType<'a>>) -> TypeUse<'a, FunctionType<'a>> {
+        TypeUse {
+            index: src.index,
+            inline: src.inline.map(|x| x.into()),
+        }
+    }
+}
+
+impl<'a> From<IndexedFunctionType<'a>> for FunctionType<'a> {
+    fn from(src: IndexedFunctionType<'a>) -> FunctionType<'a> {
+
+        FunctionType {
+            params: src.params.clone(),
+            results: src.results.iter().map(|(_,_,vt)| vt.clone()).collect::<Vec<ValType>>().into(),
         }
     }
 }

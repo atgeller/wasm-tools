@@ -1187,7 +1187,7 @@ impl<'a> Instruction<'a> {
 pub struct BlockType<'a> {
     pub label: Option<Id<'a>>,
     pub label_name: Option<NameAnnotation<'a>>,
-    pub ty: TypeUse<'a, FunctionType<'a>>,
+    pub ty: TypeUse<'a, IndexedFunctionType<'a>>,
 }
 
 impl<'a> Parse<'a> for BlockType<'a> {
@@ -1196,7 +1196,7 @@ impl<'a> Parse<'a> for BlockType<'a> {
             label: parser.parse()?,
             label_name: parser.parse()?,
             ty: parser
-                .parse::<TypeUse<'a, FunctionTypeNoNames<'a>>>()?
+                .parse::<TypeUse<'a, IndexedFunctionType<'a>>>()?
                 .into(),
         })
     }
@@ -1418,14 +1418,14 @@ pub struct CallIndirect<'a> {
     /// The table that this call is going to be indexing.
     pub table: Index<'a>,
     /// Type type signature that this `call_indirect` instruction is using.
-    pub ty: TypeUse<'a, FunctionType<'a>>,
+    pub ty: TypeUse<'a, IndexedFunctionType<'a>>,
 }
 
 impl<'a> Parse<'a> for CallIndirect<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let prev_span = parser.prev_span();
         let table: Option<_> = parser.parse()?;
-        let ty = parser.parse::<TypeUse<'a, FunctionTypeNoNames<'a>>>()?;
+        let ty = parser.parse::<TypeUse<'a, IndexedFunctionType<'a>>>()?;
         Ok(CallIndirect {
             table: table.unwrap_or(Index::Num(0, prev_span)),
             ty: ty.into(),

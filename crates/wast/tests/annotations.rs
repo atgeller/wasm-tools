@@ -53,6 +53,25 @@ fn assert_func_name(name: &str, wat: &str) -> anyhow::Result<()> {
 }
 
 #[test]
+fn precheck_annotations() -> anyhow::Result<()> {
+    wat::parse_str(r#"(module (func (param $a i32) (result $b i32) (post (eq $a $b))))"#)?;
+    wat::parse_str(r#"(module (func (param i32 i32) (result $b i32) (post (eq (i32 1) (i32.gt_s $b (i32 0))))))"#)?;
+    wat::parse_str(r#"(module (func (param (@name "foo") i32)))"#)?;
+    Ok(())
+}
+
+#[test]
+fn precheck_block_annotations() -> anyhow::Result<()> {
+    wat::parse_str(r#"(module (func block (param $a i32) (pre (eq $a (i32 0))) drop end))"#)?;
+    wat::parse_str(r#"(module (func (param $a i32) block (param $a i32) (pre (eq $a (local $a))) drop end))"#)?;
+    // Function definitions cannot reference locals
+    //wat::parse_str(r#"(module (func (param $a i32) (pre (eq $a (local $b)))))"#)?;
+    // Not sure this is legal anyway but disallowed
+    //wat::parse_str(r#"(module (type (func (param $a i32) (pre (eq $a (local $b))))) (func (param $b i32) block (type 0) drop end))"#)?;
+    Ok(())
+}
+
+#[test]
 fn local_annotations() -> anyhow::Result<()> {
     assert_local_name("foo", r#"(module (func (param $foo i32)))"#)?;
     assert_local_name("foo", r#"(module (func (local $foo i32)))"#)?;

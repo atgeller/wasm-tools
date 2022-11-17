@@ -25,7 +25,7 @@ pub struct Tag<'a> {
 pub enum TagType<'a> {
     /// An exception tag, where the payload is the type signature of the tag
     /// (constructor parameters, etc).
-    Exception(TypeUse<'a, FunctionType<'a>>),
+    Exception(TypeUse<'a, IndexedFunctionType<'a>>),
 }
 
 /// Different kinds of tags that can be defined in a module.

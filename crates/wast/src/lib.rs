@@ -373,6 +373,11 @@ id! {
 
 /// Common keyword used to parse WebAssembly text files.
 pub mod kw {
+    custom_keyword!(and);
+    custom_keyword!(or);
+    custom_keyword!(not);
+    custom_keyword!(pre);
+    custom_keyword!(post);
     custom_keyword!(after);
     custom_keyword!(alias);
     custom_keyword!(any);

@@ -159,15 +159,15 @@ impl<'a> Expander<'a> {
                     // this doesn't force an empty function type to go into the
                     // type section.
                     None => {
-                        bt.ty.inline = Some(FunctionType::default());
+                        bt.ty.inline = Some(IndexedFunctionType::default());
                         return;
                     }
                 }
                 self.expand_type_use(&mut bt.ty);
-            }
+            }/*
             Instruction::FuncBind(b) => {
                 self.expand_type_use(&mut b.ty);
-            }
+            }*/
             Instruction::CallIndirect(c) | Instruction::ReturnCallIndirect(c) => {
                 self.expand_type_use(&mut c.ty);
             }
@@ -229,8 +229,8 @@ pub(crate) trait TypeKey<'a> {
     fn insert(&self, cx: &mut Expander<'a>, id: Index<'a>);
 }
 
-pub(crate) type FuncKey<'a> = (Box<[ValType<'a>]>, Box<[ValType<'a>]>);
-
+pub(crate) type FuncKey<'a> = (Box<[ValType<'a>]>, Box<[Constraint<'a>]>, Box<[ValType<'a>]>, Box<[Constraint<'a>]>);
+/*
 impl<'a> TypeReference<'a> for FunctionType<'a> {
     type Key = FuncKey<'a>;
 
@@ -238,6 +238,22 @@ impl<'a> TypeReference<'a> for FunctionType<'a> {
         let params = self.params.iter().map(|p| p.2).collect();
         let results = self.results.clone();
         (params, results)
+    }
+
+    fn expand(&mut self, _cx: &mut Expander<'a>) {}
+}*/
+
+impl<'a> TypeReference<'a> for IndexedFunctionType<'a> {
+    type Key = FuncKey<'a>;
+
+    fn key(&self) -> Self::Key {
+        let params = self.params.iter().map(|p| p.2).collect();
+        let results = self
+            .results
+            .iter().
+            map(|(_,_,vt)| vt.clone()).
+            collect();
+        (params, self.pre_constraints.clone(), results, self.post_constraints.clone())
     }
 
     fn expand(&mut self, _cx: &mut Expander<'a>) {}
@@ -249,9 +265,11 @@ impl<'a> TypeKey<'a> for FuncKey<'a> {
     }
 
     fn to_def(&self, _span: Span) -> TypeDef<'a> {
-        TypeDef::Func(FunctionType {
+        TypeDef::Func(IndexedFunctionType {
             params: self.0.iter().map(|t| (None, None, *t)).collect(),
-            results: self.1.clone(),
+            pre_constraints: self.1.clone(),
+            results: self.2.iter().map(|t| (None, None, *t)).collect(),
+            post_constraints: self.3.clone(),
         })
     }
 

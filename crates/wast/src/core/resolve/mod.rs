@@ -4,6 +4,7 @@ use crate::{gensym, Error};
 
 mod deinline_import_export;
 mod names;
+mod index_types;
 pub(crate) mod types;
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
@@ -46,6 +47,9 @@ pub fn resolve<'a>(fields: &mut Vec<ModuleField<'a>>) -> Result<Names<'a>, Error
         }
     }
 
+    // Resolve local variable indices in block type annotations to 
+    index_types::resolve_indices(fields)?;
+
     // Expand all `TypeUse` annotations so all necessary `type` nodes are
     // present in the AST.
     types::expand(fields);
@@ -53,6 +57,7 @@ pub fn resolve<'a>(fields: &mut Vec<ModuleField<'a>>) -> Result<Names<'a>, Error
     // Perform name resolution over all `Index` items to resolve them all to
     // indices instead of symbolic names.
     let resolver = names::resolve(fields)?;
+    fields.iter().for_each(|field| println!("{:?}", field));
     Ok(Names { resolver })
 }
 

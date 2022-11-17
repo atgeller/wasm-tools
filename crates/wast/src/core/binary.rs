@@ -133,6 +133,19 @@ impl Encode for FunctionType<'_> {
     }
 }
 
+impl Encode for IndexedFunctionType<'_> {
+    fn encode(&self, e: &mut Vec<u8>) {
+        self.params.len().encode(e);
+        for (_, _, ty) in self.params.iter() {
+            ty.encode(e);
+        }
+        self.results.len().encode(e);
+        for (_, _, ty) in self.params.iter() {
+            ty.encode(e);
+        }
+    }
+}
+
 impl Encode for StructType<'_> {
     fn encode(&self, e: &mut Vec<u8>) {
         self.fields.len().encode(e);
@@ -181,7 +194,8 @@ impl Encode for Type<'_> {
         match &self.def {
             TypeDef::Func(func) => {
                 e.push(0x60);
-                func.encode(e)
+                let erased: FunctionType = (*func).clone().into();
+                erased.encode(e)
             }
             TypeDef::Struct(r#struct) => {
                 e.push(0x5f);
@@ -633,7 +647,8 @@ impl Encode for BlockType<'_> {
             return e.push(0x40);
         }
         if ty.params.is_empty() && ty.results.len() == 1 {
-            return ty.results[0].encode(e);
+            let (_,_,vt) = ty.results[0];
+            return vt.encode(e);
         }
         panic!("multi-value block types should have an index");
     }

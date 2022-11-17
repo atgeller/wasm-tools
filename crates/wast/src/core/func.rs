@@ -22,7 +22,7 @@ pub struct Func<'a> {
     /// function.
     pub kind: FuncKind<'a>,
     /// The type that this function will have.
-    pub ty: TypeUse<'a, FunctionType<'a>>,
+    pub ty: TypeUse<'a, IndexedFunctionType<'a>>,
 }
 
 /// Possible ways to define a function in the text format.
@@ -55,7 +55,7 @@ impl<'a> Parse<'a> for Func<'a> {
         let (ty, kind) = if let Some(import) = parser.parse()? {
             (parser.parse()?, FuncKind::Import(import))
         } else {
-            let ty = parser.parse()?;
+            let ty: TypeUse<IndexedFunctionType> = parser.parse()?;
             let locals = Local::parse_remainder(parser)?;
             (
                 ty,

@@ -49,7 +49,7 @@ pub struct ItemSig<'a> {
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
 pub enum ItemKind<'a> {
-    Func(TypeUse<'a, FunctionType<'a>>),
+    Func(TypeUse<'a, IndexedFunctionType<'a>>),
     Table(TableType<'a>),
     Memory(MemoryType),
     Global(GlobalType<'a>),

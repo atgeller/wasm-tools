@@ -69,8 +69,13 @@ impl<'a> Resolver<'a> {
         match &ty.def {
             TypeDef::Func(f) => {
                 let params = f.params.iter().map(|p| p.2).collect();
-                let results = f.results.clone();
-                self.type_info.push(TypeInfo::Func { params, results });
+                let results = f.results.iter().map(|r| r.2).collect();
+                self.type_info.push(TypeInfo::Func {
+                    params,
+                    pre_constraints:f.pre_constraints.clone(),
+                    results,
+                    post_constraints: f.post_constraints.clone(),
+                });
             }
             _ => self.type_info.push(TypeInfo::Other),
         }
@@ -447,23 +452,7 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
             }
 
             LocalSet(i) | LocalGet(i) | LocalTee(i) => {
-                assert!(self.scopes.len() > 0);
-                // Resolve a local by iterating over scopes from most recent
-                // to less recent. This allows locals added by `let` blocks to
-                // shadow less recent locals.
-                for (depth, scope) in self.scopes.iter().enumerate().rev() {
-                    if let Err(e) = scope.resolve(i, "local") {
-                        if depth == 0 {
-                            // There are no more scopes left, report this as
-                            // the result
-                            return Err(e);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                // We must have taken the `break` and resolved the local
-                assert!(i.is_resolved());
+                self.resolve_local(i)?;
             }
 
             Call(i) | RefFunc(i) | ReturnCall(i) => {
@@ -475,8 +464,8 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
                 self.resolver.resolve_type_use(&mut c.ty)?;
             }
 
-            FuncBind(b) => {
-                self.resolver.resolve_type_use(&mut b.ty)?;
+            FuncBind(_) => {
+                panic!("FuncBind not supported!");
             }
 
             Let(t) => {
@@ -619,6 +608,27 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
         Ok(())
     }
 
+    fn resolve_local(&self, i: &mut Index<'a>) -> Result<(), Error> {
+        assert!(self.scopes.len() > 0);
+        // Resolve a local by iterating over scopes from most recent
+        // to less recent. This allows locals added by `let` blocks to
+        // shadow less recent locals.
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
+            if let Err(e) = scope.resolve(i, "local") {
+                if depth == 0 {
+                    // There are no more scopes left, report this as
+                    // the result
+                    return Err(e);
+                }
+            } else {
+                break;
+            }
+        }
+        // We must have taken the `break` and resolved the local
+        assert!(i.is_resolved());
+        Ok(())
+    }
+
     fn resolve_label(&self, label: &mut Index<'a>) -> Result<(), Error> {
         let id = match label {
             Index::Num(..) => return Ok(()),
@@ -641,10 +651,13 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
     }
 }
 
+#[derive(Debug)]
 enum TypeInfo<'a> {
     Func {
         params: Box<[ValType<'a>]>,
+        pre_constraints: Box<[Constraint<'a>]>,
         results: Box<[ValType<'a>]>,
+        post_constraints: Box<[Constraint<'a>]>,
     },
     Other,
 }
@@ -654,14 +667,14 @@ trait TypeReference<'a> {
     fn resolve(&mut self, cx: &Resolver<'a>) -> Result<(), Error>;
 }
 
-impl<'a> TypeReference<'a> for FunctionType<'a> {
+impl<'a> TypeReference<'a> for IndexedFunctionType<'a> {
     fn check_matches(&mut self, idx: &Index<'a>, cx: &Resolver<'a>) -> Result<(), Error> {
         let n = match idx {
             Index::Num(n, _) => *n,
             Index::Id(_) => panic!("expected `Num`"),
         };
-        let (params, results) = match cx.type_info.get(n as usize) {
-            Some(TypeInfo::Func { params, results }) => (params, results),
+        let (params, pre_constraints, results, post_constraints) = match cx.type_info.get(n as usize) {
+            Some(TypeInfo::Func { params, pre_constraints, results, post_constraints }) => (params, pre_constraints, results, post_constraints),
             _ => return Ok(()),
         };
 
@@ -685,10 +698,18 @@ impl<'a> TypeReference<'a> for FunctionType<'a> {
                 .iter()
                 .zip(self.params.iter())
                 .any(|(a, (_, _, b))| types_not_equal(a, b))
+            || pre_constraints
+                .iter()
+                .zip(self.pre_constraints.iter())
+                .any(|(a, b)| a != b)
             || results
                 .iter()
                 .zip(self.results.iter())
-                .any(|(a, b)| types_not_equal(a, b));
+                .any(|(a, (_,_,b))| types_not_equal(a, b))
+            || post_constraints
+                .iter()
+                .zip(self.post_constraints.iter())
+                .any(|(a, b)| a != b);
         if not_equal {
             return Err(Error::new(
                 idx.span(),
@@ -704,8 +725,8 @@ impl<'a> TypeReference<'a> for FunctionType<'a> {
         for param in self.params.iter_mut() {
             cx.resolve_valtype(&mut param.2)?;
         }
-        for result in self.results.iter_mut() {
-            cx.resolve_valtype(result)?;
+        for (_,_,vt) in self.results.iter_mut() {
+            cx.resolve_valtype(vt)?;
         }
         Ok(())
     }

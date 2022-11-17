@@ -279,6 +279,32 @@ impl<'a> Parse<'a> for Option<NameAnnotation<'a>> {
     }
 }
 
+/// An `@name` annotation in source, currently of the form `@name "foo"`
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct PrecheckAnnotation<'a> {
+    /// The name specified for the item
+    pub annotation: &'a str,
+}
+
+impl<'a> Parse<'a> for PrecheckAnnotation<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        parser.parse::<annotation::precheck>()?;
+        let annotation = parser.parse()?;
+        Ok(PrecheckAnnotation { annotation })
+    }
+}
+
+impl<'a> Parse<'a> for Option<PrecheckAnnotation<'a>> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        let _r = parser.register_annotation("name");
+        Ok(if parser.peek2::<annotation::name>() {
+            Some(parser.parens(|p| p.parse())?)
+        } else {
+            None
+        })
+    }
+}
+
 macro_rules! integers {
     ($($i:ident($u:ident))*) => ($(
         impl<'a> Parse<'a> for $i {
