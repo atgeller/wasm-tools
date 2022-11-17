@@ -206,6 +206,174 @@ impl<'a> BinaryReader<'a> {
         }
     }
 
+    /// Reads a Wasm-Prechk index term
+    fn read_index_term(&mut self) -> Result<IndexTerm> {
+        let index_term = match self.peek()? {
+            0x41 => {
+                self.position += 1;
+                IndexTerm::IConstant(Constant::I32Const(self.read_var_i32()?))
+            }
+            0x42 => {
+                self.position += 1;
+                IndexTerm::IConstant(Constant::I64Const(self.read_var_i64()?))
+            }
+            x @ 0x6a..=0x78 | x @ 0x7c..=0x8a => {
+                self.position += 1;
+                let binop = match x {
+                    0x6a => BinOp::I32Add,
+                    0x6b => BinOp::I32Sub,
+                    0x6c => BinOp::I32Mul,
+                    0x6d => BinOp::I32DivS,
+                    0x6e => BinOp::I32DivU,
+                    0x6f => BinOp::I32RemS,
+                    0x70 => BinOp::I32RemU,
+                    0x71 => BinOp::I32And,
+                    0x72 => BinOp::I32Or,
+                    0x73 => BinOp::I32Xor,
+                    0x74 => BinOp::I32Shl,
+                    0x75 => BinOp::I32ShrS,
+                    0x76 => BinOp::I32ShrU,
+                    0x77 => BinOp::I32Rotl,
+                    0x78 => BinOp::I32Rotr,
+                    0x7c => BinOp::I64Add,
+                    0x7d => BinOp::I64Sub,
+                    0x7e => BinOp::I64Mul,
+                    0x7f => BinOp::I64DivS,
+                    0x80 => BinOp::I64DivU,
+                    0x81 => BinOp::I64RemS,
+                    0x82 => BinOp::I64RemU,
+                    0x83 => BinOp::I64And,
+                    0x84 => BinOp::I64Or,
+                    0x85 => BinOp::I64Xor,
+                    0x86 => BinOp::I64Shl,
+                    0x87 => BinOp::I64ShrS,
+                    0x88 => BinOp::I64ShrU,
+                    0x89 => BinOp::I64Rotl,
+                    0x8a => BinOp::I64Rotr,
+                    _ => panic!(),
+                };
+                let x = self.read_index_term()?;
+                let y = self.read_index_term()?;
+                IndexTerm::IBinOp(binop, Box::new(x), Box::new(y))
+            }
+            x @ 0x46..=0x4f | x @ 0x51..=0x5a => {
+                self.position += 1;
+                let relop = match x {
+                    0x46 => RelOp::I32Eq,
+                    0x47 => RelOp::I32Ne,
+                    0x48 => RelOp::I32LtS,
+                    0x49 => RelOp::I32LtU,
+                    0x4a => RelOp::I32GtS,
+                    0x4b => RelOp::I32GtU,
+                    0x4c => RelOp::I32LeS,
+                    0x4d => RelOp::I32LeU,
+                    0x4e => RelOp::I32GeS,
+                    0x4f => RelOp::I32GeU,
+                    0x51 => RelOp::I64Eq,
+                    0x52 => RelOp::I64Ne,
+                    0x53 => RelOp::I64LtS,
+                    0x54 => RelOp::I64LtU,
+                    0x55 => RelOp::I64GtS,
+                    0x56 => RelOp::I64GtU,
+                    0x57 => RelOp::I64LeS,
+                    0x58 => RelOp::I64LeU,
+                    0x59 => RelOp::I64GeS,
+                    0x5a => RelOp::I64GeU,
+                    _ => panic!(),
+                };
+                let x = self.read_index_term()?;
+                let y = self.read_index_term()?;
+                IndexTerm::IRelOp(relop, Box::new(x), Box::new(y))
+            }
+            x @ 0x45 | x @ 0x50 => {
+                self.position += 1;
+                let testop = if x == 0x45 {
+                    TestOp::I32Eqz
+                } else {
+                    TestOp::I64Eqz
+                };
+                let x = self.read_index_term()?;
+                IndexTerm::ITestOp(testop, Box::new(x))
+            }
+            x @ 0x67..=0x69 | x @ 0x79..=0x7b => {
+                self.position += 1;
+                let unop = match x {
+                    0x67 => UnOp::I32Clz,
+                    0x68 => UnOp::I32Ctz,
+                    0x69 => UnOp::I32Popcnt,
+                    0x79 => UnOp::I64Clz,
+                    0x7a => UnOp::I64Ctz,
+                    0x7b => UnOp::I64Popcnt,
+                    _ => panic!(),
+                };
+                let x = self.read_index_term()?;
+                IndexTerm::IUnOp(unop, Box::new(x))
+            }
+            x @ 0x20..=0x22 => {
+                self.position += 1;
+                let index = self.read_var_u32()?;
+                match x {
+                    0x20 => IndexTerm::Local(index),
+                    0x21 => IndexTerm::Pre(index),
+                    0x22 => IndexTerm::Post(index),
+                    _ => panic!(),
+                }
+            }
+            x => {
+                return Err(BinaryReaderError::new(
+                    format!("expected index term, got {:?}", x),
+                    self.original_position(),
+                ))
+            }
+        };
+
+        Ok(index_term)
+    }
+
+    /// Reads a Wasm-prech constraint
+    fn read_constraint(&mut self) -> Result<Constraint> {
+        let constraint = match self.peek()? {
+            0x01 => {
+                self.position += 1;
+                let x = self.read_index_term()?;
+                let y = self.read_index_term()?;
+                Constraint::Eq(x, y)
+            }
+            0x02 => {
+                self.position += 1;
+                let x = self.read_constraint()?;
+                let y = self.read_constraint()?;
+                Constraint::And(Box::new(x), Box::new(y))
+            }
+            0x03 => {
+                self.position += 1;
+                let x = self.read_constraint()?;
+                let y = self.read_constraint()?;
+                Constraint::Or(Box::new(x), Box::new(y))
+            }
+            0x04 => {
+                self.position += 1;
+                let x = self.read_constraint()?;
+                let y = self.read_constraint()?;
+                let z = self.read_constraint()?;
+                Constraint::If(Box::new(x), Box::new(y), Box::new(z))
+            }
+            0x05 => {
+                self.position += 1;
+                let x = self.read_constraint()?;
+                Constraint::Not(Box::new(x))
+            }
+            x => {
+                return Err(BinaryReaderError::new(
+                    format!("expected constraint, got {:?}", x),
+                    self.original_position(),
+                ))
+            }
+        };
+
+        Ok(constraint)
+    }
+
     pub(crate) fn read_component_start(&mut self) -> Result<ComponentStartFunction> {
         let func_index = self.read_var_u32()?;
         let size = self.read_size(MAX_WASM_START_ARGS, "start function arguments")?;
@@ -288,8 +456,35 @@ impl<'a> BinaryReader<'a> {
         for _ in 0..len_results {
             params_results.push(self.read_val_type()?);
         }
+
+        let len_pres = self.read_size(MAX_WASM_FUNCTION_PARAMS, "function pres")?;
+        let mut pres_posts = Vec::with_capacity(len_pres);
+        for _ in 0..len_pres {
+            pres_posts.push(self.read_constraint()?);
+        }
+        let len_posts = self.read_size(MAX_WASM_FUNCTION_RETURNS, "function posts")?;
+        pres_posts.reserve(len_posts);
+        for _ in 0..len_posts {
+            pres_posts.push(self.read_constraint()?);
+        }
+
+        println!("{:?}", pres_posts);
         Ok(FuncType::from_raw_parts(params_results.into(), len_params))
     }
+
+    /*pub(crate) fn read_indexed_func_type(&mut self) -> Result<IndexedFuncType> {
+        let len_params = self.read_size(MAX_WASM_FUNCTION_PARAMS, "function params")?;
+        let mut params_results = Vec::with_capacity(len_params);
+        for _ in 0..len_params {
+            params_results.push(self.read_val_type()?);
+        }
+        let len_results = self.read_size(MAX_WASM_FUNCTION_RETURNS, "function returns")?;
+        params_results.reserve(len_results);
+        for _ in 0..len_results {
+            params_results.push(self.read_val_type()?);
+        }
+        Ok(IndexedFuncType::from_raw_parts(params_results.into(), len_params))
+    }*/
 
     pub(crate) fn read_type(&mut self) -> Result<Type> {
         Ok(match self.read_u8()? {

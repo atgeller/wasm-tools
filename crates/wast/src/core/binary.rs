@@ -208,7 +208,7 @@ impl Encode for IndexedFunctionType<'_> {
         for (_, _, ty) in self.results.iter() {
             ty.encode(e);
         }
-        
+
         self.pre_constraints.len().encode(e);
         for constraint in self.pre_constraints.iter() {
             constraint.encode(e);

@@ -53,6 +53,209 @@ pub enum Type {
     Func(FuncType),
 }
 
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum BinOp {
+    I32Add,
+    I32Sub,
+    I32Mul,
+    I32DivS,
+    I32DivU,
+    I32RemS,
+    I32RemU,
+    I32And,
+    I32Or,
+    I32Xor,
+    I32Shl,
+    I32ShrS,
+    I32ShrU,
+    I32Rotl,
+    I32Rotr,
+    I64Add,
+    I64Sub,
+    I64Mul,
+    I64DivS,
+    I64DivU,
+    I64RemS,
+    I64RemU,
+    I64And,
+    I64Or,
+    I64Xor,
+    I64Shl,
+    I64ShrS,
+    I64ShrU,
+    I64Rotl,
+    I64Rotr,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum RelOp {
+    I32Eq,
+    I32Ne,
+    I32LtS,
+    I32LtU,
+    I32GtS,
+    I32GtU,
+    I32LeS,
+    I32LeU,
+    I32GeS,
+    I32GeU,
+    I64Eq,
+    I64Ne,
+    I64LtS,
+    I64LtU,
+    I64GtS,
+    I64GtU,
+    I64LeS,
+    I64LeU,
+    I64GeS,
+    I64GeU,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum UnOp {
+    I32Clz,
+    I32Ctz,
+    I32Popcnt,
+    I64Clz,
+    I64Ctz,
+    I64Popcnt,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum TestOp {
+    I32Eqz,
+    I64Eqz,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum Constant {
+    I32Const(i32),
+    I64Const(i64),
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum IndexTerm {
+    IBinOp(BinOp, Box<IndexTerm>, Box<IndexTerm>),
+    IRelOp(RelOp, Box<IndexTerm>, Box<IndexTerm>),
+    ITestOp(TestOp, Box<IndexTerm>),
+    IUnOp(UnOp, Box<IndexTerm>),
+    // Alpha will get resolved into one of the following two, they are not parseable ATM
+    Pre(u32),
+    Post(u32),
+    Local(u32),
+    IConstant(Constant),
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub enum Constraint {
+    Eq(IndexTerm, IndexTerm),
+    And(Box<Constraint>, Box<Constraint>),
+    Or(Box<Constraint>, Box<Constraint>),
+    If(Box<Constraint>, Box<Constraint>, Box<Constraint>),
+    Not(Box<Constraint>),
+}
+
+/// Represents a type of a function in a WebAssembly module.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct IndexedFuncType {
+    /// The combined parameters and result types.
+    params_results: Box<[ValType]>,
+    /// The number of parameter types.
+    len_params: usize,
+    // Combined pre and post constraints
+    pres_posts: Box<[Constraint]>,
+    /// The number of pre constraints
+    len_pres: usize,
+}
+
+impl Debug for IndexedFuncType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuncType")
+            .field("params", &self.params())
+            .field("returns", &self.results())
+            .field("pres", &self.pres())
+            .field("posts", &self.posts())
+            .finish()
+    }
+}
+
+impl IndexedFuncType {
+    /// Creates a new [`FuncType`] from the given `params` and `results`.
+    pub fn new<P, R, S, T>(params: P, results: R, pres: S, posts: T) -> Self
+    where
+        P: IntoIterator<Item = ValType>,
+        R: IntoIterator<Item = ValType>,
+        S: IntoIterator<Item = Constraint>,
+        T: IntoIterator<Item = Constraint>,
+    {
+        let mut buffer = params.into_iter().collect::<Vec<_>>();
+        let len_params = buffer.len();
+        buffer.extend(results);
+        let mut buffer2 = pres.into_iter().collect::<Vec<_>>();
+        let len_pres = buffer2.len();
+        buffer2.extend(posts);
+        Self {
+            params_results: buffer.into(),
+            len_params,
+            pres_posts: buffer2.into(),
+            len_pres,
+        }
+    }
+
+    /// Creates a new [`FuncType`] fom its raw parts.
+    ///
+    /// # Panics
+    ///
+    /// If `len_params` is greater than the length of `params_results` combined.
+    #[allow(unused)]
+    pub(crate) fn from_raw_parts(
+        params_results: Box<[ValType]>,
+        len_params: usize,
+        pres_posts: Box<[Constraint]>,
+        len_pres: usize,
+    ) -> Self {
+        assert!(len_params <= params_results.len());
+        assert!(len_pres <= pres_posts.len());
+        Self {
+            params_results,
+            len_params,
+            pres_posts,
+            len_pres,
+        }
+    }
+
+    /// Returns a shared slice to the parameter types of the [`FuncType`].
+    #[inline]
+    pub fn params(&self) -> &[ValType] {
+        &self.params_results[..self.len_params]
+    }
+
+    /// Returns a shared slice to the result types of the [`FuncType`].
+    #[inline]
+    pub fn results(&self) -> &[ValType] {
+        &self.params_results[self.len_params..]
+    }
+
+    /// Returns a shared slice to the pre constraints
+    #[inline]
+    pub fn pres(&self) -> &[Constraint] {
+        &self.pres_posts[..self.len_pres]
+    }
+
+    /// Returns a shared slice to the post constraints
+    #[inline]
+    pub fn posts(&self) -> &[Constraint] {
+        &self.pres_posts[self.len_pres..]
+    }
+}
+
 /// Represents a type of a function in a WebAssembly module.
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct FuncType {
