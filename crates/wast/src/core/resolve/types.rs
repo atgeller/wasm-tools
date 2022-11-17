@@ -130,9 +130,7 @@ impl<'a> Expander<'a> {
         match instr {
             Instruction::Block(bt)
             | Instruction::If(bt)
-            | Instruction::Loop(bt)
-            | Instruction::Let(LetType { block: bt, .. })
-            | Instruction::Try(bt) => {
+            | Instruction::Loop(bt) => {
                 // No expansion necessary, a type reference is already here.
                 // We'll verify that it's the same as the inline type, if any,
                 // later.

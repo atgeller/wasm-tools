@@ -57,7 +57,6 @@ pub fn resolve<'a>(fields: &mut Vec<ModuleField<'a>>) -> Result<Names<'a>, Error
     // Perform name resolution over all `Index` items to resolve them all to
     // indices instead of symbolic names.
     let resolver = names::resolve(fields)?;
-    fields.iter().for_each(|field| println!("{:?}", field));
     Ok(Names { resolver })
 }
 

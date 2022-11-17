@@ -126,6 +126,23 @@ fn get_name_section(wasm: &[u8]) -> anyhow::Result<NameSectionReader<'_>> {
     panic!("no name section found");
 }
 
+fn inspect_types(wat: &str) -> anyhow::Result<()> {
+    let wasm = wat::parse_str(wat)?;
+    for _ in get_type_section(&wasm)? {
+        // Just exercising the reader
+    }
+    Ok(())
+}
+
+fn get_type_section(wasm: &[u8]) -> anyhow::Result<TypeSectionReader<'_>> {
+    for payload in Parser::new(0).parse_all(&wasm) {
+        if let Payload::TypeSection(c) = payload? {
+            return Ok(c);
+        }
+    }
+    panic!("no name section found");
+}
+
 #[test]
 fn custom_section_order() -> anyhow::Result<()> {
     let bytes = wat::parse_str(

@@ -123,13 +123,78 @@ impl Encoder<'_> {
     }
 }
 
-impl Encode for FunctionType<'_> {
+impl Encode for IndexTerm<'_> {
     fn encode(&self, e: &mut Vec<u8>) {
-        self.params.len().encode(e);
-        for (_, _, ty) in self.params.iter() {
-            ty.encode(e);
+        match self {
+            IndexTerm::Alpha(id) => {
+                panic!("Alpha should have been resolved! Alpha: {:?}", id);
+            }
+            IndexTerm::IBinOp(bop, x, y) => {
+                bop.encode(e);
+                (*x).encode(e);
+                (*y).encode(e);
+            },
+            IndexTerm::IRelOp(rop, x, y) => {
+                rop.encode(e);
+                (*x).encode(e);
+                (*y).encode(e);
+            },
+            IndexTerm::ITestOp(top, x) => {
+                top.encode(e);
+                (*x).encode(e);
+            },
+            IndexTerm::IUnOp(unop, x) => {
+                unop.encode(e);
+                (*x).encode(e);
+            },
+            IndexTerm::Pre(idx) => {
+                e.push(0x21);
+                idx.encode(e);
+            },
+            IndexTerm::Post(idx) => {
+                e.push(0x22);
+                idx.encode(e);
+            },
+            IndexTerm::Local(idx) => {
+                e.push(0x20);
+                idx.encode(e);
+            },
+            IndexTerm::IConstant(c) => {
+                c.encode(e);
+            },
         }
-        self.results.encode(e);
+    }
+}
+
+impl Encode for Constraint<'_> {
+    fn encode(&self, e: &mut Vec<u8>) {
+        match self {
+            Constraint::Eq(x, y) => {
+                e.push(0x01);
+                x.encode(e);
+                y.encode(e);
+            }
+            Constraint::And(x, y) => {
+                e.push(0x02);
+                (*x).encode(e);
+                (*y).encode(e);
+            },
+            Constraint::Or(x, y) => {
+                e.push(0x03);
+                (*x).encode(e);
+                (*y).encode(e);
+            },
+            Constraint::If(i, t, el) => {
+                e.push(0x04);
+                (*i).encode(e);
+                (*t).encode(e);
+                (*el).encode(e);
+            },
+            Constraint::Not(x) => {
+                e.push(0x05);
+                (*x).encode(e);
+            },
+        }
     }
 }
 
@@ -140,8 +205,17 @@ impl Encode for IndexedFunctionType<'_> {
             ty.encode(e);
         }
         self.results.len().encode(e);
-        for (_, _, ty) in self.params.iter() {
+        for (_, _, ty) in self.results.iter() {
             ty.encode(e);
+        }
+        
+        self.pre_constraints.len().encode(e);
+        for constraint in self.pre_constraints.iter() {
+            constraint.encode(e);
+        }
+        self.post_constraints.len().encode(e);
+        for constraint in self.post_constraints.iter() {
+            constraint.encode(e);
         }
     }
 }
@@ -194,8 +268,7 @@ impl Encode for Type<'_> {
         match &self.def {
             TypeDef::Func(func) => {
                 e.push(0x60);
-                let erased: FunctionType = (*func).clone().into();
-                erased.encode(e)
+                func.encode(e)
             }
             TypeDef::Struct(r#struct) => {
                 e.push(0x5f);
@@ -653,7 +726,7 @@ impl Encode for BlockType<'_> {
         panic!("multi-value block types should have an index");
     }
 }
-
+/*
 impl Encode for FuncBindType<'_> {
     fn encode(&self, e: &mut Vec<u8>) {
         self.ty.encode(e);
@@ -665,7 +738,7 @@ impl Encode for LetType<'_> {
         self.block.encode(e);
         self.locals.encode(e);
     }
-}
+}*/
 
 impl Encode for LaneArg {
     fn encode(&self, e: &mut Vec<u8>) {
@@ -897,9 +970,7 @@ fn find_names<'a>(
                     match i {
                         Instruction::If(block)
                         | Instruction::Block(block)
-                        | Instruction::Loop(block)
-                        | Instruction::Try(block)
-                        | Instruction::Let(LetType { block, .. }) => {
+                        | Instruction::Loop(block) => {
                             if let Some(name) = get_name(&block.label, &block.label_name) {
                                 label_names.push((label_idx, name));
                             }

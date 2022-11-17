@@ -464,30 +464,6 @@ impl<'a, 'b> ExprResolver<'a, 'b> {
                 self.resolver.resolve_type_use(&mut c.ty)?;
             }
 
-            FuncBind(_) => {
-                panic!("FuncBind not supported!");
-            }
-
-            Let(t) => {
-                // Resolve (ref T) in locals
-                for local in &mut t.locals {
-                    self.resolver.resolve_valtype(&mut local.ty)?;
-                }
-
-                // Register all locals defined in this let
-                let mut scope = Namespace::default();
-                for local in &t.locals {
-                    scope.register(local.id, "local")?;
-                }
-                self.scopes.push(scope);
-                self.blocks.push(ExprBlock {
-                    label: t.block.label,
-                    pushed_scope: true,
-                });
-
-                self.resolve_block_type(&mut t.block)?;
-            }
-
             Block(bt) | If(bt) | Loop(bt) | Try(bt) => {
                 self.blocks.push(ExprBlock {
                     label: bt.label,

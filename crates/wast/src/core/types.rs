@@ -3,6 +3,7 @@ use crate::kw;
 use crate::parser::{Cursor, Parse, Parser, Peek, Result};
 use crate::token::{Id, Index, LParen, NameAnnotation, Span};
 use std::mem;
+use crate::encode::Encode;
 
 /// The value types for a wasm module.
 #[allow(missing_docs)]
@@ -140,24 +141,28 @@ macro_rules! index_expr {
                 stringify!(indexed term - $enum)
             }
         }
-        /*
-        impl Encode for Instruction<'_> {
+
+        impl Encode for $enum {
             #[allow(non_snake_case)]
             fn encode(&self, v: &mut Vec<u8>) {
                 match self {
                     $(
-                        Instruction::$name $((instructions!(@first x $($arg)*)))? => {
-                            fn encode<'a>($(arg: &instructions!(@ty $($arg)*),)? v: &mut Vec<u8>) {
-                                instructions!(@encode v $($binary)*);
-                                $(<instructions!(@ty $($arg)*) as Encode>::encode(arg, v);)?
+                        $enum::$name $((index_expr!(@first x $($arg)*)))? => {
+                            fn encode($(arg: &index_expr!(@ty $($arg)*),)? v: &mut Vec<u8>) {
+                                index_expr!(@encode v $($binary)*);
+                                $(<index_expr!(@ty $($arg)*) as Encode>::encode(arg, v);)?
                             }
-                            encode($( instructions!(@first x $($arg)*), )? v)
+                            encode($( index_expr!(@first x $($arg)*), )? v)
                         }
                     )*
                 }
             }
-        }*/
+        }
     );
+
+    (@ty $other:ty) => ($other);
+    (@first $first:ident $($t:tt)*) => ($first);
+    (@encode $dst:ident $($bytes:tt)*) => ($dst.extend_from_slice(&[$($bytes)*]););
 }
 
 index_expr! {
@@ -906,122 +911,6 @@ impl<'a> Peek for IndexedFunctionType<'a> {
     }
 }
 
-// Won't need this once block types are implemented
-/// A function type with parameters and results.
-#[derive(Clone, Debug, Default)]
-pub struct FunctionType<'a> {
-    /// The parameters of a function, optionally each having an identifier for
-    /// name resolution and a name for the custom `name` section.
-    pub params: Box<[(Option<Id<'a>>, Option<NameAnnotation<'a>>, ValType<'a>)]>,
-    /// The results types of a function.
-    pub results: Box<[ValType<'a>]>,
-}
-
-impl<'a> FunctionType<'a> {
-    fn finish_parse(&mut self, allow_names: bool, parser: Parser<'a>) -> Result<()> {
-        let mut params = Vec::from(mem::take(&mut self.params));
-        let mut results = Vec::from(mem::take(&mut self.results));
-        while parser.peek2::<kw::param>() || parser.peek2::<kw::result>() {
-            parser.parens(|p| {
-                let mut l = p.lookahead1();
-                if l.peek::<kw::param>() {
-                    if results.len() > 0 {
-                        return Err(p.error(
-                            "result before parameter (or unexpected token): \
-                             cannot list params after results",
-                        ));
-                    }
-                    p.parse::<kw::param>()?;
-                    if p.is_empty() {
-                        return Ok(());
-                    }
-                    let (id, name) = if allow_names {
-                        (p.parse::<Option<_>>()?, p.parse::<Option<_>>()?)
-                    } else {
-                        (None, None)
-                    };
-                    let parse_more = id.is_none() && name.is_none();
-                    let ty = p.parse()?;
-                    params.push((id, name, ty));
-                    while parse_more && !p.is_empty() {
-                        params.push((None, None, p.parse()?));
-                    }
-                } else if l.peek::<kw::result>() {
-                    p.parse::<kw::result>()?;
-                    while !p.is_empty() {
-                        results.push(p.parse()?);
-                    }
-                } else {
-                    return Err(l.error());
-                }
-                Ok(())
-            })?;
-        }
-        self.params = params.into();
-        self.results = results.into();
-        Ok(())
-    }
-}
-
-impl<'a> Parse<'a> for FunctionType<'a> {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        let mut ret = FunctionType {
-            params: Box::new([]),
-            results: Box::new([]),
-        };
-        ret.finish_parse(true, parser)?;
-        Ok(ret)
-    }
-}
-
-impl<'a> Peek for FunctionType<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        if let Some(next) = cursor.lparen() {
-            match next.keyword() {
-                Some(("param", _)) | Some(("result", _)) => return true,
-                _ => {}
-            }
-        }
-
-        false
-    }
-
-    fn display() -> &'static str {
-        "function type"
-    }
-}
-
-/// A function type with parameters and results.
-#[derive(Clone, Debug, Default)]
-pub struct FunctionTypeNoNames<'a>(pub FunctionType<'a>);
-
-impl<'a> Parse<'a> for FunctionTypeNoNames<'a> {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        let mut ret = FunctionType {
-            params: Box::new([]),
-            results: Box::new([]),
-        };
-        ret.finish_parse(false, parser)?;
-        Ok(FunctionTypeNoNames(ret))
-    }
-}
-
-impl<'a> Peek for FunctionTypeNoNames<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        FunctionType::peek(cursor)
-    }
-
-    fn display() -> &'static str {
-        FunctionType::display()
-    }
-}
-
-impl<'a> From<FunctionTypeNoNames<'a>> for FunctionType<'a> {
-    fn from(ty: FunctionTypeNoNames<'a>) -> FunctionType<'a> {
-        ty.0
-    }
-}
-
 /// A struct type with fields.
 #[derive(Clone, Debug)]
 pub struct StructType<'a> {
@@ -1257,33 +1146,5 @@ impl<'a, T: Peek + Parse<'a>> Parse<'a> for TypeUse<'a, T> {
         let inline = parser.parse()?;
 
         Ok(TypeUse { index, inline: inline})
-    }
-}
-
-impl<'a> From<TypeUse<'a, FunctionTypeNoNames<'a>>> for TypeUse<'a, FunctionType<'a>> {
-    fn from(src: TypeUse<'a, FunctionTypeNoNames<'a>>) -> TypeUse<'a, FunctionType<'a>> {
-        TypeUse {
-            index: src.index,
-            inline: src.inline.map(|x| x.into()),
-        }
-    }
-}
-
-impl<'a> From<TypeUse<'a, IndexedFunctionType<'a>>> for TypeUse<'a, FunctionType<'a>> {
-    fn from(src: TypeUse<'a, IndexedFunctionType<'a>>) -> TypeUse<'a, FunctionType<'a>> {
-        TypeUse {
-            index: src.index,
-            inline: src.inline.map(|x| x.into()),
-        }
-    }
-}
-
-impl<'a> From<IndexedFunctionType<'a>> for FunctionType<'a> {
-    fn from(src: IndexedFunctionType<'a>) -> FunctionType<'a> {
-
-        FunctionType {
-            params: src.params.clone(),
-            results: src.results.iter().map(|(_,_,vt)| vt.clone()).collect::<Vec<ValType>>().into(),
-        }
     }
 }

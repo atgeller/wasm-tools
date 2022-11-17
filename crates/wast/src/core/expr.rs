@@ -152,8 +152,7 @@ impl<'a> ExpressionParser<'a> {
                         // push an `end` instruction whenever the `)` token is
                         // seen
                         i @ Instruction::Block(_)
-                        | i @ Instruction::Loop(_)
-                        | i @ Instruction::Let(_) => {
+                        | i @ Instruction::Loop(_) => {
                             self.instrs.push(i);
                             self.stack.push(Level::EndWith(Instruction::End(None)));
                         }
@@ -524,8 +523,6 @@ instructions! {
         // function-references proposal
         CallRef(HeapType<'a>) : [0x14] : "call_ref",
         ReturnCallRef(HeapType<'a>) : [0x15] : "return_call_ref",
-        FuncBind(FuncBindType<'a>) : [0x16] : "func.bind",
-        Let(LetType<'a>) : [0x17] : "let",
 
         Drop : [0x1a] : "drop",
         Select(SelectTypes<'a>) : [] : "select",
@@ -1198,40 +1195,6 @@ impl<'a> Parse<'a> for BlockType<'a> {
             ty: parser
                 .parse::<TypeUse<'a, IndexedFunctionType<'a>>>()?
                 .into(),
-        })
-    }
-}
-
-/// Extra information associated with the func.bind instruction.
-#[derive(Debug)]
-#[allow(missing_docs)]
-pub struct FuncBindType<'a> {
-    pub ty: TypeUse<'a, FunctionType<'a>>,
-}
-
-impl<'a> Parse<'a> for FuncBindType<'a> {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        Ok(FuncBindType {
-            ty: parser
-                .parse::<TypeUse<'a, FunctionTypeNoNames<'a>>>()?
-                .into(),
-        })
-    }
-}
-
-/// Extra information associated with the let instruction.
-#[derive(Debug)]
-#[allow(missing_docs)]
-pub struct LetType<'a> {
-    pub block: BlockType<'a>,
-    pub locals: Vec<Local<'a>>,
-}
-
-impl<'a> Parse<'a> for LetType<'a> {
-    fn parse(parser: Parser<'a>) -> Result<Self> {
-        Ok(LetType {
-            block: parser.parse()?,
-            locals: Local::parse_remainder(parser)?,
         })
     }
 }
