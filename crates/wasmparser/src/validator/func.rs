@@ -188,7 +188,7 @@ impl<T: WasmModuleResources> FuncValidator<T> {
 
     /// Returns the type of the local variable at the given `index` if any.
     pub fn get_local_type(&self, index: u32) -> Option<ValType> {
-        self.validator.locals.get(index)
+        self.validator.locals.get(index).map(|(ty,_)| ty)
     }
 
     /// Get the current height of the operand stack.
@@ -252,7 +252,7 @@ mod tests {
     struct EmptyResources;
 
     impl WasmModuleResources for EmptyResources {
-        type FuncType = EmptyFuncType;
+        type IndexedFuncType = EmptyFuncType;
 
         fn table_at(&self, _at: u32) -> Option<crate::TableType> {
             todo!()
@@ -260,16 +260,16 @@ mod tests {
         fn memory_at(&self, _at: u32) -> Option<crate::MemoryType> {
             todo!()
         }
-        fn tag_at(&self, _at: u32) -> Option<&Self::FuncType> {
+        fn tag_at(&self, _at: u32) -> Option<&Self::IndexedFuncType> {
             todo!()
         }
         fn global_at(&self, _at: u32) -> Option<crate::GlobalType> {
             todo!()
         }
-        fn func_type_at(&self, _type_idx: u32) -> Option<&Self::FuncType> {
+        fn func_type_at(&self, _type_idx: u32) -> Option<&Self::IndexedFuncType> {
             Some(&EmptyFuncType)
         }
-        fn type_of_function(&self, _func_idx: u32) -> Option<&Self::FuncType> {
+        fn type_of_function(&self, _func_idx: u32) -> Option<&Self::IndexedFuncType> {
             todo!()
         }
         fn element_type_at(&self, _at: u32) -> Option<ValType> {
@@ -300,6 +300,12 @@ mod tests {
         }
         fn output_at(&self, _at: u32) -> Option<ValType> {
             todo!()
+        }
+        fn pre_conditions(&self) -> &[crate::Constraint] {
+            &[]
+        }
+        fn post_conditions(&self) -> &[crate::Constraint] {
+            &[]
         }
     }
 

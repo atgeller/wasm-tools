@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-use crate::{FuncType, GlobalType, MemoryType, TableType, ValType};
+use crate::{GlobalType, IndexedFuncType, MemoryType, TableType, ValType, Constraint};
 use std::ops::Range;
 
 /// Types that qualify as Wasm function types for validation purposes.
@@ -58,6 +58,11 @@ pub trait WasmFuncType {
             range: 0..self.len_outputs() as u32,
         }
     }
+
+    /// Returns the expected pre-conditions
+    fn pre_conditions(&self) -> &[Constraint];
+    /// Returns the expected post-conditions
+    fn post_conditions(&self) -> &[Constraint];
 }
 
 impl<T> WasmFuncType for &'_ T
@@ -75,6 +80,12 @@ where
     }
     fn output_at(&self, at: u32) -> Option<ValType> {
         T::output_at(self, at)
+    }
+    fn pre_conditions(&self) -> &[Constraint] {
+        T::pre_conditions(self)
+    }
+    fn post_conditions(&self) -> &[Constraint] {
+        T::post_conditions(self)
     }
 }
 
@@ -196,20 +207,20 @@ impl<'a, T> Clone for WasmFuncTypeOutputs<'a, T> {
 /// the need of an additional parsing or validation step or copying data around.
 pub trait WasmModuleResources {
     /// The function type used for validation.
-    type FuncType: WasmFuncType;
+    type IndexedFuncType: WasmFuncType;
 
     /// Returns the table at given index if any.
     fn table_at(&self, at: u32) -> Option<TableType>;
     /// Returns the linear memory at given index.
     fn memory_at(&self, at: u32) -> Option<MemoryType>;
     /// Returns the tag at given index.
-    fn tag_at(&self, at: u32) -> Option<&Self::FuncType>;
+    fn tag_at(&self, at: u32) -> Option<&Self::IndexedFuncType>;
     /// Returns the global variable at given index.
     fn global_at(&self, at: u32) -> Option<GlobalType>;
     /// Returns the `FuncType` associated with the given type index.
-    fn func_type_at(&self, type_idx: u32) -> Option<&Self::FuncType>;
+    fn func_type_at(&self, type_idx: u32) -> Option<&Self::IndexedFuncType>;
     /// Returns the `FuncType` associated with the given function index.
-    fn type_of_function(&self, func_idx: u32) -> Option<&Self::FuncType>;
+    fn type_of_function(&self, func_idx: u32) -> Option<&Self::IndexedFuncType>;
     /// Returns the element type at the given index.
     fn element_type_at(&self, at: u32) -> Option<ValType>;
 
@@ -226,7 +237,7 @@ impl<T> WasmModuleResources for &'_ T
 where
     T: ?Sized + WasmModuleResources,
 {
-    type FuncType = T::FuncType;
+    type IndexedFuncType = T::IndexedFuncType;
 
     fn table_at(&self, at: u32) -> Option<TableType> {
         T::table_at(self, at)
@@ -234,16 +245,16 @@ where
     fn memory_at(&self, at: u32) -> Option<MemoryType> {
         T::memory_at(self, at)
     }
-    fn tag_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn tag_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         T::tag_at(self, at)
     }
     fn global_at(&self, at: u32) -> Option<GlobalType> {
         T::global_at(self, at)
     }
-    fn func_type_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn func_type_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         T::func_type_at(self, at)
     }
-    fn type_of_function(&self, func_idx: u32) -> Option<&Self::FuncType> {
+    fn type_of_function(&self, func_idx: u32) -> Option<&Self::IndexedFuncType> {
         T::type_of_function(self, func_idx)
     }
     fn element_type_at(&self, at: u32) -> Option<ValType> {
@@ -265,7 +276,7 @@ impl<T> WasmModuleResources for std::sync::Arc<T>
 where
     T: WasmModuleResources,
 {
-    type FuncType = T::FuncType;
+    type IndexedFuncType = T::IndexedFuncType;
 
     fn table_at(&self, at: u32) -> Option<TableType> {
         T::table_at(self, at)
@@ -275,7 +286,7 @@ where
         T::memory_at(self, at)
     }
 
-    fn tag_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn tag_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         T::tag_at(self, at)
     }
 
@@ -283,11 +294,11 @@ where
         T::global_at(self, at)
     }
 
-    fn func_type_at(&self, type_idx: u32) -> Option<&Self::FuncType> {
+    fn func_type_at(&self, type_idx: u32) -> Option<&Self::IndexedFuncType> {
         T::func_type_at(self, type_idx)
     }
 
-    fn type_of_function(&self, func_idx: u32) -> Option<&Self::FuncType> {
+    fn type_of_function(&self, func_idx: u32) -> Option<&Self::IndexedFuncType> {
         T::type_of_function(self, func_idx)
     }
 
@@ -308,7 +319,7 @@ where
     }
 }
 
-impl WasmFuncType for FuncType {
+impl WasmFuncType for IndexedFuncType {
     fn len_inputs(&self) -> usize {
         self.params().len()
     }
@@ -323,5 +334,13 @@ impl WasmFuncType for FuncType {
 
     fn output_at(&self, at: u32) -> Option<ValType> {
         self.results().get(at as usize).copied()
+    }
+
+    fn pre_conditions(&self) -> &[Constraint] {
+        self.pres()
+    }
+
+    fn post_conditions(&self) -> &[Constraint] {
+        self.posts()
     }
 }

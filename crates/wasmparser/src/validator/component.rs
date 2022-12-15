@@ -16,8 +16,8 @@ use crate::{
         UnionType, VariantType,
     },
     BinaryReaderError, CanonicalOption, ComponentExternalKind, ComponentOuterAliasKind,
-    ComponentTypeRef, ExternalKind, FuncType, GlobalType, InstantiationArgKind, MemoryType, Result,
-    TableType, TypeBounds, ValType, WasmFeatures,
+    ComponentTypeRef, ExternalKind, GlobalType, IndexedFuncType, InstantiationArgKind, MemoryType,
+    Result, TableType, TypeBounds, ValType, WasmFeatures,
 };
 use indexmap::{IndexMap, IndexSet};
 use std::{collections::HashSet, mem};
@@ -487,7 +487,7 @@ impl ComponentState {
 
     fn check_options(
         &self,
-        core_ty: Option<&FuncType>,
+        core_ty: Option<&IndexedFuncType>,
         info: &LoweringInfo,
         options: &[CanonicalOption],
         types: &TypeList,

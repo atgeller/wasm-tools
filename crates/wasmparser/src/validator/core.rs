@@ -8,8 +8,8 @@ use super::{
 use crate::validator::core::arc::MaybeOwned;
 use crate::{
     limits::*, BinaryReaderError, ConstExpr, Data, DataKind, Element, ElementItem, ElementKind,
-    ExternalKind, FuncType, Global, GlobalType, MemoryType, Result, TableType, TagType, TypeRef,
-    ValType, VisitOperator, WasmFeatures, WasmModuleResources,
+    ExternalKind, Global, GlobalType, IndexedFuncType, MemoryType, Result, TableType, TagType,
+    TypeRef, ValType, VisitOperator, WasmFeatures, WasmModuleResources,
 };
 use indexmap::IndexMap;
 use std::mem;
@@ -629,7 +629,7 @@ impl Module {
         type_index: u32,
         types: &'a TypeList,
         offset: usize,
-    ) -> Result<&'a FuncType> {
+    ) -> Result<&'a IndexedFuncType> {
         types[self.type_at(type_index, offset)?]
             .as_func_type()
             .ok_or_else(|| format_err!(offset, "type index {type_index} is not a function type"))
@@ -872,7 +872,7 @@ impl Module {
         func_idx: u32,
         types: &'a TypeList,
         offset: usize,
-    ) -> Result<&'a FuncType> {
+    ) -> Result<&'a IndexedFuncType> {
         match self.functions.get(func_idx as usize) {
             Some(idx) => self.func_type_at(*idx, types, offset),
             None => Err(format_err!(
@@ -941,7 +941,7 @@ struct OperatorValidatorResources<'a> {
 }
 
 impl WasmModuleResources for OperatorValidatorResources<'_> {
-    type FuncType = crate::FuncType;
+    type IndexedFuncType = crate::IndexedFuncType;
 
     fn table_at(&self, at: u32) -> Option<TableType> {
         self.module.tables.get(at as usize).cloned()
@@ -951,7 +951,7 @@ impl WasmModuleResources for OperatorValidatorResources<'_> {
         self.module.memories.get(at as usize).cloned()
     }
 
-    fn tag_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn tag_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         Some(
             self.types[*self.module.tags.get(at as usize)?]
                 .as_func_type()
@@ -963,7 +963,7 @@ impl WasmModuleResources for OperatorValidatorResources<'_> {
         self.module.globals.get(at as usize).cloned()
     }
 
-    fn func_type_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn func_type_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         Some(
             self.types[*self.module.types.get(at as usize)?]
                 .as_func_type()
@@ -971,7 +971,7 @@ impl WasmModuleResources for OperatorValidatorResources<'_> {
         )
     }
 
-    fn type_of_function(&self, at: u32) -> Option<&Self::FuncType> {
+    fn type_of_function(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         self.func_type_at(*self.module.functions.get(at as usize)?)
     }
 
@@ -997,7 +997,7 @@ impl WasmModuleResources for OperatorValidatorResources<'_> {
 pub struct ValidatorResources(pub(crate) Arc<Module>);
 
 impl WasmModuleResources for ValidatorResources {
-    type FuncType = crate::FuncType;
+    type IndexedFuncType = crate::IndexedFuncType;
 
     fn table_at(&self, at: u32) -> Option<TableType> {
         self.0.tables.get(at as usize).cloned()
@@ -1007,7 +1007,7 @@ impl WasmModuleResources for ValidatorResources {
         self.0.memories.get(at as usize).cloned()
     }
 
-    fn tag_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn tag_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         Some(
             self.0.snapshot.as_ref().unwrap()[*self.0.tags.get(at as usize)?]
                 .as_func_type()
@@ -1019,7 +1019,7 @@ impl WasmModuleResources for ValidatorResources {
         self.0.globals.get(at as usize).cloned()
     }
 
-    fn func_type_at(&self, at: u32) -> Option<&Self::FuncType> {
+    fn func_type_at(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         Some(
             self.0.snapshot.as_ref().unwrap()[*self.0.types.get(at as usize)?]
                 .as_func_type()
@@ -1027,7 +1027,7 @@ impl WasmModuleResources for ValidatorResources {
         )
     }
 
-    fn type_of_function(&self, at: u32) -> Option<&Self::FuncType> {
+    fn type_of_function(&self, at: u32) -> Option<&Self::IndexedFuncType> {
         self.func_type_at(*self.0.functions.get(at as usize)?)
     }
 

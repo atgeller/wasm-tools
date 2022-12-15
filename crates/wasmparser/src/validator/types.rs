@@ -3,8 +3,8 @@
 use super::{component::ComponentState, core::Module};
 use crate::{
     ComponentExport, ComponentExternalKind, ComponentImport, ComponentTypeRef, Export,
-    ExternalKind, FuncType, GlobalType, Import, MemoryType, PrimitiveValType, TableType, TypeRef,
-    ValType,
+    ExternalKind, GlobalType, Import, IndexedFuncType, MemoryType, PrimitiveValType, TableType,
+    TypeRef, ValType,
 };
 use indexmap::{IndexMap, IndexSet};
 use std::{
@@ -93,10 +93,12 @@ pub(crate) struct LoweringInfo {
 }
 
 impl LoweringInfo {
-    pub(crate) fn into_func_type(self) -> FuncType {
-        FuncType::new(
+    pub(crate) fn into_func_type(self) -> IndexedFuncType {
+        IndexedFuncType::new(
             self.params.as_slice().iter().copied(),
             self.results.as_slice().iter().copied(),
+            [],
+            [],
         )
     }
 }
@@ -155,7 +157,7 @@ pub struct TypeId {
 #[derive(Debug)]
 pub enum Type {
     /// The definition is for a core function type.
-    Func(FuncType),
+    Func(IndexedFuncType),
     /// The definition is for a core module type.
     ///
     /// This variant is only supported when parsing a component.
@@ -184,7 +186,7 @@ pub enum Type {
 
 impl Type {
     /// Converts the type to a core function type.
-    pub fn as_func_type(&self) -> Option<&FuncType> {
+    pub fn as_func_type(&self) -> Option<&IndexedFuncType> {
         match self {
             Self::Func(ty) => Some(ty),
             _ => None,
@@ -1202,7 +1204,7 @@ impl<'a> TypesRef<'a> {
     ///
     /// Returns `None` if the type index is out of bounds or the type has not
     /// been parsed yet.
-    pub fn func_type_at(&self, index: u32) -> Option<&'a FuncType> {
+    pub fn func_type_at(&self, index: u32) -> Option<&'a IndexedFuncType> {
         match self.type_at(index, true)? {
             Type::Func(ty) => Some(ty),
             _ => None,
@@ -1252,7 +1254,7 @@ impl<'a> TypesRef<'a> {
     ///
     /// Returns `None` if the type index is out of bounds or the type has not
     /// been parsed yet.
-    pub fn tag_at(&self, index: u32) -> Option<&'a FuncType> {
+    pub fn tag_at(&self, index: u32) -> Option<&'a IndexedFuncType> {
         let tags = match &self.kind {
             TypesRefKind::Module(module) => &module.tags,
             TypesRefKind::Component(component) => &component.core_tags,
@@ -1269,7 +1271,7 @@ impl<'a> TypesRef<'a> {
     ///
     /// Returns `None` if the type index is out of bounds or the type has not
     /// been parsed yet.
-    pub fn function_at(&self, index: u32) -> Option<&'a FuncType> {
+    pub fn function_at(&self, index: u32) -> Option<&'a IndexedFuncType> {
         let id = match &self.kind {
             TypesRefKind::Module(module) => {
                 &module.types[*module.functions.get(index as usize)? as usize]
@@ -1541,7 +1543,7 @@ impl Types {
     /// Gets a defined core function type at the given type index.
     ///
     /// Returns `None` if the index is out of bounds.
-    pub fn func_type_at(&self, index: u32) -> Option<&FuncType> {
+    pub fn func_type_at(&self, index: u32) -> Option<&IndexedFuncType> {
         self.as_ref().func_type_at(index)
     }
 
@@ -1601,7 +1603,7 @@ impl Types {
     /// Gets the type of a tag at the given tag index.
     ///
     /// Returns `None` if the index is out of bounds.
-    pub fn tag_at(&self, index: u32) -> Option<&FuncType> {
+    pub fn tag_at(&self, index: u32) -> Option<&IndexedFuncType> {
         self.as_ref().tag_at(index)
     }
 
@@ -1616,7 +1618,7 @@ impl Types {
     /// Gets the type of a core function at the given function index.
     ///
     /// Returns `None` if the index is out of bounds.
-    pub fn function_at(&self, index: u32) -> Option<&FuncType> {
+    pub fn function_at(&self, index: u32) -> Option<&IndexedFuncType> {
         self.as_ref().function_at(index)
     }
 

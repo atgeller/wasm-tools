@@ -50,7 +50,7 @@ impl ValType {
 #[derive(Debug, Clone)]
 pub enum Type {
     /// The type is for a function.
-    Func(FuncType),
+    Func(IndexedFuncType),
 }
 
 #[allow(missing_docs)]
@@ -145,7 +145,7 @@ pub enum IndexTerm {
     IRelOp(RelOp, Box<IndexTerm>, Box<IndexTerm>),
     ITestOp(TestOp, Box<IndexTerm>),
     IUnOp(UnOp, Box<IndexTerm>),
-    // Alpha will get resolved into one of the following two, they are not parseable ATM
+    Alpha(u32),
     Pre(u32),
     Post(u32),
     Local(u32),
@@ -253,6 +253,20 @@ impl IndexedFuncType {
     #[inline]
     pub fn posts(&self) -> &[Constraint] {
         &self.pres_posts[self.len_pres..]
+    }
+}
+
+impl From<IndexedFuncType> for FuncType {
+    fn from(value: IndexedFuncType) -> Self {
+        let mut params = Vec::new();
+        for param in value.params().iter() {
+            params.push(*param);
+        }
+        let mut results = Vec::new();
+        for result in value.results().iter() {
+            results.push(*result);
+        }
+        FuncType::new(params, results)
     }
 }
 

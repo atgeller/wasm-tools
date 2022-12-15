@@ -1,6 +1,6 @@
 use crate::{
-    BinaryReader, ComponentAlias, ComponentImport, ComponentTypeRef, FuncType, Import, Result,
-    SectionIteratorLimited, SectionReader, SectionWithLimitedItems, Type, TypeRef,
+    BinaryReader, ComponentAlias, ComponentImport, ComponentTypeRef, Import, IndexedFuncType,
+    Result, SectionIteratorLimited, SectionReader, SectionWithLimitedItems, Type, TypeRef,
 };
 use std::ops::Range;
 
@@ -15,7 +15,7 @@ pub enum OuterAliasKind {
 #[derive(Debug, Clone)]
 pub enum CoreType<'a> {
     /// The type is for a core function.
-    Func(FuncType),
+    Func(IndexedFuncType),
     /// The type is for a core module.
     Module(Box<[ModuleTypeDeclaration<'a>]>),
 }

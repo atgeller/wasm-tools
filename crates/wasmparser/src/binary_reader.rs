@@ -445,7 +445,7 @@ impl<'a> BinaryReader<'a> {
         Self::component_external_kind_from_bytes(byte1, byte2, offset)
     }
 
-    pub(crate) fn read_func_type(&mut self) -> Result<FuncType> {
+    pub(crate) fn read_func_type(&mut self) -> Result<IndexedFuncType> {
         let len_params = self.read_size(MAX_WASM_FUNCTION_PARAMS, "function params")?;
         let mut params_results = Vec::with_capacity(len_params);
         for _ in 0..len_params {
@@ -469,7 +469,12 @@ impl<'a> BinaryReader<'a> {
         }
 
         println!("{:?}", pres_posts);
-        Ok(FuncType::from_raw_parts(params_results.into(), len_params))
+        Ok(IndexedFuncType::from_raw_parts(
+            params_results.into(),
+            len_params,
+            pres_posts.into(),
+            len_pres,
+        ))
     }
 
     /*pub(crate) fn read_indexed_func_type(&mut self) -> Result<IndexedFuncType> {

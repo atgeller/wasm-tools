@@ -22,11 +22,17 @@
 // confusing it's recommended to read over that section to see how it maps to
 // the various methods here.
 
+use index_language::constraint;
+
 use crate::{
-    limits::MAX_WASM_FUNCTION_LOCALS, BinaryReaderError, BlockType, BrTable, Ieee32, Ieee64,
-    MemArg, Result, ValType, VisitOperator, WasmFeatures, WasmFuncType, WasmModuleResources, V128,
+    limits::MAX_WASM_FUNCTION_LOCALS, BinOp, BinaryReaderError, BlockType, BrTable, Constant,
+    Constraint, Ieee32, Ieee64, IndexTerm, MemArg, RelOp, Result, UnOp, TestOp, ValType, VisitOperator,
+    WasmFeatures, WasmFuncType, WasmModuleResources, V128,
 };
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    u32::MAX,
+};
 
 pub(crate) struct OperatorValidator {
     pub(super) locals: Locals,
@@ -841,13 +847,13 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         Ok(())
     }
 
-    fn func_type_at(&self, at: u32) -> Result<&'resources R::FuncType> {
+    fn func_type_at(&self, at: u32) -> Result<&'resources R::IndexedFuncType> {
         self.resources
             .func_type_at(at)
             .ok_or_else(|| format_err!(self.offset, "unknown type: type index out of bounds"))
     }
 
-    fn tag_at(&self, at: u32) -> Result<&'resources R::FuncType> {
+    fn tag_at(&self, at: u32) -> Result<&'resources R::IndexedFuncType> {
         self.resources
             .tag_at(at)
             .ok_or_else(|| format_err!(self.offset, "unknown tag {}: tag index out of bounds", at))

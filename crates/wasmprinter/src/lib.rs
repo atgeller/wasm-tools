@@ -51,7 +51,7 @@ pub struct Printer {
 
 #[derive(Default)]
 struct CoreState {
-    types: Vec<Option<FuncType>>,
+    types: Vec<Option<IndexedFuncType>>,
     funcs: u32,
     memories: u32,
     tags: u32,
@@ -603,7 +603,7 @@ impl Printer {
     fn print_func_type(
         &mut self,
         state: &State,
-        ty: &FuncType,
+        ty: &IndexedFuncType,
         names_for: Option<u32>,
     ) -> Result<u32> {
         if !ty.params().is_empty() {
