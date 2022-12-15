@@ -47,7 +47,11 @@ pub(crate) struct OperatorValidator {
     /// The `control` list is the list of blocks that we're currently in.
     control: Vec<Frame>,
     /// The `operands` is the current type stack.
-    operands: Vec<Option<ValType>>,
+    operands: Vec<(Option<ValType>, u32)>,
+    /// Current constraints
+    constraints: Vec<Constraint>,
+    /// Current constraints
+    indices: Vec<Option<ValType>>,
 
     /// Offset of the `end` instruction which emptied the `control` stack, which
     /// must be the end of the function.
@@ -66,7 +70,7 @@ pub(super) struct Locals {
     // optimize the theoretically common case where most functions don't have
     // many locals and don't need a full binary search in the entire local space
     // below.
-    first: Vec<ValType>,
+    first: Vec<(ValType, u32)>,
 
     // This is a "compressed" list of locals for this function. The list of
     // locals are represented as a list of tuples. The second element is the
@@ -78,7 +82,7 @@ pub(super) struct Locals {
     // `local.{get,set,tee}`. We do a binary search for the index desired, and
     // it either lies in a "hole" where the maximum index is specified later,
     // or it's at the end of the list meaning it's out of bounds.
-    all: Vec<(u32, ValType)>,
+    //all: Vec<(u32, ValType)>,
 }
 
 /// A Wasm control flow block on the control flow stack during Wasm validation.
@@ -87,7 +91,7 @@ pub(super) struct Locals {
 //
 // This structure corresponds to `ctrl_frame` as specified at in the validation
 // appendix of the wasm spec
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct Frame {
     /// Indicator for what kind of instruction pushed this frame.
     pub kind: FrameKind,
@@ -98,6 +102,10 @@ pub struct Frame {
     pub height: usize,
     /// Whether this frame is unreachable so far.
     pub unreachable: bool,
+    /// The list of constraints with which we hit the control frame
+    pub constraints: Vec<Constraint>,
+    /// The post-condition for exiting the control frame
+    pub post: Vec<Constraint>,
 }
 
 /// The kind of a control flow [`Frame`].
@@ -141,8 +149,8 @@ struct OperatorValidatorTemp<'validator, 'resources, T> {
 pub struct OperatorValidatorAllocations {
     br_table_tmp: Vec<Option<ValType>>,
     control: Vec<Frame>,
-    operands: Vec<Option<ValType>>,
-    locals_first: Vec<ValType>,
+    operands: Vec<(Option<ValType>, u32)>,
+    locals_first: Vec<(ValType, u32)>,
     locals_all: Vec<(u32, ValType)>,
 }
 
@@ -164,11 +172,12 @@ impl OperatorValidator {
             locals: Locals {
                 num_locals: 0,
                 first: locals_first,
-                all: locals_all,
             },
             features: *features,
             br_table_tmp,
             operands,
+            constraints: Vec::new(),
+            indices: Vec::new(),
             control,
             end_which_emptied_control: None,
         }
@@ -195,6 +204,8 @@ impl OperatorValidator {
             block_type: BlockType::FuncType(ty),
             height: 0,
             unreachable: false,
+            constraints: Vec::new(),
+            post: Vec::new(),
         });
         let params = OperatorValidatorTemp {
             // This offset is used by the `func_type_at` and `inputs`.
@@ -205,7 +216,9 @@ impl OperatorValidator {
         .func_type_at(ty)?
         .inputs();
         for ty in params {
-            ret.locals.define(1, ty);
+            let index = ret.indices.len();
+            ret.indices.push(Some(ty));
+            ret.locals.add_local(ty, index as u32);
         }
         Ok(ret)
     }
@@ -224,6 +237,8 @@ impl OperatorValidator {
             block_type: BlockType::Type(ty),
             height: 0,
             unreachable: false,
+            constraints: Vec::new(),
+            post: Vec::new(),
         });
         ret
     }
@@ -235,12 +250,18 @@ impl OperatorValidator {
         if count == 0 {
             return Ok(());
         }
-        if !self.locals.define(count, ty) {
-            return Err(BinaryReaderError::new(
-                "too many locals: locals exceed maximum",
-                offset,
-            ));
+
+        for _ in 0..count {
+            let index = self.indices.len();
+            self.indices.push(Some(ty));
+            if !self.locals.add_local(ty, index as u32) {
+                return Err(BinaryReaderError::new(
+                    "too many locals: locals exceed maximum",
+                    offset,
+                ));
+            }
         }
+        
         Ok(())
     }
 
@@ -260,7 +281,12 @@ impl OperatorValidator {
     ///
     /// A `depth` of 0 will refer to the last operand on the stack.
     pub fn peek_operand_at(&self, depth: usize) -> Option<Option<ValType>> {
-        self.operands.iter().rev().nth(depth).copied()
+        self.operands
+            .iter()
+            .rev()
+            .nth(depth)
+            .copied()
+            .map(|(x, _)| x)
     }
 
     /// Returns the number of frames on the control flow stack.
@@ -321,7 +347,7 @@ impl OperatorValidator {
             control: truncate(self.control),
             operands: truncate(self.operands),
             locals_first: truncate(self.locals.first),
-            locals_all: truncate(self.locals.all),
+            locals_all: truncate(Vec::new()),
         }
     }
 }
@@ -345,13 +371,17 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// This is used by instructions to represent a value that is pushed to the
     /// operand stack. This can fail, but only if `Type` is feature gated.
     /// Otherwise the push operation always succeeds.
-    fn push_operand<T>(&mut self, ty: T) -> Result<()>
+    ///
+    /// Returns: the index associated with the index variable returned
+    fn push_operand<T>(&mut self, ty: T) -> Result<u32>
     where
         T: Into<Option<ValType>>,
     {
         let maybe_ty = ty.into();
-        self.operands.push(maybe_ty);
-        Ok(())
+        let index = self.indices.len() as u32;
+        self.indices.push(maybe_ty);
+        self.operands.push((maybe_ty, index));
+        Ok(index)
     }
 
     /// Attempts to pop a type from the operand stack.
@@ -372,9 +402,9 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// matches `expected`. If `None` is returned then it means that `None` was
     /// expected and a type was successfully popped, but its exact type is
     /// indeterminate because the current block is unreachable.
-    fn pop_operand(&mut self, expected: Option<ValType>) -> Result<Option<ValType>> {
+    fn pop_operand(&mut self, expected: Option<ValType>) -> Result<(Option<ValType>, u32)> {
         // This method is one of the hottest methods in the validator so to
-        // improve codegen this method contains a fast-path success case where
+        // improve codegen this method, contains a fast-path success case where
         // if the top operand on the stack is as expected it's returned
         // immediately. This is the most common case where the stack will indeed
         // have the expected type and all we need to do is pop it off.
@@ -385,7 +415,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // pop it. If we shouldn't have popped it then it's passed to the slow
         // path to get pushed back onto the stack.
         let popped = if let Some(actual_ty) = self.operands.pop() {
-            if actual_ty == expected {
+            if actual_ty.0 == expected {
                 if let Some(control) = self.control.last() {
                     if self.operands.len() >= control.height {
                         return Ok(actual_ty);
@@ -407,8 +437,8 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn _pop_operand(
         &mut self,
         expected: Option<ValType>,
-        popped: Option<Option<ValType>>,
-    ) -> Result<Option<ValType>> {
+        popped: Option<(Option<ValType>, u32)>,
+    ) -> Result<(Option<ValType>, u32)> {
         self.operands.extend(popped);
         let control = match self.control.last() {
             Some(c) => c,
@@ -416,7 +446,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         };
         let actual = if self.operands.len() == control.height {
             if control.unreachable {
-                None
+                (None, MAX)
             } else {
                 let desc = match expected {
                     Some(ty) => ty_to_str(ty),
@@ -430,7 +460,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         } else {
             self.operands.pop().unwrap()
         };
-        if let (Some(actual_ty), Some(expected_ty)) = (actual, expected) {
+        if let ((Some(actual_ty), _), Some(expected_ty)) = (actual, expected) {
             if actual_ty != expected_ty {
                 bail!(
                     self.offset,
@@ -445,9 +475,25 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
 
     /// Fetches the type for the local at `idx`, returning an error if it's out
     /// of bounds.
-    fn local(&self, idx: u32) -> Result<ValType> {
+    fn local(&self, idx: u32) -> Result<(ValType, u32)> {
         match self.locals.get(idx) {
             Some(ty) => Ok(ty),
+            None => bail!(
+                self.offset,
+                "unknown local {}: local index out of bounds",
+                idx
+            ),
+        }
+    }
+
+    /// Fetches the type for the local at `idx`, returning an error if it's out
+    /// of bounds.
+    fn replace_local(&mut self, idx: u32, alpha: u32) -> Result<()> {
+        match self.locals.get(idx) {
+            Some(_) => {
+                self.locals.replace_index(idx, alpha);
+                return Ok(());
+            },
             None => bail!(
                 self.offset,
                 "unknown local {}: local index out of bounds",
@@ -475,21 +521,29 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// or block itself. The `kind` of block is specified which indicates how
     /// breaks interact with this block's type. Additionally the type signature
     /// of the block is specified by `ty`.
-    fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType) -> Result<()> {
+    fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType, consumed: Vec<u32>) -> Result<()> {
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
         let height = self.operands.len();
+        let post = self.unify_block_type(&consumed, ty, false)?;
+        let constraints = self.constraints.clone();
+
         self.control.push(Frame {
             kind,
             block_type: ty,
             height,
             unreachable: false,
+            constraints,
+            post,
         });
         // All of the parameters are now also available in this control frame,
         // so we push them here in order.
+        let mut new_indices = Vec::new();
         for ty in self.params(ty)? {
-            self.push_operand(ty)?;
+            let x = self.push_operand(ty)?;
+            new_indices.push(x);
         }
+        self.constraints = self.unify_block_type(&new_indices, ty, true)?;
         Ok(())
     }
 
@@ -530,14 +584,14 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     ///
     /// Returns the type signature of the block that we're jumping to as well
     /// as the kind of block if the jump is valid. Otherwise returns an error.
-    fn jump(&self, depth: u32) -> Result<(BlockType, FrameKind)> {
+    fn jump(&self, depth: u32) -> Result<(BlockType, FrameKind, Vec<Constraint>)> {
         if self.control.is_empty() {
             return Err(self.err_beyond_end(self.offset));
         }
         match (self.control.len() - 1).checked_sub(depth as usize) {
             Some(i) => {
                 let frame = &self.control[i];
-                Ok((frame.block_type, frame.kind))
+                Ok((frame.block_type, frame.kind, frame.post.clone()))
             }
             None => bail!(self.offset, "unknown label: branch depth too large"),
         }
@@ -588,6 +642,112 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             bail!(self.offset, "SIMD index out of bounds");
         }
         Ok(())
+    }
+
+     /// Unifies an index_term
+     fn unify_index_term(&self, consumed: &Vec<u32>, it: &mut IndexTerm, is_pre: bool) -> Result<()> {
+        let idx = match it {
+            IndexTerm::IBinOp(_, x, y)
+            | IndexTerm::IRelOp(_, x, y) => {
+                self.unify_index_term(consumed, &mut *x, is_pre)?;
+                self.unify_index_term(consumed, &mut *y, is_pre)?;
+                None
+            },
+            IndexTerm::ITestOp(_, x)
+            | IndexTerm::IUnOp(_, x) => {
+                self.unify_index_term(consumed, &mut *x, is_pre)?;
+                None
+            },
+            IndexTerm::Pre(idx) => {
+                if !is_pre {
+                    None
+                } else {
+                    Some(*idx as usize)
+                }
+            },
+            IndexTerm::Post(idx) => {
+                if is_pre {
+                    None
+                } else {
+                    Some(*idx as usize)
+                }
+            },
+            IndexTerm::Local(_) => todo!(),
+            _ => None
+        };
+
+        if let Some(x) = idx.and_then(|x| consumed.get(x)) {
+            *it = IndexTerm::Alpha(*x);
+        } else if idx.is_some() {
+            bail!(self.offset, "illegal index variable reference: unknown offset");
+        }
+
+        Ok(())
+    }
+
+    /// Unifies a constraint
+    fn unify_constraint(
+        &self,
+        consumed: &Vec<u32>,
+        c: &mut Constraint,
+        is_pre: bool
+    ) -> Result<()> {
+        match c {
+            Constraint::Eq(x, y) => {
+                self.unify_index_term(consumed, x, is_pre)?;
+                self.unify_index_term(consumed, y, is_pre)?;
+            },
+            Constraint::And(x, y)
+            | Constraint::Or(x, y) => {
+                self.unify_constraint(consumed, x, is_pre)?;
+                self.unify_constraint(consumed, y, is_pre)?;
+            },
+            Constraint::If(x, y, z) => {
+                self.unify_constraint(consumed, x, is_pre)?;
+                self.unify_constraint(consumed, y, is_pre)?;
+                self.unify_constraint(consumed, z, is_pre)?;
+            },
+            Constraint::Not(x) => {
+                self.unify_constraint(consumed, x, is_pre)?;
+            },
+        }
+
+        Ok(())
+    }
+
+    /// Unifies the constraints from a block_type
+    fn unify_constraints(&self, consumed: &Vec<u32>, constraints: Vec<Constraint>, is_pre: bool) -> Result<Vec<Constraint>> {
+        let mut new_constraints = Vec::new();
+
+        for c in constraints.iter() {
+            let mut copy = c.clone();
+            self.unify_constraint(consumed, &mut copy, is_pre)?;
+            new_constraints.push(copy);
+        }
+
+        Ok(new_constraints)
+    }
+
+    /// Unifies a block type against the stack and local environment
+    fn unify_block_type(&self, consumed: &Vec<u32>, ty: BlockType, pre: bool) -> Result<Vec<Constraint>> {
+        match ty {
+            BlockType::FuncType(idx) => {
+                let ft = self.func_type_at(idx)?;
+
+                let constraints = if pre {
+                    ft.pre_conditions()
+                } else {
+                    ft.post_conditions()
+                };
+
+                let new_constraints = constraints.iter().map(|x| x.clone()).collect();
+
+                let unified = self.unify_constraints(consumed, new_constraints, true)?;
+
+                Ok(unified)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Validates a block type, primarily with various in-flight proposals.
@@ -674,10 +834,20 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 
     /// Checks the validity of a common comparison operator.
-    fn check_cmp_op(&mut self, ty: ValType) -> Result<()> {
-        self.pop_operand(Some(ty))?;
-        self.pop_operand(Some(ty))?;
-        self.push_operand(ValType::I32)?;
+    fn check_cmp_op(&mut self, ty: ValType, cop: Option<RelOp>) -> Result<()> {
+        let (_, x) = self.pop_operand(Some(ty))?;
+        let (_, y) = self.pop_operand(Some(ty))?;
+        let new = self.push_operand(ty)?;
+        if let Some(c) = cop {
+            self.constraints.push(Constraint::Eq(
+                IndexTerm::Alpha(new),
+                IndexTerm::IRelOp(
+                    c,
+                    Box::new(IndexTerm::Alpha(y)),
+                    Box::new(IndexTerm::Alpha(x)),
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -685,13 +855,19 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn check_fcmp_op(&mut self, ty: ValType) -> Result<()> {
         debug_assert!(matches!(ty, ValType::F32 | ValType::F64));
         self.check_non_deterministic_enabled()?;
-        self.check_cmp_op(ty)
+        self.check_cmp_op(ty, None)
     }
 
     /// Checks the validity of a common unary operator.
-    fn check_unary_op(&mut self, ty: ValType) -> Result<()> {
-        self.pop_operand(Some(ty))?;
-        self.push_operand(ty)?;
+    fn check_unary_op(&mut self, ty: ValType, uop: Option<UnOp>) -> Result<()> {
+        let (_, x) = self.pop_operand(Some(ty))?;
+        let new = self.push_operand(ty)?;
+        if let Some(u) = uop {
+            self.constraints.push(Constraint::Eq(
+                IndexTerm::Alpha(new),
+                IndexTerm::IUnOp(u, Box::new(IndexTerm::Alpha(x))),
+            ));
+        }
         Ok(())
     }
 
@@ -699,7 +875,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn check_funary_op(&mut self, ty: ValType) -> Result<()> {
         debug_assert!(matches!(ty, ValType::F32 | ValType::F64));
         self.check_non_deterministic_enabled()?;
-        self.check_unary_op(ty)
+        self.check_unary_op(ty, None)
     }
 
     /// Checks the validity of a common conversion operator.
@@ -717,10 +893,20 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 
     /// Checks the validity of a common binary operator.
-    fn check_binary_op(&mut self, ty: ValType) -> Result<()> {
-        self.pop_operand(Some(ty))?;
-        self.pop_operand(Some(ty))?;
-        self.push_operand(ty)?;
+    fn check_binary_op(&mut self, ty: ValType, bop: Option<BinOp>) -> Result<()> {
+        let (_, x) = self.pop_operand(Some(ty))?;
+        let (_, y) = self.pop_operand(Some(ty))?;
+        let new = self.push_operand(ty)?;
+        if let Some(b) = bop {
+            self.constraints.push(Constraint::Eq(
+                IndexTerm::Alpha(new),
+                IndexTerm::IBinOp(
+                    b,
+                    Box::new(IndexTerm::Alpha(y)),
+                    Box::new(IndexTerm::Alpha(x)),
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -728,7 +914,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn check_fbinary_op(&mut self, ty: ValType) -> Result<()> {
         debug_assert!(matches!(ty, ValType::F32 | ValType::F64));
         self.check_non_deterministic_enabled()?;
-        self.check_binary_op(ty)
+        self.check_binary_op(ty, None)
     }
 
     /// Checks the validity of an atomic load operator.
@@ -898,6 +1084,39 @@ fn ty_to_str(ty: ValType) -> &'static str {
     }
 }
 
+macro_rules! visit_op {
+    (BinOpI32: $name:ident, $op:expr) => {
+        fn $name(&mut self) -> Self::Output {
+            self.check_binary_op(ValType::I32, Some($op))
+        }
+    };
+    (CmpOpI32: $name:ident, $op:expr) => {
+        fn $name(&mut self) -> Self::Output {
+            self.check_cmp_op(ValType::I32, Some($op))
+        }
+    };
+    (UnOpI32: $name:ident, $op:expr) => {
+        fn $name(&mut self) -> Self::Output {
+            self.check_unary_op(ValType::I32, Some($op))
+        }
+    };
+    (BinOpI64: $name:ident, $op:expr) => {
+        fn $name(&mut self) -> Self::Output {
+            self.check_binary_op(ValType::I64, Some($op))
+        }
+    };
+    (CmpOpI64: $name:ident, $op:expr) => {
+        fn $name(&mut self) -> Self::Output {
+            self.check_cmp_op(ValType::I64, Some($op))
+        }
+    };
+    (UnOpI64: $name:ident, $op:expr) => {
+        fn $name(&mut self) -> Self::Output {
+            self.check_unary_op(ValType::I64, Some($op))
+        }
+    };
+}
+
 /// A wrapper "visitor" around the real operator validator internally which
 /// exists to check that the required wasm feature is enabled to proceed with
 /// validation.
@@ -968,28 +1187,41 @@ where
         Ok(())
     }
     fn visit_block(&mut self, ty: BlockType) -> Self::Output {
+        println!("Before: {:?}", self.constraints);
+        println!("Before: {:?}", self.indices);
+        println!("Before: {:?}", self.operands);
         self.check_block_type(ty)?;
+        let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            pres.push(idx);
         }
-        self.push_ctrl(FrameKind::Block, ty)?;
+        self.push_ctrl(FrameKind::Block, ty, pres)?;
+        println!("In block: {:?}", self.constraints);
+        println!("In block: {:?}", self.indices);
+        println!("In block: {:?}", self.operands);
+        
         Ok(())
     }
     fn visit_loop(&mut self, ty: BlockType) -> Self::Output {
         self.check_block_type(ty)?;
+        let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            pres.push(idx);
         }
-        self.push_ctrl(FrameKind::Loop, ty)?;
+        self.push_ctrl(FrameKind::Block, ty, pres)?;
         Ok(())
     }
     fn visit_if(&mut self, ty: BlockType) -> Self::Output {
         self.check_block_type(ty)?;
         self.pop_operand(Some(ValType::I32))?;
+        let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            pres.push(idx);
         }
-        self.push_ctrl(FrameKind::If, ty)?;
+        self.push_ctrl(FrameKind::Block, ty, pres)?;
         Ok(())
     }
     fn visit_else(&mut self) -> Self::Output {
@@ -997,95 +1229,31 @@ where
         if frame.kind != FrameKind::If {
             bail!(self.offset, "else found outside of an `if` block");
         }
-        self.push_ctrl(FrameKind::Else, frame.block_type)?;
+        self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new())?;
         Ok(())
     }
-    fn visit_try(&mut self, ty: BlockType) -> Self::Output {
-        self.check_block_type(ty)?;
-        for ty in self.params(ty)?.rev() {
-            self.pop_operand(Some(ty))?;
-        }
-        self.push_ctrl(FrameKind::Try, ty)?;
-        Ok(())
+    fn visit_try(&mut self, _ty: BlockType) -> Self::Output {
+        bail!(self.offset, "unsupported instrunction - try");
     }
-    fn visit_catch(&mut self, index: u32) -> Self::Output {
-        let frame = self.pop_ctrl()?;
-        if frame.kind != FrameKind::Try && frame.kind != FrameKind::Catch {
-            bail!(self.offset, "catch found outside of an `try` block");
-        }
-        // Start a new frame and push `exnref` value.
-        let height = self.operands.len();
-        self.control.push(Frame {
-            kind: FrameKind::Catch,
-            block_type: frame.block_type,
-            height,
-            unreachable: false,
-        });
-        // Push exception argument types.
-        let ty = self.tag_at(index)?;
-        for ty in ty.inputs() {
-            self.push_operand(ty)?;
-        }
-        Ok(())
+    fn visit_catch(&mut self, _index: u32) -> Self::Output {
+        bail!(self.offset, "unsupported instrunction - catch");
     }
-    fn visit_throw(&mut self, index: u32) -> Self::Output {
-        // Check values associated with the exception.
-        let ty = self.tag_at(index)?;
-        for ty in ty.inputs().rev() {
-            self.pop_operand(Some(ty))?;
-        }
-        if ty.outputs().len() > 0 {
-            bail!(
-                self.offset,
-                "result type expected to be empty for exception"
-            );
-        }
-        self.unreachable()?;
-        Ok(())
+    fn visit_throw(&mut self, _index: u32) -> Self::Output {
+        bail!(self.offset, "unsupported instrunction - throw");
     }
-    fn visit_rethrow(&mut self, relative_depth: u32) -> Self::Output {
-        // This is not a jump, but we need to check that the `rethrow`
-        // targets an actual `catch` to get the exception.
-        let (_, kind) = self.jump(relative_depth)?;
-        if kind != FrameKind::Catch && kind != FrameKind::CatchAll {
-            bail!(
-                self.offset,
-                "invalid rethrow label: target was not a `catch` block"
-            );
-        }
-        self.unreachable()?;
-        Ok(())
+    fn visit_rethrow(&mut self, _relative_depth: u32) -> Self::Output {
+        bail!(self.offset, "unsupported instrunction - rethrow");
     }
-    fn visit_delegate(&mut self, relative_depth: u32) -> Self::Output {
-        let frame = self.pop_ctrl()?;
-        if frame.kind != FrameKind::Try {
-            bail!(self.offset, "delegate found outside of an `try` block");
-        }
-        // This operation is not a jump, but we need to check the
-        // depth for validity
-        let _ = self.jump(relative_depth)?;
-        for ty in self.results(frame.block_type)? {
-            self.push_operand(ty)?;
-        }
-        Ok(())
+    fn visit_delegate(&mut self, _relative_depth: u32) -> Self::Output {
+        bail!(self.offset, "unsupported instrunction - delegate");
     }
     fn visit_catch_all(&mut self) -> Self::Output {
-        let frame = self.pop_ctrl()?;
-        if frame.kind == FrameKind::CatchAll {
-            bail!(self.offset, "only one catch_all allowed per `try` block");
-        } else if frame.kind != FrameKind::Try && frame.kind != FrameKind::Catch {
-            bail!(self.offset, "catch_all found outside of a `try` block");
-        }
-        let height = self.operands.len();
-        self.control.push(Frame {
-            kind: FrameKind::CatchAll,
-            block_type: frame.block_type,
-            height,
-            unreachable: false,
-        });
-        Ok(())
+        bail!(self.offset, "unsupported instrunction - catch_all");
     }
     fn visit_end(&mut self) -> Self::Output {
+        println!("In block: {:?}", self.constraints);
+        println!("In block: {:?}", self.indices);
+        println!("In block: {:?}", self.operands);
         let mut frame = self.pop_ctrl()?;
 
         // Note that this `if` isn't included in the appendix right
@@ -1093,12 +1261,23 @@ where
         // missing an `else` block which have the same parameter/return
         // types on the block (since that's valid).
         if frame.kind == FrameKind::If {
-            self.push_ctrl(FrameKind::Else, frame.block_type)?;
+            self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new())?;
             frame = self.pop_ctrl()?;
         }
+        let mut new_indices = Vec::new();
         for ty in self.results(frame.block_type)? {
-            self.push_operand(ty)?;
+            new_indices.push(self.push_operand(ty)?);
         }
+
+        let mut constraints = frame.constraints.clone();
+        println!("Frame constraints: {:?}, frame post: {:?}", constraints, frame.post);
+        let mut new_constraints = self.unify_constraints(&new_indices, frame.post, false)?;
+
+        new_constraints.append(&mut constraints);
+        self.constraints = new_constraints;
+        println!("After: {:?}", self.constraints);
+        println!("After: {:?}", self.indices);
+        println!("After: {:?}", self.operands);
 
         if self.control.is_empty() && self.end_which_emptied_control.is_none() {
             assert_ne!(self.offset, 0);
@@ -1107,7 +1286,7 @@ where
         Ok(())
     }
     fn visit_br(&mut self, relative_depth: u32) -> Self::Output {
-        let (ty, kind) = self.jump(relative_depth)?;
+        let (ty, kind, _) = self.jump(relative_depth)?;
         for ty in self.label_types(ty, kind)?.rev() {
             self.pop_operand(Some(ty))?;
         }
@@ -1116,7 +1295,7 @@ where
     }
     fn visit_br_if(&mut self, relative_depth: u32) -> Self::Output {
         self.pop_operand(Some(ValType::I32))?;
-        let (ty, kind) = self.jump(relative_depth)?;
+        let (ty, kind, _) = self.jump(relative_depth)?;
         let types = self.label_types(ty, kind)?;
         for ty in types.clone().rev() {
             self.pop_operand(Some(ty))?;
@@ -1143,10 +1322,11 @@ where
             debug_assert!(self.br_table_tmp.is_empty());
             for ty in tys.rev() {
                 let ty = self.pop_operand(Some(ty))?;
-                self.br_table_tmp.push(ty);
+                self.br_table_tmp.push(ty.0);
             }
             for ty in self.inner.br_table_tmp.drain(..).rev() {
-                self.inner.operands.push(ty);
+                // TODO: indices in branch
+                self.inner.operands.push((ty, MAX));
             }
         }
         for ty in default_types.rev() {
@@ -1189,13 +1369,16 @@ where
         Ok(())
     }
     fn visit_drop(&mut self) -> Self::Output {
+        println!("{:?}", self.constraints);
+        println!("{:?}", self.indices);
+        println!("{:?}", self.operands);
         self.pop_operand(None)?;
         Ok(())
     }
     fn visit_select(&mut self) -> Self::Output {
-        self.pop_operand(Some(ValType::I32))?;
-        let ty1 = self.pop_operand(None)?;
-        let ty2 = self.pop_operand(None)?;
+        let (_, a0) = self.pop_operand(Some(ValType::I32))?;
+        let (ty1, a1) = self.pop_operand(None)?;
+        let (ty2, a2) = self.pop_operand(None)?;
         fn is_num(ty: Option<ValType>) -> bool {
             matches!(
                 ty,
@@ -1219,7 +1402,8 @@ where
                 "type mismatch: select operands have different types"
             )
         }
-        self.push_operand(ty1.or(ty2))?;
+        let x = self.push_operand(ty1.or(ty2))?;
+        self.constraints.push(constraint!(r#if (= a0 (i32 0)) (= x a1) (= x a2)));
         Ok(())
     }
     fn visit_typed_select(&mut self, ty: ValType) -> Self::Output {
@@ -1233,19 +1417,23 @@ where
         Ok(())
     }
     fn visit_local_get(&mut self, local_index: u32) -> Self::Output {
-        let ty = self.local(local_index)?;
-        self.push_operand(ty)?;
+        let (ty, l_idx) = self.local(local_index)?;
+        let new = self.push_operand(ty)?;
+        self.constraints.push(constraint!(= l_idx new));
         Ok(())
     }
     fn visit_local_set(&mut self, local_index: u32) -> Self::Output {
-        let ty = self.local(local_index)?;
-        self.pop_operand(Some(ty))?;
+        let (ty, _) = self.local(local_index)?;
+        let (_, new) = self.pop_operand(Some(ty))?;
+        self.replace_local(local_index, new)?;
         Ok(())
     }
     fn visit_local_tee(&mut self, local_index: u32) -> Self::Output {
-        let ty = self.local(local_index)?;
-        self.pop_operand(Some(ty))?;
-        self.push_operand(ty)?;
+        let (ty, _) = self.local(local_index)?;
+        let (_, new_local) = self.pop_operand(Some(ty))?;
+        self.replace_local(local_index, new_local)?;
+        let new_stack = self.push_operand(ty)?;
+        self.constraints.push(constraint!(= new_local new_stack));
         Ok(())
     }
     fn visit_global_get(&mut self, global_index: u32) -> Self::Output {
@@ -1415,11 +1603,13 @@ where
         Ok(())
     }
     fn visit_i32_const(&mut self, _value: i32) -> Self::Output {
-        self.push_operand(ValType::I32)?;
+        let index = self.push_operand(ValType::I32)?;
+        self.constraints.push(constraint!(= index (i32 _value)));
         Ok(())
     }
     fn visit_i64_const(&mut self, _value: i64) -> Self::Output {
-        self.push_operand(ValType::I64)?;
+        let index = self.push_operand(ValType::I64)?;
+        self.constraints.push(constraint!(= index (i64 _value)));
         Ok(())
     }
     fn visit_f32_const(&mut self, _value: Ieee32) -> Self::Output {
@@ -1433,75 +1623,37 @@ where
         Ok(())
     }
     fn visit_i32_eqz(&mut self) -> Self::Output {
-        self.pop_operand(Some(ValType::I32))?;
-        self.push_operand(ValType::I32)?;
+        let (_, old) = self.pop_operand(Some(ValType::I32))?;
+        let new = self.push_operand(ValType::I32)?;
+        self.constraints.push(constraint!(= new (i32.eqz old)));
         Ok(())
     }
-    fn visit_i32_eq(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_ne(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_lt_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_lt_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_gt_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_gt_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_le_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_le_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_ge_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
-    fn visit_i32_ge_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I32)
-    }
+    visit_op!(CmpOpI32: visit_i32_eq, RelOp::I32Eq);
+    visit_op!(CmpOpI32: visit_i32_ne, RelOp::I32Ne);
+    visit_op!(CmpOpI32: visit_i32_lt_s, RelOp::I32LtS);
+    visit_op!(CmpOpI32: visit_i32_lt_u, RelOp::I32LtU);
+    visit_op!(CmpOpI32: visit_i32_gt_s, RelOp::I32GtS);
+    visit_op!(CmpOpI32: visit_i32_gt_u, RelOp::I32GtU);
+    visit_op!(CmpOpI32: visit_i32_le_s, RelOp::I32LeS);
+    visit_op!(CmpOpI32: visit_i32_le_u, RelOp::I32LeU);
+    visit_op!(CmpOpI32: visit_i32_ge_s, RelOp::I32GeS);
+    visit_op!(CmpOpI32: visit_i32_ge_u, RelOp::I32GeU);
     fn visit_i64_eqz(&mut self) -> Self::Output {
-        self.pop_operand(Some(ValType::I64))?;
-        self.push_operand(ValType::I32)?;
+        let (_, old) = self.pop_operand(Some(ValType::I64))?;
+        let new = self.push_operand(ValType::I64)?;
+        self.constraints.push(constraint!(= new (i64.eqz old)));
         Ok(())
     }
-    fn visit_i64_eq(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_ne(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_lt_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_lt_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_gt_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_gt_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_le_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_le_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_ge_s(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
-    fn visit_i64_ge_u(&mut self) -> Self::Output {
-        self.check_cmp_op(ValType::I64)
-    }
+    visit_op!(CmpOpI64: visit_i64_eq, RelOp::I64Eq);
+    visit_op!(CmpOpI64: visit_i64_ne, RelOp::I64Ne);
+    visit_op!(CmpOpI64: visit_i64_lt_s, RelOp::I64LtS);
+    visit_op!(CmpOpI64: visit_i64_lt_u, RelOp::I64LtU);
+    visit_op!(CmpOpI64: visit_i64_gt_s, RelOp::I64GtS);
+    visit_op!(CmpOpI64: visit_i64_gt_u, RelOp::I64GtU);
+    visit_op!(CmpOpI64: visit_i64_le_s, RelOp::I64LeS);
+    visit_op!(CmpOpI64: visit_i64_le_u, RelOp::I64LeU);
+    visit_op!(CmpOpI64: visit_i64_ge_s, RelOp::I64GeS);
+    visit_op!(CmpOpI64: visit_i64_ge_u, RelOp::I64GeU);
     fn visit_f32_eq(&mut self) -> Self::Output {
         self.check_fcmp_op(ValType::F32)
     }
@@ -1538,114 +1690,42 @@ where
     fn visit_f64_ge(&mut self) -> Self::Output {
         self.check_fcmp_op(ValType::F64)
     }
-    fn visit_i32_clz(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I32)
-    }
-    fn visit_i32_ctz(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I32)
-    }
-    fn visit_i32_popcnt(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I32)
-    }
-    fn visit_i32_add(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_sub(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_mul(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_div_s(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_div_u(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_rem_s(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_rem_u(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_and(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_or(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_xor(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_shl(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_shr_s(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_shr_u(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_rotl(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i32_rotr(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I32)
-    }
-    fn visit_i64_clz(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I64)
-    }
-    fn visit_i64_ctz(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I64)
-    }
-    fn visit_i64_popcnt(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I64)
-    }
-    fn visit_i64_add(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_sub(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_mul(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_div_s(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_div_u(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_rem_s(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_rem_u(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_and(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_or(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_xor(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_shl(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_shr_s(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_shr_u(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_rotl(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
-    fn visit_i64_rotr(&mut self) -> Self::Output {
-        self.check_binary_op(ValType::I64)
-    }
+    visit_op!(UnOpI32: visit_i32_clz, UnOp::I32Clz);
+    visit_op!(UnOpI32: visit_i32_ctz, UnOp::I32Ctz);
+    visit_op!(UnOpI32: visit_i32_popcnt, UnOp::I32Popcnt);
+    visit_op!(BinOpI32: visit_i32_add, BinOp::I32Add);
+    visit_op!(BinOpI32: visit_i32_sub, BinOp::I32Sub);
+    visit_op!(BinOpI32: visit_i32_mul, BinOp::I32Mul);
+    visit_op!(BinOpI32: visit_i32_div_s, BinOp::I32DivS);
+    visit_op!(BinOpI32: visit_i32_div_u, BinOp::I32DivU);
+    visit_op!(BinOpI32: visit_i32_rem_s, BinOp::I32RemS);
+    visit_op!(BinOpI32: visit_i32_rem_u, BinOp::I32RemU);
+    visit_op!(BinOpI32: visit_i32_and, BinOp::I32And);
+    visit_op!(BinOpI32: visit_i32_or, BinOp::I32Or);
+    visit_op!(BinOpI32: visit_i32_xor, BinOp::I32Xor);
+    visit_op!(BinOpI32: visit_i32_shl, BinOp::I32Shl);
+    visit_op!(BinOpI32: visit_i32_shr_s, BinOp::I32ShrS);
+    visit_op!(BinOpI32: visit_i32_shr_u, BinOp::I32ShrU);
+    visit_op!(BinOpI32: visit_i32_rotl, BinOp::I32Rotl);
+    visit_op!(BinOpI32: visit_i32_rotr, BinOp::I32Rotr);
+    visit_op!(UnOpI64: visit_i64_clz, UnOp::I64Clz);
+    visit_op!(UnOpI64: visit_i64_ctz, UnOp::I64Ctz);
+    visit_op!(UnOpI64: visit_i64_popcnt, UnOp::I64Popcnt);
+    visit_op!(BinOpI64: visit_i64_add, BinOp::I64Add);
+    visit_op!(BinOpI64: visit_i64_sub, BinOp::I64Sub);
+    visit_op!(BinOpI64: visit_i64_mul, BinOp::I64Mul);
+    visit_op!(BinOpI64: visit_i64_div_s, BinOp::I64DivS);
+    visit_op!(BinOpI64: visit_i64_div_u, BinOp::I64DivU);
+    visit_op!(BinOpI64: visit_i64_rem_s, BinOp::I64RemS);
+    visit_op!(BinOpI64: visit_i64_rem_u, BinOp::I64RemU);
+    visit_op!(BinOpI64: visit_i64_and, BinOp::I64And);
+    visit_op!(BinOpI64: visit_i64_or, BinOp::I64Or);
+    visit_op!(BinOpI64: visit_i64_xor, BinOp::I64Xor);
+    visit_op!(BinOpI64: visit_i64_shl, BinOp::I64Shl);
+    visit_op!(BinOpI64: visit_i64_shr_s, BinOp::I64ShrS);
+    visit_op!(BinOpI64: visit_i64_shr_u, BinOp::I64ShrU);
+    visit_op!(BinOpI64: visit_i64_rotl, BinOp::I64Rotl);
+    visit_op!(BinOpI64: visit_i64_rotr, BinOp::I64Rotr);
     fn visit_f32_abs(&mut self) -> Self::Output {
         self.check_funary_op(ValType::F32)
     }
@@ -1830,19 +1910,19 @@ where
         self.check_conversion_op(ValType::I64, ValType::F64)
     }
     fn visit_i32_extend8_s(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I32)
+        self.check_unary_op(ValType::I32, None)
     }
     fn visit_i32_extend16_s(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I32)
+        self.check_unary_op(ValType::I32, None)
     }
     fn visit_i64_extend8_s(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I64)
+        self.check_unary_op(ValType::I64, None)
     }
     fn visit_i64_extend16_s(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I64)
+        self.check_unary_op(ValType::I64, None)
     }
     fn visit_i64_extend32_s(&mut self) -> Self::Output {
-        self.check_unary_op(ValType::I64)
+        self.check_unary_op(ValType::I64, None)
     }
     fn visit_i32_atomic_load(&mut self, memarg: MemArg) -> Self::Output {
         self.check_atomic_load(memarg, ValType::I32)
@@ -2066,19 +2146,7 @@ where
         Ok(())
     }
     fn visit_ref_is_null(&mut self) -> Self::Output {
-        match self.pop_operand(None)? {
-            None => {}
-            Some(t) => {
-                if !t.is_reference_type() {
-                    bail!(
-                        self.offset,
-                        "type mismatch: invalid reference type in ref.is_null"
-                    );
-                }
-            }
-        }
-        self.push_operand(ValType::I32)?;
-        Ok(())
+        bail!(self.offset, "no")
     }
     fn visit_ref_func(&mut self, function_index: u32) -> Self::Output {
         if self.resources.type_of_function(function_index).is_none() {
@@ -3180,21 +3248,11 @@ impl Locals {
     /// Returns `true` if the definition was successful. Local variable
     /// definition is unsuccessful in case the amount of total variables
     /// after definition exceeds the allowed maximum number.
-    fn define(&mut self, count: u32, ty: ValType) -> bool {
-        match self.num_locals.checked_add(count) {
-            Some(n) => self.num_locals = n,
-            None => return false,
-        }
+    fn add_local(&mut self, ty: ValType, alpha: u32) -> bool {
         if self.num_locals > (MAX_WASM_FUNCTION_LOCALS as u32) {
             return false;
         }
-        for _ in 0..count {
-            if self.first.len() >= MAX_LOCALS_TO_TRACK {
-                break;
-            }
-            self.first.push(ty);
-        }
-        self.all.push((self.num_locals - 1, ty));
+        self.first.push((ty, alpha));
         true
     }
 
@@ -3205,13 +3263,14 @@ impl Locals {
 
     /// Returns the type of the local variable at the given index if any.
     #[inline]
-    pub(super) fn get(&self, idx: u32) -> Option<ValType> {
-        match self.first.get(idx as usize) {
-            Some(ty) => Some(*ty),
-            None => self.get_bsearch(idx),
-        }
+    pub(super) fn get(&self, idx: u32) -> Option<(ValType, u32)> {
+        self.first.get(idx as usize).map(|x| *x)
     }
 
+    pub(super) fn replace_index(&mut self, idx: u32, alpha: u32) {
+        self.first.get_mut(idx as usize).map(|x| (*x).1 = alpha);
+    }
+    /*
     fn get_bsearch(&self, idx: u32) -> Option<ValType> {
         match self.all.binary_search_by_key(&idx, |(idx, _)| *idx) {
             // If this index would be inserted at the end of the list, then the
@@ -3225,5 +3284,5 @@ impl Locals {
             // list at index `i`.
             Ok(i) | Err(i) => Some(self.all[i].1),
         }
-    }
+    }*/
 }
