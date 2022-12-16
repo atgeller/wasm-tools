@@ -27,7 +27,7 @@ use index_language::constraint;
 use crate::{
     limits::MAX_WASM_FUNCTION_LOCALS, BinOp, BinaryReaderError, BlockType, BrTable, Constant,
     Constraint, Ieee32, Ieee64, IndexTerm, MemArg, RelOp, Result, UnOp, TestOp, ValType, VisitOperator,
-    WasmFeatures, WasmFuncType, WasmModuleResources, V128,
+    WasmFeatures, WasmFuncType, WasmModuleResources, V128, validator::solver::{Z3, ConstraintSolver},
 };
 use std::{
     ops::{Deref, DerefMut},
@@ -525,8 +525,13 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
         let height = self.operands.len();
+        let unified = self.unify_block_type(&consumed, ty, true)?;
         let post = self.unify_block_type(&consumed, ty, false)?;
         let constraints = self.constraints.clone();
+
+        let result = Z3::satisfies(&self.indices, &constraints, &unified);
+
+        println!("Satisfies?: {}", result);
 
         self.control.push(Frame {
             kind,

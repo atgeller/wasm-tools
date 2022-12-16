@@ -49,6 +49,7 @@ mod component;
 mod core;
 mod func;
 mod operators;
+mod solver;
 pub mod types;
 
 use self::component::*;
