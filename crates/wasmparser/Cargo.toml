@@ -15,7 +15,7 @@ exclude = ["benches/*.wasm"]
 [dependencies]
 indexmap = { workspace = true }
 index_language = { path = "./src/validator/index_language" }
-z3 = { git="https://github.com/prove-rs/z3.rs", rev = "b5a9f851a2ba3fe169abfa289daa706739b82d1a" }
+z3 = { git="https://github.com/Trolldemorted/z3.rs/", rev="2d8ed61411f6d0672c7987a7ceafbd0e68db5ed9" }
 
 [dev-dependencies]
 anyhow = { workspace = true }

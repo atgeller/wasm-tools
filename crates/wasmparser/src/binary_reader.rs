@@ -468,7 +468,6 @@ impl<'a> BinaryReader<'a> {
             pres_posts.push(self.read_constraint()?);
         }
 
-        println!("{:?}", pres_posts);
         Ok(IndexedFuncType::from_raw_parts(
             params_results.into(),
             len_params,

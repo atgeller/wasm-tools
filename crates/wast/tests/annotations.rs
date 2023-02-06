@@ -54,20 +54,70 @@ fn assert_func_name(name: &str, wat: &str) -> anyhow::Result<()> {
 
 #[test]
 fn precheck_annotations() -> anyhow::Result<()> {
-    wat::parse_str(r#"(module (func (param $a i32) (result $b i32) (post (eq $a $b))))"#)?;
-    wat::parse_str(r#"(module (func (param i32 i32) (result $b i32) (post (eq (i32 1) (i32.gt_s $b (i32 0))))))"#)?;
-    wat::parse_str(r#"(module (func (param (@name "foo") i32)))"#)?;
+    //let str = wat::parse_str(r#"(module (func (param $a i32) (result $b i32) (post (eq $a $b))))"#)?;
+    //inspect_types(r#"(module (func (param $a i32) (result $b i32) (post (eq $a $b))))"#)?;
+    //wasmparser::
+    //wat::parse_str(r#"(module (func (param i32 i32) (result $b i32) (post (eq (i32 1) (i32.gt_s $b (i32 0))))))"#)?;
+    //wat::parse_str(r#"(module (func (param (@name "foo") i32)))"#)?;
+
+    let wasm = wat::parse_str(r#"(module
+        (func
+            (param $a i32)
+            (result $b i32)
+            (post (eq $b (i32.add (i32 1) $a)))
+            (local.get 0)
+            (i32.const 1)
+            i32.add
+        )
+        (func
+            (result $b i32)
+            (post (eq (i32 1) (i32.gt_s $b (i32 0))))
+            (i32.const 42)
+            (call 0)
+        )
+    )"#)?;
+
+    wasmparser::validate(&wasm.as_slice())?;
     Ok(())
 }
 
+// [0, 97, 115, 109, 1, 0, 0, 0, 1, 6, 1, 96, 1, 127, 1, 127, 3, 2, 1, 0, 10, 4, 1, 2, 0, 11, 0, 13, 4, 110, 97, 109, 101, 2, 6, 1, 0, 1, 0, 1, 97]
+// [0, 97, 115, 109, 1, 0, 0, 0, 1, 13, 1, 96, 1, 127, 1, 127, 0, 1, 1, 33, 0, 34, 0, 3, 2, 1, 0, 10, 4, 1, 2, 0, 11, 0, 13, 4, 110, 97, 109, 101, 2, 6, 1, 0, 1, 0, 1, 97]
+
 #[test]
 fn precheck_block_annotations() -> anyhow::Result<()> {
-    wat::parse_str(r#"(module (func block (param $a i32) (pre (eq $a (i32 0))) drop end))"#)?;
-    wat::parse_str(r#"(module (func (param $a i32) block (param $a i32) (pre (eq $a (local $a))) drop end))"#)?;
+    //wat::parse_str(r#"(module (func block (param $a i32) (pre (eq $a (i32 0))) drop end))"#)?;
+    /*wat::parse_str(
+        r#"(module (func (param $a i32) block (param $a i32) (pre (eq $a (local $a))) drop end))"#,
+    )?;*/
+    //wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (pre (eq $a (local $a))) drop end))"#)?;
+    //wat::parse_str(r#"(module (func (param $l i32) (i32.const 1) block (param $a i32) (pre (eq $a (i32 0))) (post (eq (local $l) (i32.add $a (i32 1)))) (i32.const 1) i32.add (local.set $l) end))"#)?;
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 1) i32.add end drop))"#)?;
+    // Expect fail
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 2) i32.add end drop))"#)?;
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 1) (br 0) i32.add end drop))"#)?;
+    // Expect fail
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 2) (br 0) i32.add end drop))"#)?;
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 1) i32.add (i32.const 1) (br_if 0) end drop))"#)?;
+    // Expect fail
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 2) i32.add (i32.const 0) (br_if 0) end drop))"#)?;
+    // Expect fail
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 2) i32.add (i32.const 1) (br_if 0) unreachable end drop))"#)?;
+    // Expect fail
+    //let wasm = wat::parse_str(r#"(module (func (i32.const 0) block (param $a i32) (result $b i32) (pre (eq $a (i32 0))) (post (eq $b (i32.add $a (i32 1)))) (i32.const 2) i32.add (i32.const 1) (br_if 0) end drop))"#)?;
     // Function definitions cannot reference locals
     //wat::parse_str(r#"(module (func (param $a i32) (pre (eq $a (local $b)))))"#)?;
     // Not sure this is legal anyway but disallowed
     //wat::parse_str(r#"(module (type (func (param $a i32) (pre (eq $a (local $b))))) (func (param $b i32) block (type 0) drop end))"#)?;
+
+    //wasmparser::validate(&wasm.as_slice())?;
+    Ok(())
+}
+
+#[test]
+fn precheck_instructions() -> anyhow::Result<()> {
+    let wasm = wat::parse_str(r#"(module (func (local i32) (local i32) (local.get 0) (local.get 1) (local.get 1) (i32.const 1) select i32.div_s drop))"#)?;
+    wasmparser::validate(&wasm.as_slice())?;
     Ok(())
 }
 
@@ -78,6 +128,7 @@ fn local_annotations() -> anyhow::Result<()> {
     assert_local_name("foo", r#"(module (func (param (@name "foo") i32)))"#)?;
     assert_local_name("foo", r#"(module (func (local (@name "foo") i32)))"#)?;
     assert_local_name("foo", r#"(module (func (param $bar (@name "foo") i32)))"#)?;
+    //assert_local_name("foo", r#"(module (func ((((i32 a)) ()) -> ((i32 b) (= a b)))))"#)?;
     assert_local_name("foo", r#"(module (func (local $bar (@name "foo") i32)))"#)?;
     assert_local_name(
         "foo bar",
@@ -128,6 +179,7 @@ fn get_name_section(wasm: &[u8]) -> anyhow::Result<NameSectionReader<'_>> {
 
 fn inspect_types(wat: &str) -> anyhow::Result<()> {
     let wasm = wat::parse_str(wat)?;
+    //wasmparser::validate(&wasm.as_slice())?;
     for _ in get_type_section(&wasm)? {
         // Just exercising the reader
     }

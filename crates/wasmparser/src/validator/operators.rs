@@ -104,6 +104,8 @@ pub struct Frame {
     pub unreachable: bool,
     /// The list of constraints with which we hit the control frame
     pub constraints: Vec<Constraint>,
+    /// The label condition (for loops, when different from post condition)
+    pub br_cond: Option<Vec<Constraint>>,
     /// The post-condition for exiting the control frame
     pub post: Vec<Constraint>,
 }
@@ -199,22 +201,25 @@ impl OperatorValidator {
         T: WasmModuleResources,
     {
         let mut ret = OperatorValidator::new(features, allocs);
+        let functy = OperatorValidatorTemp {
+            // This offset is used by the `func_type_at` and `inputs`.
+            offset,
+            inner: &mut ret,
+            resources,
+        }
+        .func_type_at(ty)?;
+
         ret.control.push(Frame {
             kind: FrameKind::Block,
             block_type: BlockType::FuncType(ty),
             height: 0,
             unreachable: false,
             constraints: Vec::new(),
-            post: Vec::new(),
+            br_cond: None,
+            post: functy.post_conditions().to_vec(),
         });
-        let params = OperatorValidatorTemp {
-            // This offset is used by the `func_type_at` and `inputs`.
-            offset,
-            inner: &mut ret,
-            resources,
-        }
-        .func_type_at(ty)?
-        .inputs();
+
+        let params = functy.inputs();
         for ty in params {
             let index = ret.indices.len();
             ret.indices.push(Some(ty));
@@ -238,6 +243,7 @@ impl OperatorValidator {
             height: 0,
             unreachable: false,
             constraints: Vec::new(),
+            br_cond: None,
             post: Vec::new(),
         });
         ret
@@ -526,21 +532,15 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // operand stack.
         let height = self.operands.len();
         let unified = self.unify_block_type(&consumed, ty, true)?;
-        let post = self.unify_block_type(&consumed, ty, false)?;
         let constraints = self.constraints.clone();
 
-        let result = Z3::satisfies(&self.indices, &constraints, &unified);
+        if !self.check_condition_is_satisfied(&unified) {
+            bail!(
+                self.offset,
+                "constraints do not satisfy block precondition!"
+            )
+        }
 
-        println!("Satisfies?: {}", result);
-
-        self.control.push(Frame {
-            kind,
-            block_type: ty,
-            height,
-            unreachable: false,
-            constraints,
-            post,
-        });
         // All of the parameters are now also available in this control frame,
         // so we push them here in order.
         let mut new_indices = Vec::new();
@@ -549,6 +549,24 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             new_indices.push(x);
         }
         self.constraints = self.unify_block_type(&new_indices, ty, true)?;
+
+        let br_cond = if kind == FrameKind::Loop {
+            Some(unified)
+        } else {
+            None
+        };
+
+        let post = self.unify_block_type(&new_indices, ty, false)?;
+        self.control.push(Frame {
+            kind,
+            block_type: ty,
+            height,
+            unreachable: false,
+            constraints,
+            br_cond,
+            post,
+        });
+
         Ok(())
     }
 
@@ -565,11 +583,27 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         };
         let ty = frame.block_type;
         let height = frame.height;
+        let cond = if frame.kind == FrameKind::Loop {
+            frame.br_cond.clone().unwrap()
+        } else {
+            frame.post.clone()            
+        };
 
         // Pop all the result types, in reverse order, from the operand stack.
         // These types will, possibly, be transferred to the next frame.
+        let mut results = Vec::new();
         for ty in self.results(ty)?.rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            results.push(idx);
+        }
+
+        let condition = self.unify_constraints(&results, cond, false, false)?;
+
+        if !self.check_condition_is_satisfied(&condition) {
+            bail!(
+                self.offset,
+                "constraints do not satisfy block post-condition"
+            )
         }
 
         // Make sure that the operand stack has returned to is original
@@ -650,17 +684,17 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 
      /// Unifies an index_term
-     fn unify_index_term(&self, consumed: &Vec<u32>, it: &mut IndexTerm, is_pre: bool) -> Result<()> {
+     fn unify_index_term(&self, consumed: &Vec<u32>, it: &mut IndexTerm, is_pre: bool, is_call: bool) -> Result<()> {
         let idx = match it {
             IndexTerm::IBinOp(_, x, y)
             | IndexTerm::IRelOp(_, x, y) => {
-                self.unify_index_term(consumed, &mut *x, is_pre)?;
-                self.unify_index_term(consumed, &mut *y, is_pre)?;
+                self.unify_index_term(consumed, &mut *x, is_pre, is_call)?;
+                self.unify_index_term(consumed, &mut *y, is_pre, is_call)?;
                 None
             },
             IndexTerm::ITestOp(_, x)
             | IndexTerm::IUnOp(_, x) => {
-                self.unify_index_term(consumed, &mut *x, is_pre)?;
+                self.unify_index_term(consumed, &mut *x, is_pre, is_call)?;
                 None
             },
             IndexTerm::Pre(idx) => {
@@ -677,7 +711,15 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                     Some(*idx as usize)
                 }
             },
-            IndexTerm::Local(_) => todo!(),
+            IndexTerm::Local(idx) => {
+                if is_call {
+                    Some(*idx as usize)
+                } else {
+                    let (_, alpha) = self.local(*idx)?;
+                    *it = IndexTerm::Alpha(alpha);
+                    return Ok(());
+                }
+            },
             _ => None
         };
 
@@ -695,25 +737,26 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         &self,
         consumed: &Vec<u32>,
         c: &mut Constraint,
-        is_pre: bool
+        is_pre: bool,
+        is_call: bool
     ) -> Result<()> {
         match c {
             Constraint::Eq(x, y) => {
-                self.unify_index_term(consumed, x, is_pre)?;
-                self.unify_index_term(consumed, y, is_pre)?;
+                self.unify_index_term(consumed, x, is_pre, is_call)?;
+                self.unify_index_term(consumed, y, is_pre, is_call)?;
             },
             Constraint::And(x, y)
             | Constraint::Or(x, y) => {
-                self.unify_constraint(consumed, x, is_pre)?;
-                self.unify_constraint(consumed, y, is_pre)?;
+                self.unify_constraint(consumed, x, is_pre, is_call)?;
+                self.unify_constraint(consumed, y, is_pre, is_call)?;
             },
             Constraint::If(x, y, z) => {
-                self.unify_constraint(consumed, x, is_pre)?;
-                self.unify_constraint(consumed, y, is_pre)?;
-                self.unify_constraint(consumed, z, is_pre)?;
+                self.unify_constraint(consumed, x, is_pre, is_call)?;
+                self.unify_constraint(consumed, y, is_pre, is_call)?;
+                self.unify_constraint(consumed, z, is_pre, is_call)?;
             },
             Constraint::Not(x) => {
-                self.unify_constraint(consumed, x, is_pre)?;
+                self.unify_constraint(consumed, x, is_pre, is_call)?;
             },
         }
 
@@ -721,12 +764,12 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 
     /// Unifies the constraints from a block_type
-    fn unify_constraints(&self, consumed: &Vec<u32>, constraints: Vec<Constraint>, is_pre: bool) -> Result<Vec<Constraint>> {
+    fn unify_constraints(&self, consumed: &Vec<u32>, constraints: Vec<Constraint>, is_pre: bool, is_call: bool) -> Result<Vec<Constraint>> {
         let mut new_constraints = Vec::new();
 
         for c in constraints.iter() {
             let mut copy = c.clone();
-            self.unify_constraint(consumed, &mut copy, is_pre)?;
+            self.unify_constraint(consumed, &mut copy, is_pre, is_call)?;
             new_constraints.push(copy);
         }
 
@@ -747,12 +790,24 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
 
                 let new_constraints = constraints.iter().map(|x| x.clone()).collect();
 
-                let unified = self.unify_constraints(consumed, new_constraints, true)?;
+                let unified = self.unify_constraints(consumed, new_constraints, true, false)?;
 
                 Ok(unified)
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Checks whether the current set of constraints satisfies the post-condition
+    /// condition should already be unified with variables from stack/locals
+    /// Always returns true when self.unreachable
+    fn check_condition_is_satisfied(&self, condition: &Vec<Constraint>) -> bool {
+        let control = match self.control.last() {
+            Some(frame) => frame,
+            None => return false,
+        };
+
+        control.unreachable || Z3::satisfies(&self.indices, &self.constraints, condition)
     }
 
     /// Validates a block type, primarily with various in-flight proposals.
@@ -790,12 +845,29 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 );
             }
         };
+
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
         for ty in ty.inputs().rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            inputs.push(idx);
         }
         for ty in ty.outputs() {
-            self.push_operand(ty)?;
+            outputs.push(self.push_operand(ty)?);
         }
+
+        let pre = self.unify_constraints(&inputs, ty.pre_conditions().into(), true, true)?;
+        let post = self.unify_constraints(&inputs, ty.post_conditions().into(), true, true)?;
+        let mut post = self.unify_constraints(&outputs, post, false, true)?;
+
+        if !self.check_condition_is_satisfied(&pre) {
+            bail!(
+                self.offset,
+                "call - function pre-condition not satisfied"
+            )
+        }
+        self.constraints.append(&mut post);
+
         Ok(())
     }
 
@@ -831,8 +903,24 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         if self.control.is_empty() {
             return Err(self.err_beyond_end(self.offset));
         }
+
+        let mut returns = Vec::new();
         for ty in self.results(self.control[0].block_type)?.rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            returns.push(idx);
+        }
+
+        let unified = self.unify_constraints(
+            &returns,
+            self.control[0].post.clone(),
+            false,
+            false
+        )?;
+        if !self.check_condition_is_satisfied(&unified) {
+            bail!(
+                self.offset,
+                "return - function post condition not satisfied"
+            )
         }
         self.unreachable()?;
         Ok(())
@@ -1192,9 +1280,6 @@ where
         Ok(())
     }
     fn visit_block(&mut self, ty: BlockType) -> Self::Output {
-        println!("Before: {:?}", self.constraints);
-        println!("Before: {:?}", self.indices);
-        println!("Before: {:?}", self.operands);
         self.check_block_type(ty)?;
         let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
@@ -1202,9 +1287,6 @@ where
             pres.push(idx);
         }
         self.push_ctrl(FrameKind::Block, ty, pres)?;
-        println!("In block: {:?}", self.constraints);
-        println!("In block: {:?}", self.indices);
-        println!("In block: {:?}", self.operands);
         
         Ok(())
     }
@@ -1215,7 +1297,7 @@ where
             let (_, idx) = self.pop_operand(Some(ty))?;
             pres.push(idx);
         }
-        self.push_ctrl(FrameKind::Block, ty, pres)?;
+        self.push_ctrl(FrameKind::Loop, ty, pres)?;
         Ok(())
     }
     fn visit_if(&mut self, ty: BlockType) -> Self::Output {
@@ -1256,9 +1338,6 @@ where
         bail!(self.offset, "unsupported instrunction - catch_all");
     }
     fn visit_end(&mut self) -> Self::Output {
-        println!("In block: {:?}", self.constraints);
-        println!("In block: {:?}", self.indices);
-        println!("In block: {:?}", self.operands);
         let mut frame = self.pop_ctrl()?;
 
         // Note that this `if` isn't included in the appendix right
@@ -1275,14 +1354,10 @@ where
         }
 
         let mut constraints = frame.constraints.clone();
-        println!("Frame constraints: {:?}, frame post: {:?}", constraints, frame.post);
-        let mut new_constraints = self.unify_constraints(&new_indices, frame.post, false)?;
+        let mut new_constraints = self.unify_constraints(&new_indices, frame.post, false, false)?;
 
         new_constraints.append(&mut constraints);
         self.constraints = new_constraints;
-        println!("After: {:?}", self.constraints);
-        println!("After: {:?}", self.indices);
-        println!("After: {:?}", self.operands);
 
         if self.control.is_empty() && self.end_which_emptied_control.is_none() {
             assert_ne!(self.offset, 0);
@@ -1291,23 +1366,49 @@ where
         Ok(())
     }
     fn visit_br(&mut self, relative_depth: u32) -> Self::Output {
-        let (ty, kind, _) = self.jump(relative_depth)?;
+        let (ty, kind, post) = self.jump(relative_depth)?;
+        let mut args = Vec::new();
         for ty in self.label_types(ty, kind)?.rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            args.push(idx);
+        }
+        let unified = self.unify_constraints(&args, post, false, false)?;
+        if !self.check_condition_is_satisfied(&unified) {
+            bail!(
+                self.offset,
+                "br - branching condition not met"
+            )
         }
         self.unreachable()?;
         Ok(())
     }
     fn visit_br_if(&mut self, relative_depth: u32) -> Self::Output {
-        self.pop_operand(Some(ValType::I32))?;
-        let (ty, kind, _) = self.jump(relative_depth)?;
+        let (_, cond) = self.pop_operand(Some(ValType::I32))?;
+
+        let (ty, kind, post) = self.jump(relative_depth)?;
         let types = self.label_types(ty, kind)?;
+        let mut args = Vec::new();
         for ty in types.clone().rev() {
-            self.pop_operand(Some(ty))?;
+            let (_, idx) = self.pop_operand(Some(ty))?;
+            args.push(idx);
         }
+
+        let unified = self.unify_constraints(&args, post, false, false)?;
+        self.constraints.push(constraint!(not (= cond (i32 0))));
+        if !self.check_condition_is_satisfied(&unified) {
+            bail!(
+                self.offset,
+                "br_if - branching condition not met"
+            )
+        }
+
+        self.constraints.pop();
+        self.constraints.push(constraint!(= cond (i32 0)));
+
         for ty in types {
             self.push_operand(ty)?;
         }
+
         Ok(())
     }
     fn visit_br_table(&mut self, table: BrTable) -> Self::Output {
@@ -1374,9 +1475,6 @@ where
         Ok(())
     }
     fn visit_drop(&mut self) -> Self::Output {
-        println!("{:?}", self.constraints);
-        println!("{:?}", self.indices);
-        println!("{:?}", self.operands);
         self.pop_operand(None)?;
         Ok(())
     }

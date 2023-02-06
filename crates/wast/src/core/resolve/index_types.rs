@@ -197,6 +197,7 @@ struct IndexTypeResolver<'a> {
     is_func: bool,
     pre_scope: Namespace<'a>,
     post_scope: Namespace<'a>,
+    in_pre: bool,
 }
 
 impl<'a> IndexTypeResolver<'a> {
@@ -209,6 +210,7 @@ impl<'a> IndexTypeResolver<'a> {
             is_func,
             pre_scope: Namespace::default(),
             post_scope: Namespace::default(),
+            in_pre: true,
         }
     }
     
@@ -223,6 +225,7 @@ impl<'a> IndexTypeResolver<'a> {
         for constraint in ty.pre_constraints.iter_mut() {
             self.resolve_constraint(constraint)?;
         }
+        self.in_pre = false;
         for constraint in ty.post_constraints.iter_mut() {
             self.resolve_constraint(constraint)?;
         }
@@ -259,7 +262,11 @@ impl<'a> IndexTypeResolver<'a> {
                 if let Ok(n) = self.post_scope.resolve(&mut Index::Id(*id), "index") {
                     *it = IndexTerm::Post(Index::Num(n,id.span()));
                 } else if let Ok(n) = self.pre_scope.resolve(&mut Index::Id(*id), "index") {
-                    *it = IndexTerm::Pre(Index::Num(n,id.span()));
+                    *it = if self.in_pre {
+                        IndexTerm::Pre(Index::Num(n,id.span()))
+                    } else {
+                        IndexTerm::Local(Index::Num(n,id.span()))
+                    };
                 } else {
                     return Err(Error::new(
                         id.span(),
@@ -282,7 +289,18 @@ impl<'a> IndexTypeResolver<'a> {
                 self.resolve_index_term(&mut *x)?;
             }
             IndexTerm::IConstant(_) => {},
-            IndexTerm::Pre(idx) | IndexTerm::Post(idx) => {
+            IndexTerm::Pre(idx) => {
+                if !idx.is_resolved() {
+                    return Err(Error::new(
+                        idx.span(),
+                        "unresolvable index type variable".to_string(),
+                    ));
+                }
+                if self.is_func && !self.in_pre {
+                    *it = IndexTerm::Local(*idx);
+                }
+            },
+            IndexTerm::Post(idx) => {
                 if !idx.is_resolved() {
                     return Err(Error::new(
                         idx.span(),

@@ -1,9 +1,9 @@
-use index_language::constraint;
+//use index_language::constraint;
 
 use crate::{
-    BinOp, BrTable, Constant, Constraint, IndexTerm, MemArg, RelOp, UnOp, TestOp, ValType, WasmFuncType,
+    BinOp, Constant, Constraint, IndexTerm, RelOp, UnOp, TestOp, ValType,
 };
-use z3::{Config, Context, FuncDecl, ast, Sort, SatResult};
+use z3::{Config, Context, ast, SatResult};
 use z3::ast::{Bool, BV, Ast};
 
 
@@ -17,13 +17,13 @@ pub struct Z3<'a> {
 }
 
 impl<'a> Z3<'a> {
-    fn ty_to_sort(ty: ValType, ctx: &'a Context) -> Sort<'a> {
+    /*fn ty_to_sort(ty: ValType, ctx: &'a Context) -> Sort<'a> {
         match ty {
             ValType::I32 => Sort::bitvector(ctx, 32),
             ValType::I64 => Sort::bitvector(ctx, 64),
             _ => todo!(),
         }
-    }
+    }*/
 
     fn process_binop(&self, binop: &BinOp, bv1: BV<'a>, bv2: BV<'a>) -> BV<'a> {
         match binop {
@@ -89,14 +89,14 @@ impl<'a> Z3<'a> {
         }
     }
 
-    fn process_testop(&self, testop: &TestOp, bv1: BV<'a>) -> BV<'a> {
+    fn process_testop(&self, testop: &TestOp, _bv1: BV<'a>) -> BV<'a> {
         match testop {
             TestOp::I32Eqz => todo!(),
             TestOp::I64Eqz => todo!(),
         }
     }
 
-    fn process_unop(&self, unop: &UnOp, bv1: BV<'a>) -> BV<'a> {
+    fn process_unop(&self, unop: &UnOp, _bv1: BV<'a>) -> BV<'a> {
         match unop {
             UnOp::I32Clz => todo!(),
             UnOp::I32Ctz => todo!(),
@@ -191,6 +191,7 @@ impl ConstraintSolver for Z3<'static> {
         }
         let binding = rhs.iter().map(|x| x).collect::<Vec<&Bool>>();
         solver.assert(&Bool::and(&ctx, binding.as_slice()).not());
+
         let result = solver.check();
         match result {
             SatResult::Unsat => true,
