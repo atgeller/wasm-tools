@@ -178,14 +178,14 @@ impl Printer {
 
             match payload {
                 Payload::FunctionSection(s) => {
-                    if s.get_count() > MAX_WASM_FUNCTIONS {
+                    if s.count() > MAX_WASM_FUNCTIONS {
                         bail!(
                             "module contains {} functions which exceeds the limit of {}",
-                            s.get_count(),
+                            s.count(),
                             MAX_WASM_FUNCTIONS
                         );
                     }
-                    code.reserve(s.get_count() as usize);
+                    code.reserve(s.count() as usize);
                 }
                 Payload::CodeSectionEntry(f) => {
                     code.push(f);
@@ -197,12 +197,17 @@ impl Printer {
                     }
                     bytes = &bytes[offset..];
                 }
-                Payload::CustomSection(c) if c.name() == "name" => {
-                    let reader = NameSectionReader::new(c.data(), c.data_offset())?;
 
-                    // Ignore any error associated with the name section.
+                // Ignore any error associated with the name sections.
+                Payload::CustomSection(c) if c.name() == "name" => {
+                    let reader = NameSectionReader::new(c.data(), c.data_offset());
                     drop(self.register_names(state, reader));
                 }
+                Payload::CustomSection(c) if c.name() == "component-name" => {
+                    let reader = ComponentNameSectionReader::new(c.data(), c.data_offset());
+                    drop(self.register_component_names(state, reader));
+                }
+
                 Payload::End(_) => break,
                 _ => {}
             }
@@ -284,6 +289,7 @@ impl Printer {
                         }
                     }
 
+                    let len = states.len();
                     let state = states.last_mut().unwrap();
 
                     // First up try to find the `name` subsection which we'll use to print
@@ -293,9 +299,11 @@ impl Printer {
                     code_printed = false;
                     self.read_names_and_code(bytes, parser.clone(), state, &mut code)?;
 
-                    if let Some(name) = state.name.as_ref() {
-                        self.result.push(' ');
-                        name.write(&mut self.result);
+                    if len == 1 {
+                        if let Some(name) = state.name.as_ref() {
+                            self.result.push(' ');
+                            name.write(&mut self.result);
+                        }
                     }
                 }
                 Payload::CustomSection(c) => {
@@ -315,7 +323,7 @@ impl Printer {
                     if mem::replace(&mut code_printed, true) {
                         bail!("function section appeared twice in module");
                     }
-                    if reader.get_count() == 0 {
+                    if reader.count() == 0 {
                         continue;
                     }
                     self.print_code(states.last_mut().unwrap(), &code, reader)?;
@@ -409,9 +417,9 @@ impl Printer {
                     Self::ensure_component(&states)?;
                     self.print_canonical_functions(states.last_mut().unwrap(), s)?;
                 }
-                Payload::ComponentStartSection(s) => {
+                Payload::ComponentStartSection { start, range } => {
                     Self::ensure_component(&states)?;
-                    self.print_component_start(states.last_mut().unwrap(), s)?;
+                    self.print_component_start(states.last_mut().unwrap(), range.start, start)?;
                 }
                 Payload::ComponentImportSection(s) => {
                     Self::ensure_component(&states)?;
@@ -466,18 +474,6 @@ impl Printer {
     }
 
     fn register_names(&mut self, state: &mut State, names: NameSectionReader<'_>) -> Result<()> {
-        fn name_map(into: &mut HashMap<u32, Naming>, names: NameMap<'_>, name: &str) -> Result<()> {
-            let mut used = HashSet::new();
-            for naming in names {
-                let naming = naming?;
-                into.insert(
-                    naming.index,
-                    Naming::new(naming.name, naming.index, name, &mut used),
-                );
-            }
-            Ok(())
-        }
-
         fn indirect_name_map(
             into: &mut HashMap<(u32, u32), Naming>,
             names: IndirectNameMap<'_>,
@@ -513,6 +509,53 @@ impl Printer {
                 Name::Element(n) => name_map(&mut state.core.element_names, n, "elem")?,
                 Name::Data(n) => name_map(&mut state.core.data_names, n, "data")?,
                 Name::Unknown { .. } => (),
+            }
+        }
+        Ok(())
+    }
+
+    fn register_component_names(
+        &mut self,
+        state: &mut State,
+        names: ComponentNameSectionReader<'_>,
+    ) -> Result<()> {
+        for section in names {
+            match section? {
+                ComponentName::Component { name, .. } => {
+                    let name = Naming::new(name, 0, "component", &mut HashSet::new());
+                    state.name = Some(name);
+                }
+                ComponentName::CoreFuncs(n) => {
+                    name_map(&mut state.core.func_names, n, "core-func")?
+                }
+                ComponentName::CoreTypes(n) => {
+                    name_map(&mut state.core.type_names, n, "core-type")?
+                }
+                ComponentName::CoreTables(n) => {
+                    name_map(&mut state.core.table_names, n, "core-table")?
+                }
+                ComponentName::CoreMemories(n) => {
+                    name_map(&mut state.core.memory_names, n, "core-memory")?
+                }
+                ComponentName::CoreGlobals(n) => {
+                    name_map(&mut state.core.global_names, n, "core-global")?
+                }
+                ComponentName::CoreModules(n) => {
+                    name_map(&mut state.core.module_names, n, "core-module")?
+                }
+                ComponentName::CoreInstances(n) => {
+                    name_map(&mut state.core.instance_names, n, "core-instance")?
+                }
+                ComponentName::Types(n) => name_map(&mut state.component.type_names, n, "type")?,
+                ComponentName::Instances(n) => {
+                    name_map(&mut state.component.instance_names, n, "instance")?
+                }
+                ComponentName::Components(n) => {
+                    name_map(&mut state.component.component_names, n, "component")?
+                }
+                ComponentName::Funcs(n) => name_map(&mut state.component.func_names, n, "func")?,
+                ComponentName::Values(n) => name_map(&mut state.component.value_names, n, "value")?,
+                ComponentName::Unknown { .. } => (),
             }
         }
         Ok(())
@@ -814,15 +857,15 @@ impl Printer {
         &mut self,
         state: &mut State,
         code: &[FunctionBody<'_>],
-        mut funcs: FunctionSectionReader<'_>,
+        funcs: FunctionSectionReader<'_>,
     ) -> Result<()> {
-        if funcs.get_count() != code.len() as u32 {
+        if funcs.count() != code.len() as u32 {
             bail!("mismatch in function and code section counts");
         }
-        for body in code {
+        for (body, ty) in code.iter().zip(funcs) {
             let mut body = body.get_binary_reader();
             let offset = body.original_position();
-            let ty = funcs.read()?;
+            let ty = ty?;
             self.newline(offset);
             self.start_group("func ");
             let func_idx = state.core.funcs;
@@ -838,7 +881,7 @@ impl Printer {
             for _ in 0..body.read_var_u32()? {
                 let offset = body.original_position();
                 let cnt = body.read_var_u32()?;
-                let ty = body.read_val_type()?;
+                let ty = body.read()?;
                 if MAX_LOCALS
                     .checked_sub(local_idx)
                     .and_then(|s| s.checked_sub(cnt))
@@ -1073,18 +1116,21 @@ impl Printer {
                     self.print_const_expr_sugar(state, offset_expr, "offset")?;
                 }
             }
-            let mut items_reader = elem.items.get_items_reader()?;
             self.result.push(' ');
-            if items_reader.uses_exprs() {
-                self.print_valtype(elem.ty)?;
-            } else {
-                self.print_reftype(elem.ty)?;
-            }
-            for _ in 0..items_reader.get_count() {
-                self.result.push(' ');
-                match items_reader.read()? {
-                    ElementItem::Expr(expr) => self.print_const_expr_sugar(state, &expr, "item")?,
-                    ElementItem::Func(idx) => self.print_idx(&state.core.func_names, idx)?,
+            match elem.items {
+                ElementItems::Functions(reader) => {
+                    self.print_reftype(elem.ty)?;
+                    for idx in reader {
+                        self.result.push(' ');
+                        self.print_idx(&state.core.func_names, idx?)?
+                    }
+                }
+                ElementItems::Expressions(reader) => {
+                    self.print_valtype(elem.ty)?;
+                    for expr in reader {
+                        self.result.push(' ');
+                        self.print_const_expr_sugar(state, &expr?, "item")?
+                    }
                 }
             }
             self.end_group();
@@ -1408,9 +1454,13 @@ impl Printer {
                         self.print_component_outer_alias(states, kind, count, index)?
                     }
                 },
-                ComponentTypeDeclaration::Export { name, ty } => {
+                ComponentTypeDeclaration::Export { name, url, ty } => {
                     self.start_group("export ");
                     self.print_str(name)?;
+                    if !url.is_empty() {
+                        self.result.push(' ');
+                        self.print_str(url)?;
+                    }
                     self.result.push(' ');
                     self.print_component_import_ty(states.last().unwrap(), &ty, false)?;
                     self.end_group();
@@ -1449,9 +1499,13 @@ impl Printer {
                         self.print_component_outer_alias(states, kind, count, index)?
                     }
                 },
-                InstanceTypeDeclaration::Export { name, ty } => {
+                InstanceTypeDeclaration::Export { name, url, ty } => {
                     self.start_group("export ");
                     self.print_str(name)?;
+                    if !url.is_empty() {
+                        self.result.push(' ');
+                        self.print_str(url)?;
+                    }
                     self.result.push(' ');
                     self.print_component_import_ty(states.last().unwrap(), &ty, false)?;
                     self.end_group();
@@ -1679,6 +1733,10 @@ impl Printer {
     ) -> Result<()> {
         self.start_group("import ");
         self.print_str(import.name)?;
+        if !import.url.is_empty() {
+            self.result.push(' ');
+            self.print_str(import.url)?;
+        }
         self.result.push(' ');
         self.print_component_import_ty(state, &import.ty, index)?;
         self.end_group();
@@ -1769,6 +1827,10 @@ impl Printer {
     ) -> Result<()> {
         self.start_group("export ");
         self.print_str(export.name)?;
+        if !export.url.is_empty() {
+            self.result.push(' ');
+            self.print_str(export.url)?;
+        }
         self.result.push(' ');
         self.print_component_external_kind(state, export.kind, export.index)?;
         self.end_group();
@@ -1995,11 +2057,9 @@ impl Printer {
     fn print_component_start(
         &mut self,
         state: &mut State,
-        mut parser: ComponentStartSectionReader,
+        pos: usize,
+        start: ComponentStartFunction,
     ) -> Result<()> {
-        let pos = parser.original_position();
-        let start = parser.read()?;
-
         self.newline(pos);
         self.start_group("start ");
         self.print_idx(&state.component.func_names, start.func_index)?;
@@ -2455,4 +2515,16 @@ impl Naming {
             }
         }
     }
+}
+
+fn name_map(into: &mut HashMap<u32, Naming>, names: NameMap<'_>, name: &str) -> Result<()> {
+    let mut used = HashSet::new();
+    for naming in names {
+        let naming = naming?;
+        into.insert(
+            naming.index,
+            Naming::new(naming.name, naming.index, name, &mut used),
+        );
+    }
+    Ok(())
 }

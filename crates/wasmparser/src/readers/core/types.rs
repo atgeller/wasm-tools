@@ -13,9 +13,9 @@
  * limitations under the License.
  */
 
-use crate::{BinaryReader, Result, SectionIteratorLimited, SectionReader, SectionWithLimitedItems};
+use crate::limits::{MAX_WASM_FUNCTION_PARAMS, MAX_WASM_FUNCTION_RETURNS};
+use crate::{BinaryReader, FromReader, Result, SectionLimited};
 use std::fmt::Debug;
-use std::ops::Range;
 
 /// Represents the types of values in a WebAssembly module.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -43,6 +43,31 @@ impl ValType {
     /// instructions. Current reference types include `funcref` and `externref`.
     pub fn is_reference_type(&self) -> bool {
         matches!(self, ValType::FuncRef | ValType::ExternRef)
+    }
+
+    pub(crate) fn from_byte(byte: u8) -> Option<ValType> {
+        match byte {
+            0x7F => Some(ValType::I32),
+            0x7E => Some(ValType::I64),
+            0x7D => Some(ValType::F32),
+            0x7C => Some(ValType::F64),
+            0x7B => Some(ValType::V128),
+            0x70 => Some(ValType::FuncRef),
+            0x6F => Some(ValType::ExternRef),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> FromReader<'a> for ValType {
+    fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        match ValType::from_byte(reader.peek()?) {
+            Some(ty) => {
+                reader.position += 1;
+                Ok(ty)
+            }
+            None => bail!(reader.original_position(), "invalid value type"),
+        }
     }
 }
 
@@ -269,6 +294,21 @@ impl From<IndexedFuncType> for FuncType {
         FuncType::new(params, results)
     }
 }
+/*
+impl From<&IndexedFuncType> for &FuncType {
+    fn from(value: &IndexedFuncType) -> Self {
+        let mut params = Vec::new();
+        for param in value.params().iter() {
+            params.push(*param);
+        }
+        let mut results = Vec::new();
+        for result in value.results().iter() {
+            results.push(*result);
+        }
+        &FuncType::new(params, results)
+    }
+}
+*/
 
 /// Represents a type of a function in a WebAssembly module.
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -408,89 +448,215 @@ pub struct TagType {
 }
 
 /// A reader for the type section of a WebAssembly module.
-#[derive(Clone)]
-pub struct TypeSectionReader<'a> {
-    reader: BinaryReader<'a>,
-    count: u32,
-}
+pub type TypeSectionReader<'a> = SectionLimited<'a, Type>;
 
-impl<'a> TypeSectionReader<'a> {
-    /// Constructs a new `TypeSectionReader` for the given data and offset.
-    pub fn new(data: &'a [u8], offset: usize) -> Result<Self> {
-        let mut reader = BinaryReader::new_with_offset(data, offset);
-        let count = reader.read_var_u32()?;
-        Ok(Self { reader, count })
-    }
-
-    /// Gets the original position of the reader.
-    pub fn original_position(&self) -> usize {
-        self.reader.original_position()
-    }
-
-    /// Gets a count of items in the section.
-    pub fn get_count(&self) -> u32 {
-        self.count
-    }
-
-    /// Reads content of the type section.
-    ///
-    /// # Examples
-    /// ```
-    /// use wasmparser::TypeSectionReader;
-    /// let data: &[u8] = &[0x01, 0x60, 0x00, 0x00];
-    /// let mut reader = TypeSectionReader::new(data, 0).unwrap();
-    /// for _ in 0..reader.get_count() {
-    ///     let ty = reader.read().expect("type");
-    ///     println!("Type {:?}", ty);
-    /// }
-    /// ```
-    pub fn read(&mut self) -> Result<Type> {
-        self.reader.read_type()
+impl<'a> FromReader<'a> for Type {
+    fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        Ok(match reader.read_u8()? {
+            0x60 => Type::Func(reader.read()?),
+            x => return reader.invalid_leading_byte(x, "type"),
+        })
     }
 }
-
-impl<'a> SectionReader for TypeSectionReader<'a> {
-    type Item = Type;
-
-    fn read(&mut self) -> Result<Self::Item> {
-        Self::read(self)
+/*
+impl<'a> FromReader<'a> for FuncType {
+    fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        let mut params_results = reader
+            .read_iter(MAX_WASM_FUNCTION_PARAMS, "function params")?
+            .collect::<Result<Vec<_>>>()?;
+        let len_params = params_results.len();
+        let results = reader.read_iter(MAX_WASM_FUNCTION_RETURNS, "function returns")?;
+        params_results.reserve(results.size_hint().0);
+        for result in results {
+            params_results.push(result?);
+        }
+        Ok(FuncType::from_raw_parts(params_results.into(), len_params))
     }
+}*/
 
-    fn eof(&self) -> bool {
-        self.reader.eof()
-    }
+impl<'a> FromReader<'a> for IndexedFuncType {
+    fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        let mut params_results = reader
+            .read_iter(MAX_WASM_FUNCTION_PARAMS, "function params")?
+            .collect::<Result<Vec<_>>>()?;
+        let len_params = params_results.len();
+        let results = reader.read_iter(MAX_WASM_FUNCTION_RETURNS, "function returns")?;
+        params_results.reserve(results.size_hint().0);
+        for result in results {
+            params_results.push(result?);
+        }
 
-    fn original_position(&self) -> usize {
-        Self::original_position(self)
-    }
+        let mut pres_posts = reader
+            .read_iter(MAX_WASM_FUNCTION_PARAMS, "function pre-conditions")?
+            .collect::<Result<Vec<_>>>()?;
+        let len_pres = pres_posts.len();
+        let posts = reader.read_iter(MAX_WASM_FUNCTION_RETURNS, "function post-conditions")?;
+        pres_posts.reserve(posts.size_hint().0);
+        for post in posts {
+            pres_posts.push(post?);
+        }
 
-    fn range(&self) -> Range<usize> {
-        self.reader.range()
+        Ok(IndexedFuncType::from_raw_parts(
+            params_results.into(),
+            len_params,
+            pres_posts.into(),
+            len_pres,
+        ))
     }
 }
 
-impl<'a> SectionWithLimitedItems for TypeSectionReader<'a> {
-    fn get_count(&self) -> u32 {
-        Self::get_count(self)
+impl<'a> FromReader<'a> for Constraint {
+    fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        let byte = reader.peek()?;
+        reader.position += 1;
+        let constraint = match byte {
+            0x01 => {
+                let x = reader.read()?;
+                let y = reader.read()?;
+                Constraint::Eq(x, y)
+            }
+            0x02 => {
+                let x = reader.read()?;
+                let y = reader.read()?;
+                Constraint::And(Box::new(x), Box::new(y))
+            }
+            0x03 => {
+                let x = reader.read()?;
+                let y = reader.read()?;
+                Constraint::Or(Box::new(x), Box::new(y))
+            }
+            0x04 => {
+                let x = reader.read()?;
+                let y = reader.read()?;
+                let z = reader.read()?;
+                Constraint::If(Box::new(x), Box::new(y), Box::new(z))
+            }
+            0x05 => {
+                let x = reader.read()?;
+                Constraint::Not(Box::new(x))
+            }
+            x => {
+                return reader.invalid_leading_byte(x, "constraint");
+            }
+        };
+
+        Ok(constraint)
     }
 }
 
-impl<'a> IntoIterator for TypeSectionReader<'a> {
-    type Item = Result<Type>;
-    type IntoIter = SectionIteratorLimited<Self>;
+impl<'a> FromReader<'a> for IndexTerm {
+    fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        let byte = reader.peek()?;
+        reader.position += 1;
+        let index_term = match byte {
+            0x41 => {
+                IndexTerm::IConstant(Constant::I32Const(reader.read_var_i32()?))
+            }
+            0x42 => {
+                IndexTerm::IConstant(Constant::I64Const(reader.read_var_i64()?))
+            }
+            x @ 0x6a..=0x78 | x @ 0x7c..=0x8a => {
+                let binop = match x {
+                    0x6a => BinOp::I32Add,
+                    0x6b => BinOp::I32Sub,
+                    0x6c => BinOp::I32Mul,
+                    0x6d => BinOp::I32DivS,
+                    0x6e => BinOp::I32DivU,
+                    0x6f => BinOp::I32RemS,
+                    0x70 => BinOp::I32RemU,
+                    0x71 => BinOp::I32And,
+                    0x72 => BinOp::I32Or,
+                    0x73 => BinOp::I32Xor,
+                    0x74 => BinOp::I32Shl,
+                    0x75 => BinOp::I32ShrS,
+                    0x76 => BinOp::I32ShrU,
+                    0x77 => BinOp::I32Rotl,
+                    0x78 => BinOp::I32Rotr,
+                    0x7c => BinOp::I64Add,
+                    0x7d => BinOp::I64Sub,
+                    0x7e => BinOp::I64Mul,
+                    0x7f => BinOp::I64DivS,
+                    0x80 => BinOp::I64DivU,
+                    0x81 => BinOp::I64RemS,
+                    0x82 => BinOp::I64RemU,
+                    0x83 => BinOp::I64And,
+                    0x84 => BinOp::I64Or,
+                    0x85 => BinOp::I64Xor,
+                    0x86 => BinOp::I64Shl,
+                    0x87 => BinOp::I64ShrS,
+                    0x88 => BinOp::I64ShrU,
+                    0x89 => BinOp::I64Rotl,
+                    0x8a => BinOp::I64Rotr,
+                    _ => panic!(),
+                };
+                let x = reader.read()?;
+                let y = reader.read()?;
+                IndexTerm::IBinOp(binop, Box::new(x), Box::new(y))
+            }
+            x @ 0x46..=0x4f | x @ 0x51..=0x5a => {
+                let relop = match x {
+                    0x46 => RelOp::I32Eq,
+                    0x47 => RelOp::I32Ne,
+                    0x48 => RelOp::I32LtS,
+                    0x49 => RelOp::I32LtU,
+                    0x4a => RelOp::I32GtS,
+                    0x4b => RelOp::I32GtU,
+                    0x4c => RelOp::I32LeS,
+                    0x4d => RelOp::I32LeU,
+                    0x4e => RelOp::I32GeS,
+                    0x4f => RelOp::I32GeU,
+                    0x51 => RelOp::I64Eq,
+                    0x52 => RelOp::I64Ne,
+                    0x53 => RelOp::I64LtS,
+                    0x54 => RelOp::I64LtU,
+                    0x55 => RelOp::I64GtS,
+                    0x56 => RelOp::I64GtU,
+                    0x57 => RelOp::I64LeS,
+                    0x58 => RelOp::I64LeU,
+                    0x59 => RelOp::I64GeS,
+                    0x5a => RelOp::I64GeU,
+                    _ => panic!(),
+                };
+                let x = reader.read()?;
+                let y = reader.read()?;
+                IndexTerm::IRelOp(relop, Box::new(x), Box::new(y))
+            }
+            x @ 0x45 | x @ 0x50 => {
+                let testop = if x == 0x45 {
+                    TestOp::I32Eqz
+                } else {
+                    TestOp::I64Eqz
+                };
+                let x = reader.read()?;
+                IndexTerm::ITestOp(testop, Box::new(x))
+            }
+            x @ 0x67..=0x69 | x @ 0x79..=0x7b => {
+                let unop = match x {
+                    0x67 => UnOp::I32Clz,
+                    0x68 => UnOp::I32Ctz,
+                    0x69 => UnOp::I32Popcnt,
+                    0x79 => UnOp::I64Clz,
+                    0x7a => UnOp::I64Ctz,
+                    0x7b => UnOp::I64Popcnt,
+                    _ => panic!(),
+                };
+                let x = reader.read()?;
+                IndexTerm::IUnOp(unop, Box::new(x))
+            }
+            x @ 0x20..=0x22 => {
+                let index = reader.read()?;
+                match x {
+                    0x20 => IndexTerm::Local(index),
+                    0x21 => IndexTerm::Pre(index),
+                    0x22 => IndexTerm::Post(index),
+                    _ => panic!(),
+                }
+            }
+            x => {
+                return reader.invalid_leading_byte(x, "index_term");
+            }
+        };
 
-    /// Implements iterator over the type section.
-    ///
-    /// # Examples
-    /// ```
-    /// use wasmparser::TypeSectionReader;
-    /// # let data: &[u8] = &[0x01, 0x60, 0x00, 0x00];
-    /// let mut reader = TypeSectionReader::new(data, 0).unwrap();
-    /// for ty in reader {
-    ///     println!("Type {:?}", ty.expect("type"));
-    /// }
-    /// ```
-    fn into_iter(self) -> Self::IntoIter {
-        SectionIteratorLimited::new(self)
+        Ok(index_term)
     }
 }

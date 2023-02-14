@@ -15,10 +15,12 @@ fuzz_target!(|bytes: &[u8]| {
     // use with `wasm-mutate`.
 
     let mut seed = 0;
+    let mut preserve_semantics = false;
     let mut u = Unstructured::new(bytes);
     let (wasm, config) = match wasm_tools_fuzz::generate_valid_module(&mut u, |config, u| {
         config.exceptions_enabled = false;
         seed = u.arbitrary()?;
+        preserve_semantics = u.arbitrary()?;
         Ok(())
     }) {
         Ok(m) => m,
@@ -50,7 +52,7 @@ fuzz_target!(|bytes: &[u8]| {
     wasm_mutate.preserve_semantics(
         // If we are going to check that we get the same evaluated results
         // before and after mutation, then we need to preserve semantics.
-        cfg!(feature = "wasmtime"),
+        cfg!(feature = "wasmtime") && preserve_semantics,
     );
 
     let iterator = match wasm_mutate.run(&wasm) {
@@ -106,19 +108,22 @@ fuzz_target!(|bytes: &[u8]| {
         validation_result.expect("`wasm-mutate` should always produce a valid Wasm file");
 
         #[cfg(feature = "wasmtime")]
-        eval::assert_same_evaluation(&wasm, &mutated_wasm);
+        if preserve_semantics {
+            eval::assert_same_evaluation(&wasm, &mutated_wasm);
+        }
     }
 });
 
 #[cfg(feature = "wasmtime")]
-#[path = "../../crates/fuzz-stats/src/dummy.rs"]
-pub mod dummy;
+#[path = "../../crates/fuzz-stats/src/lib.rs"]
+pub mod fuzz_stats;
 
 #[cfg(feature = "wasmtime")]
 mod eval {
-    use super::dummy;
+    use super::fuzz_stats::{dummy, limits::StoreLimits};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use wasmtime::{ResourceLimiter, Val};
 
     /// Compile, instantiate, and evaluate both the original and mutated Wasm.
     ///
@@ -142,7 +147,14 @@ mod eval {
             (_, _) => return,
         };
 
-        let mut store = wasmtime::Store::new(&engine, ());
+        let mut store = wasmtime::Store::new(
+            &engine,
+            StoreLimits {
+                remaining_memory: 1 << 30,
+                oom: false,
+            },
+        );
+        store.limiter(|s| s as &mut dyn ResourceLimiter);
         let (orig_imports, mutated_imports) = match dummy::dummy_imports(&mut store, &orig_module) {
             Ok(imps) => (imps.clone(), imps),
             Err(_) => return,
@@ -162,7 +174,7 @@ mod eval {
     }
 
     fn assert_same_state(
-        store: &mut wasmtime::Store<()>,
+        store: &mut wasmtime::Store<StoreLimits>,
         orig_module: &wasmtime::Module,
         orig_instance: wasmtime::Instance,
         mutated_instance: wasmtime::Instance,
@@ -209,45 +221,47 @@ mod eval {
     }
 
     fn assert_same_calls(
-        store: &mut wasmtime::Store<()>,
+        store: &mut wasmtime::Store<StoreLimits>,
         orig_module: &wasmtime::Module,
         orig_instance: wasmtime::Instance,
         mutated_instance: wasmtime::Instance,
     ) {
         for export in orig_module.exports() {
-            match export.ty() {
-                wasmtime::ExternType::Func(func_ty) => {
-                    let orig_func = orig_instance.get_func(&mut *store, export.name()).unwrap();
-                    let mutated_func = mutated_instance
-                        .get_func(&mut *store, export.name())
-                        .unwrap();
-                    let args = dummy::dummy_values(func_ty.params());
-                    match (
-                        {
-                            store.add_fuel(1_000).unwrap();
-                            orig_func.call(&mut *store, &args)
-                        },
-                        {
-                            let consumed = store.fuel_consumed().unwrap();
-                            store.add_fuel(consumed).unwrap();
-                            mutated_func.call(&mut *store, &args)
-                        },
-                    ) {
-                        (Ok(orig_vals), Ok(mutated_vals)) => {
-                            assert_eq!(orig_vals.len(), mutated_vals.len());
-                            for (orig_val, mutated_val) in orig_vals.iter().zip(mutated_vals.iter())
-                            {
-                                assert_val_eq(orig_val, mutated_val);
-                            }
-                        }
-                        (Err(_), Err(_)) => continue,
-                        (orig, mutated) => panic!(
-                            "mutated and original Wasm diverged: orig = {:?}; mutated = {:?}",
-                            orig, mutated,
-                        ),
+            let func_ty = match export.ty() {
+                wasmtime::ExternType::Func(func_ty) => func_ty,
+                _ => continue,
+            };
+            let orig_func = orig_instance.get_func(&mut *store, export.name()).unwrap();
+            let mutated_func = mutated_instance
+                .get_func(&mut *store, export.name())
+                .unwrap();
+            let args = dummy::dummy_values(func_ty.params());
+            let mut orig_results = vec![Val::I32(0); func_ty.results().len()];
+            let mut mutated_results = orig_results.clone();
+            log::debug!("invoking `{}`", export.name());
+            let prev_consumed = store.fuel_consumed().unwrap();
+            match (
+                {
+                    store.add_fuel(1_000).unwrap();
+                    orig_func.call(&mut *store, &args, &mut orig_results)
+                },
+                {
+                    let consumed = store.fuel_consumed().unwrap() - prev_consumed;
+                    log::debug!("consumed {consumed} fuel");
+                    store.add_fuel(consumed).unwrap();
+                    mutated_func.call(&mut *store, &args, &mut mutated_results)
+                },
+            ) {
+                (Ok(()), Ok(())) => {
+                    for (orig_val, mutated_val) in orig_results.iter().zip(mutated_results.iter()) {
+                        assert_val_eq(orig_val, mutated_val);
                     }
                 }
-                _ => continue,
+                (Err(_), Err(_)) => continue,
+                (orig, mutated) => panic!(
+                    "mutated and original Wasm diverged: orig = {:?}; mutated = {:?}",
+                    orig, mutated,
+                ),
             }
         }
     }
@@ -256,8 +270,25 @@ mod eval {
         match (orig_val, mutated_val) {
             (wasmtime::Val::I32(o), wasmtime::Val::I32(m)) => assert_eq!(o, m),
             (wasmtime::Val::I64(o), wasmtime::Val::I64(m)) => assert_eq!(o, m),
-            (wasmtime::Val::F32(o), wasmtime::Val::F32(m)) => assert_eq!(o, m),
-            (wasmtime::Val::F64(o), wasmtime::Val::F64(m)) => assert_eq!(o, m),
+            (wasmtime::Val::F32(o), wasmtime::Val::F32(m)) => {
+                let o = f32::from_bits(*o);
+                let m = f32::from_bits(*m);
+                assert!(o == m || (o.is_nan() && m.is_nan()));
+            }
+            (wasmtime::Val::F64(o), wasmtime::Val::F64(m)) => {
+                let o = f64::from_bits(*o);
+                let m = f64::from_bits(*m);
+                assert!(o == m || (o.is_nan() && m.is_nan()));
+            }
+            (wasmtime::Val::V128(o), wasmtime::Val::V128(m)) => {
+                assert_eq!(o, m)
+            }
+            (wasmtime::Val::ExternRef(o), wasmtime::Val::ExternRef(m)) => {
+                assert_eq!(o.is_none(), m.is_none())
+            }
+            (wasmtime::Val::FuncRef(o), wasmtime::Val::FuncRef(m)) => {
+                assert_eq!(o.is_none(), m.is_none())
+            }
             (o, m) => panic!(
                 "mutated and original Wasm diverged: orig = {:?}; mutated = {:?}",
                 o, m,

@@ -234,9 +234,7 @@ impl ShrinkRun {
             sign_extension: true,
             component_model: false,
             precheck: true,
-
-            // We'll never enable this here.
-            deterministic_only: false,
+            floats: true,
         });
 
         validator.validate_all(wasm)?;

@@ -116,7 +116,8 @@ fn precheck_block_annotations() -> anyhow::Result<()> {
 
 #[test]
 fn precheck_instructions() -> anyhow::Result<()> {
-    let wasm = wat::parse_str(r#"(module (func (local i32) (local i32) (local.get 0) (local.get 1) (local.get 1) (i32.const 1) select i32.div_s drop))"#)?;
+    //let wasm = wat::parse_str(r#"(module (func (local i32) (local i32) (local.get 0) (local.get 1) (local.get 1) (i32.const 1) select i32.div_s drop))"#)?;
+    let wasm = wat::parse_str(r#"(module (memory 1) (func (i32.const 65504) i32.load_prechk drop))"#)?;
     wasmparser::validate(&wasm.as_slice())?;
     Ok(())
 }
@@ -170,7 +171,7 @@ fn get_name_section(wasm: &[u8]) -> anyhow::Result<NameSectionReader<'_>> {
     for payload in Parser::new(0).parse_all(&wasm) {
         if let Payload::CustomSection(c) = payload? {
             if c.name() == "name" {
-                return Ok(NameSectionReader::new(c.data(), c.data_offset())?);
+                return Ok(NameSectionReader::new(c.data(), c.data_offset()));
             }
         }
     }

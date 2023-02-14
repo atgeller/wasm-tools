@@ -14,8 +14,8 @@
  */
 
 use crate::{
-    limits::*, BinaryReaderError, Encoding, FunctionBody, Parser, Payload, Result, SectionReader,
-    SectionWithLimitedItems, ValType, WASM_COMPONENT_VERSION, WASM_MODULE_VERSION,
+    limits::*, BinaryReaderError, Encoding, FromReader, FunctionBody, Parser, Payload, Result,
+    SectionLimited, ValType, WASM_COMPONENT_VERSION, WASM_MODULE_VERSION,
 };
 use std::mem;
 use std::ops::Range;
@@ -55,7 +55,7 @@ pub mod types;
 use self::component::*;
 pub use self::core::ValidatorResources;
 use self::core::*;
-use self::types::{TypeList, Types, TypesRef};
+use self::types::{TypeAlloc, Types, TypesRef};
 pub use func::{FuncToValidate, FuncValidator, FuncValidatorAllocations};
 pub use operators::{Frame, FrameKind};
 
@@ -75,7 +75,7 @@ fn check_max(cur_len: usize, amt_added: u32, max: usize, desc: &str, offset: usi
     Ok(())
 }
 
-fn combine_type_sizes(a: usize, b: usize, offset: usize) -> Result<usize> {
+fn combine_type_sizes(a: u32, b: u32, offset: usize) -> Result<u32> {
     match a.checked_add(b) {
         Some(sum) if sum < MAX_WASM_TYPE_SIZE => Ok(sum),
         _ => Err(format_err!(
@@ -116,7 +116,7 @@ pub struct Validator {
     state: State,
 
     /// The global type space used by the validator and any sub-validators.
-    types: TypeList,
+    types: TypeAlloc,
 
     /// The module state when parsing a WebAssembly module.
     module: Option<ModuleState>,
@@ -212,7 +212,7 @@ pub struct WasmFeatures {
     pub multi_value: bool,
     /// The WebAssembly bulk memory operations proposal (enabled by default)
     pub bulk_memory: bool,
-    /// The WebAssembly SIMD proposal
+    /// The WebAssembly SIMD proposal (enabled by default)
     pub simd: bool,
     /// The WebAssembly Relaxed SIMD proposal
     pub relaxed_simd: bool,
@@ -220,8 +220,18 @@ pub struct WasmFeatures {
     pub threads: bool,
     /// The WebAssembly tail-call proposal
     pub tail_call: bool,
-    /// Whether or not only deterministic instructions are allowed
-    pub deterministic_only: bool,
+    /// Whether or not floating-point instructions are enabled.
+    ///
+    /// This is enabled by default can be used to disallow floating-point
+    /// operators. Note that disabling this does not disable the `f32` and
+    /// `f64` wasm types, only the operators that work on them.
+    ///
+    /// This does not correspond to a WebAssembly proposal but is instead
+    /// intended for embeddings which have stricter-than-usual requirements
+    /// about execution. Floats in WebAssembly can have different NaN patterns
+    /// across hosts which can lead to host-dependent execution which some
+    /// runtimes may not desire.
+    pub floats: bool,
     /// The WebAssembly multi memory proposal
     pub multi_memory: bool,
     /// The WebAssembly exception handling proposal
@@ -270,7 +280,6 @@ impl Default for WasmFeatures {
             memory64: false,
             extended_const: false,
             component_model: false,
-            deterministic_only: cfg!(feature = "deterministic"),
 
             // on-by-default features
             mutable_global: true,
@@ -281,6 +290,7 @@ impl Default for WasmFeatures {
             reference_types: true,
             simd: true,
             precheck: true,
+            floats: true,
         }
     }
 }
@@ -430,7 +440,7 @@ impl Validator {
             } => self.code_section_start(*count, range)?,
             CodeSectionEntry(body) => {
                 let func_validator = self.code_section_entry(body)?;
-                return Ok(ValidPayload::Func(func_validator, *body));
+                return Ok(ValidPayload::Func(func_validator, body.clone()));
             }
             DataSection(s) => self.data_section(s)?,
 
@@ -449,7 +459,7 @@ impl Validator {
             ComponentAliasSection(s) => self.component_alias_section(s)?,
             ComponentTypeSection(s) => self.component_type_section(s)?,
             ComponentCanonicalSection(s) => self.component_canonical_section(s)?,
-            ComponentStartSection(s) => self.component_start_section(s)?,
+            ComponentStartSection { start, range } => self.component_start_section(start, range)?,
             ComponentImportSection(s) => self.component_import_section(s)?,
             ComponentExportSection(s) => self.component_export_section(s)?,
 
@@ -1006,7 +1016,7 @@ impl Validator {
     /// This method should only be called when parsing a component.
     pub fn component_alias_section(
         &mut self,
-        section: &crate::ComponentAliasSectionReader,
+        section: &crate::ComponentAliasSectionReader<'_>,
     ) -> Result<()> {
         self.process_component_section(
             section,
@@ -1093,20 +1103,20 @@ impl Validator {
     /// This method should only be called when parsing a component.
     pub fn component_start_section(
         &mut self,
-        section: &crate::ComponentStartSectionReader,
+        f: &crate::ComponentStartFunction,
+        range: &Range<usize>,
     ) -> Result<()> {
-        let range = section.range();
         self.state.ensure_component("start", range.start)?;
 
-        let mut section = section.clone();
-        let f = section.read()?;
+        // let mut section = section.clone();
+        // let f = section.read()?;
 
-        if !section.eof() {
-            return Err(BinaryReaderError::new(
-                "trailing data at the end of the start section",
-                section.original_position(),
-            ));
-        }
+        // if !section.eof() {
+        //     return Err(BinaryReaderError::new(
+        //         "trailing data at the end of the start section",
+        //         section.original_position(),
+        //     ));
+        // }
 
         self.components.last_mut().unwrap().add_start(
             f.func_index,
@@ -1162,7 +1172,13 @@ impl Validator {
             |components, _, _, export, offset| {
                 let current = components.last_mut().unwrap();
                 let ty = current.export_to_entity_type(&export, offset)?;
-                current.add_export(export.name, ty, offset, false /* checked above */)
+                current.add_export(
+                    export.name,
+                    export.url,
+                    ty,
+                    offset,
+                    false, /* checked above */
+                )
             },
         )
     }
@@ -1226,28 +1242,28 @@ impl Validator {
         }
     }
 
-    fn process_module_section<T>(
+    fn process_module_section<'a, T>(
         &mut self,
         order: Order,
-        section: &T,
+        section: &SectionLimited<'a, T>,
         name: &str,
         validate_section: impl FnOnce(
             &mut ModuleState,
             &WasmFeatures,
-            &mut TypeList,
+            &mut TypeAlloc,
             u32,
             usize,
         ) -> Result<()>,
         mut validate_item: impl FnMut(
             &mut ModuleState,
             &WasmFeatures,
-            &mut TypeList,
-            T::Item,
+            &mut TypeAlloc,
+            T,
             usize,
         ) -> Result<()>,
     ) -> Result<()>
     where
-        T: SectionReader + Clone + SectionWithLimitedItems,
+        T: FromReader<'a>,
     {
         let offset = section.range().start;
         self.state.ensure_module(name, offset)?;
@@ -1259,37 +1275,38 @@ impl Validator {
             state,
             &self.features,
             &mut self.types,
-            section.get_count(),
+            section.count(),
             offset,
         )?;
 
-        let mut section = section.clone();
-        for _ in 0..section.get_count() {
-            let offset = section.original_position();
-            let item = section.read()?;
+        for item in section.clone().into_iter_with_offsets() {
+            let (offset, item) = item?;
             validate_item(state, &self.features, &mut self.types, item, offset)?;
         }
-
-        section.ensure_end()?;
 
         Ok(())
     }
 
-    fn process_component_section<T>(
+    fn process_component_section<'a, T>(
         &mut self,
-        section: &T,
+        section: &SectionLimited<'a, T>,
         name: &str,
-        validate_section: impl FnOnce(&mut Vec<ComponentState>, &mut TypeList, u32, usize) -> Result<()>,
+        validate_section: impl FnOnce(
+            &mut Vec<ComponentState>,
+            &mut TypeAlloc,
+            u32,
+            usize,
+        ) -> Result<()>,
         mut validate_item: impl FnMut(
             &mut Vec<ComponentState>,
-            &mut TypeList,
+            &mut TypeAlloc,
             &WasmFeatures,
-            T::Item,
+            T,
             usize,
         ) -> Result<()>,
     ) -> Result<()>
     where
-        T: Clone + SectionWithLimitedItems,
+        T: FromReader<'a>,
     {
         let offset = section.range().start;
 
@@ -1304,14 +1321,12 @@ impl Validator {
         validate_section(
             &mut self.components,
             &mut self.types,
-            section.get_count(),
+            section.count(),
             offset,
         )?;
 
-        let mut section = section.clone();
-        for _ in 0..section.get_count() {
-            let offset = section.original_position();
-            let item = section.read()?;
+        for item in section.clone().into_iter_with_offsets() {
+            let (offset, item) = item?;
             validate_item(
                 &mut self.components,
                 &mut self.types,
@@ -1320,8 +1335,6 @@ impl Validator {
                 offset,
             )?;
         }
-
-        section.ensure_end()?;
 
         Ok(())
     }
