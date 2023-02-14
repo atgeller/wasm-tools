@@ -60,7 +60,7 @@ pub(crate) struct OperatorValidator {
 
 // No science was performed in the creation of this number, feel free to change
 // it if you so like.
-const MAX_LOCALS_TO_TRACK: usize = 50;
+const _MAX_LOCALS_TO_TRACK: usize = 50;
 
 pub(super) struct Locals {
     // Total number of locals in the function.
@@ -658,6 +658,28 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         Ok(index_ty)
     }
 
+    /// Validates a `memarg for alignment and such (also the memory it
+    /// references), and returns the type of index used to address the memory.
+    fn check_prechk_mem_access(&mut self, memarg: MemArg, size: u64) -> Result<ValType> {
+        match self.resources.memory_at(memarg.memory) {
+            Some(mem) => {
+                let (_, index) = self.pop_operand(Some(mem.index_type()))?;
+                let initial_size = (mem.initial * 65536) as i32;
+                let offset = (memarg.offset + size) as i32;
+                // Todo: should add memory access to index language since i33 technically
+                let cond = constraint!(= (i32 1) (i32.lt_u (i32.add (i32 offset) index) (i32 initial_size)));
+                if !self.check_condition_is_satisfied(&vec![cond]) {
+                    bail!(
+                        self.offset,
+                        "memory access pre-condition not satisfied"
+                    )
+                }
+                return Ok(mem.index_type());
+            },
+            None => bail!(self.offset, "unknown memory {}", memarg.memory),
+        }
+    }
+
     #[cfg_attr(not(feature = "deterministic"), inline(always))]
     fn check_non_deterministic_enabled(&self) -> Result<()> {
         if cfg!(feature = "deterministic") && !self.features.deterministic_only {
@@ -1132,7 +1154,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             .ok_or_else(|| format_err!(self.offset, "unknown type: type index out of bounds"))
     }
 
-    fn tag_at(&self, at: u32) -> Result<&'resources R::IndexedFuncType> {
+    fn _tag_at(&self, at: u32) -> Result<&'resources R::IndexedFuncType> {
         self.resources
             .tag_at(at)
             .ok_or_else(|| format_err!(self.offset, "unknown tag {}: tag index out of bounds", at))
@@ -1255,6 +1277,7 @@ macro_rules! validate_proposal {
     (desc sign_extension) => ("sign extension operations");
     (desc exceptions) => ("exceptions");
     (desc tail_call) => ("tail calls");
+    (desc precheck) => ("precheck");
 }
 
 impl<'a, T> VisitOperator<'a> for WasmProposalValidator<'_, '_, T>
@@ -1686,6 +1709,91 @@ where
         let ty = self.check_memarg(memarg)?;
         self.pop_operand(Some(ValType::I64))?;
         self.pop_operand(Some(ty))?;
+        Ok(())
+    }
+    fn visit_i32_load_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 32)?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
+    }
+    fn visit_i64_load_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 64)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i32_load8_s_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 8)?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
+    }
+    fn visit_i32_load8_u_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.visit_i32_load8_s_prechk(memarg)
+    }
+    fn visit_i32_load16_s_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 16)?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
+    }
+    fn visit_i32_load16_u_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.visit_i32_load16_s_prechk(memarg)
+    }
+    fn visit_i64_load8_s_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 8)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i64_load8_u_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.visit_i64_load8_s(memarg)
+    }
+    fn visit_i64_load16_s_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 16)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i64_load16_u_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.visit_i64_load16_s(memarg)
+    }
+    fn visit_i64_load32_s_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 32)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i64_load32_u_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.visit_i64_load32_s(memarg)
+    }
+    fn visit_i32_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 32)?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
+    }
+    fn visit_i64_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 64)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i32_store8_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 8)?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
+    }
+    fn visit_i32_store16_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 16)?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
+    }
+    fn visit_i64_store8_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 8)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i64_store16_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 16)?;
+        self.push_operand(ValType::I64)?;
+        Ok(())
+    }
+    fn visit_i64_store32_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 32)?;
+        self.push_operand(ValType::I64)?;
         Ok(())
     }
     fn visit_memory_size(&mut self, mem: u32, mem_byte: u8) -> Self::Output {

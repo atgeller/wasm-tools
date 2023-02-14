@@ -368,6 +368,27 @@ pub enum Instruction<'a> {
     MemoryCopy { src_mem: u32, dst_mem: u32 },
     MemoryFill(u32),
 
+    // Precbeck memory instructions.
+    I32LoadPrechk(MemArg),
+    I64LoadPrechk(MemArg),
+    I32Load8SPrechk(MemArg),
+    I32Load8UPrechk(MemArg),
+    I32Load16SPrechk(MemArg),
+    I32Load16UPrechk(MemArg),
+    I64Load8SPrechk(MemArg),
+    I64Load8UPrechk(MemArg),
+    I64Load16SPrechk(MemArg),
+    I64Load16UPrechk(MemArg),
+    I64Load32SPrechk(MemArg),
+    I64Load32UPrechk(MemArg),
+    I32StorePrechk(MemArg),
+    I64StorePrechk(MemArg),
+    I32Store8Prechk(MemArg),
+    I32Store16Prechk(MemArg),
+    I64Store8Prechk(MemArg),
+    I64Store16Prechk(MemArg),
+    I64Store32Prechk(MemArg),
+
     // Numeric instructions.
     I32Const(i32),
     I64Const(i64),
@@ -1091,6 +1112,103 @@ impl Encode for Instruction<'_> {
                 sink.push(0xfc);
                 sink.push(0x0b);
                 mem.encode(sink);
+            }
+
+            // Precheck memory instructions.
+            Instruction::I32LoadPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x28);
+                m.encode(sink);
+            }
+            Instruction::I64LoadPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x29);
+                m.encode(sink);
+            }
+            Instruction::I32Load8SPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x2C);
+                m.encode(sink);
+            }
+            Instruction::I32Load8UPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x2D);
+                m.encode(sink);
+            }
+            Instruction::I32Load16SPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x2E);
+                m.encode(sink);
+            }
+            Instruction::I32Load16UPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x2F);
+                m.encode(sink);
+            }
+            Instruction::I64Load8SPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x30);
+                m.encode(sink);
+            }
+            Instruction::I64Load8UPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x31);
+                m.encode(sink);
+            }
+            Instruction::I64Load16SPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x32);
+                m.encode(sink);
+            }
+            Instruction::I64Load16UPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x33);
+                m.encode(sink);
+            }
+            Instruction::I64Load32SPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x34);
+                m.encode(sink);
+            }
+            Instruction::I64Load32UPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x35);
+                m.encode(sink);
+            }
+            Instruction::I32StorePrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x36);
+                m.encode(sink);
+            }
+            Instruction::I64StorePrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x37);
+                m.encode(sink);
+            }
+            Instruction::I32Store8Prechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x3A);
+                m.encode(sink);
+            }
+            Instruction::I32Store16Prechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x3B);
+                m.encode(sink);
+            }
+            Instruction::I64Store8Prechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x3C);
+                m.encode(sink);
+            }
+            Instruction::I64Store16Prechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x3D);
+                m.encode(sink);
+            }
+            Instruction::I64Store32Prechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x3E);
+                m.encode(sink);
             }
 
             // Numeric instructions.

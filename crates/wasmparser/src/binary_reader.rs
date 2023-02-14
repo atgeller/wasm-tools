@@ -1826,11 +1826,46 @@ impl<'a> BinaryReader<'a> {
             0xd1 => visitor.visit_ref_is_null(),
             0xd2 => visitor.visit_ref_func(self.read_var_u32()?),
 
+            0xfa => self.visit_0xfa_operator(pos, visitor)?,
             0xfc => self.visit_0xfc_operator(pos, visitor)?,
             0xfd => self.visit_0xfd_operator(pos, visitor)?,
             0xfe => self.visit_0xfe_operator(pos, visitor)?,
 
             _ => bail!(pos, "illegal opcode: 0x{code:x}"),
+        })
+    }
+
+    fn visit_0xfa_operator<T>(
+        &mut self,
+        pos: usize,
+        visitor: &mut T,
+    ) -> Result<<T as VisitOperator<'a>>::Output>
+    where
+        T: VisitOperator<'a>,
+    {
+        let code = self.read_var_u32()?;
+        Ok(match code {
+            0x28 => visitor.visit_i32_load_prechk(self.read_memarg(2)?),
+            0x29 => visitor.visit_i64_load_prechk(self.read_memarg(3)?),
+            0x2c => visitor.visit_i32_load8_s_prechk(self.read_memarg(0)?),
+            0x2d => visitor.visit_i32_load8_u_prechk(self.read_memarg(0)?),
+            0x2e => visitor.visit_i32_load16_s_prechk(self.read_memarg(1)?),
+            0x2f => visitor.visit_i32_load16_u_prechk(self.read_memarg(1)?),
+            0x30 => visitor.visit_i64_load8_s_prechk(self.read_memarg(0)?),
+            0x31 => visitor.visit_i64_load8_u_prechk(self.read_memarg(0)?),
+            0x32 => visitor.visit_i64_load16_s_prechk(self.read_memarg(1)?),
+            0x33 => visitor.visit_i64_load16_u_prechk(self.read_memarg(1)?),
+            0x34 => visitor.visit_i64_load32_s_prechk(self.read_memarg(2)?),
+            0x35 => visitor.visit_i64_load32_u_prechk(self.read_memarg(2)?),
+            0x36 => visitor.visit_i32_store_prechk(self.read_memarg(2)?),
+            0x37 => visitor.visit_i64_store_prechk(self.read_memarg(3)?),
+            0x3a => visitor.visit_i32_store8_prechk(self.read_memarg(0)?),
+            0x3b => visitor.visit_i32_store16_prechk(self.read_memarg(1)?),
+            0x3c => visitor.visit_i64_store8_prechk(self.read_memarg(0)?),
+            0x3d => visitor.visit_i64_store16_prechk(self.read_memarg(1)?),
+            0x3e => visitor.visit_i64_store32_prechk(self.read_memarg(2)?),
+
+            _ => bail!(pos, "unknown 0xfa subopcode: 0x{code:x}"),
         })
     }
 

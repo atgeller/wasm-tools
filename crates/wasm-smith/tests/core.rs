@@ -298,6 +298,7 @@ fn parser_features_from_config(config: &impl Config) -> WasmFeatures {
         deterministic_only: false,
         extended_const: false,
         component_model: false,
+        precheck: true,
     }
 }
 

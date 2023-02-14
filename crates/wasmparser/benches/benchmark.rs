@@ -242,6 +242,7 @@ fn define_benchmarks(c: &mut Criterion) {
             mutable_global: true,
             saturating_float_to_int: true,
             sign_extension: true,
+            precheck: true,
         })
     }
 

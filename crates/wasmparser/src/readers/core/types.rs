@@ -309,7 +309,7 @@ impl FuncType {
     /// # Panics
     ///
     /// If `len_params` is greater than the length of `params_results` combined.
-    pub(crate) fn from_raw_parts(params_results: Box<[ValType]>, len_params: usize) -> Self {
+    pub(crate) fn _from_raw_parts(params_results: Box<[ValType]>, len_params: usize) -> Self {
         assert!(len_params <= params_results.len());
         Self {
             params_results,

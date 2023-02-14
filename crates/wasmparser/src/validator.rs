@@ -232,6 +232,8 @@ pub struct WasmFeatures {
     pub extended_const: bool,
     /// The WebAssembly component model proposal.
     pub component_model: bool,
+    /// WasmPrecheck
+    pub precheck: bool,
 }
 
 impl WasmFeatures {
@@ -278,6 +280,7 @@ impl Default for WasmFeatures {
             multi_value: true,
             reference_types: true,
             simd: true,
+            precheck: true,
         }
     }
 }
