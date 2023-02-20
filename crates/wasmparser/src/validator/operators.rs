@@ -220,11 +220,23 @@ impl OperatorValidator {
         });
 
         let params = functy.inputs();
+        let mut consumed = Vec::new();
         for ty in params {
             let index = ret.indices.len();
+            consumed.push(ret.indices.len() as u32);
             ret.indices.push(Some(ty));
             ret.locals.add_local(ty, index as u32);
         }
+
+        let unified = OperatorValidatorTemp {
+            // This offset is used by the `func_type_at` and `inputs`.
+            offset,
+            inner: &mut ret,
+            resources,
+        }.unify_constraints(&consumed, functy.pre_conditions().to_vec().clone(), true, true)?;
+
+        ret.constraints = unified;
+
         Ok(ret)
     }
 
@@ -265,6 +277,12 @@ impl OperatorValidator {
                     "too many locals: locals exceed maximum",
                     offset,
                 ));
+            }
+            let local_alpha = index as u32;
+            match ty {
+                ValType::I32 => { self.constraints.push(constraint!((= local_alpha (i32 0)))); }
+                ValType::I64 => { self.constraints.push(constraint!((= local_alpha (i64 0)))); }
+                _ => {}
             }
         }
         
@@ -508,6 +526,15 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         }
     }
 
+    fn freshen_locals(&mut self) {
+        for idx in 0..self.locals.num_locals {
+            let (ty, _) = self.locals.get(idx).unwrap();
+            let new_alpha = self.indices.len() as u32;
+            self.indices.push(Some(ty));
+            self.locals.replace_index(idx, new_alpha);
+        }
+    }
+
     /// Flags the current control frame as unreachable, additionally truncating
     /// the currently active operand stack.
     fn unreachable(&mut self) -> Result<()> {
@@ -548,7 +575,11 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             let x = self.push_operand(ty)?;
             new_indices.push(x);
         }
-        self.constraints = self.unify_block_type(&new_indices, ty, true)?;
+        // Freshen locals before unifying
+        if !(kind == FrameKind::If || kind == FrameKind::Else) {
+            self.freshen_locals();
+            self.constraints = self.unify_block_type(&new_indices, ty, true)?;
+        }
 
         let br_cond = if kind == FrameKind::Loop {
             Some(unified)
@@ -1324,13 +1355,14 @@ where
     }
     fn visit_if(&mut self, ty: BlockType) -> Self::Output {
         self.check_block_type(ty)?;
-        self.pop_operand(Some(ValType::I32))?;
+        let (_, cond) = self.pop_operand(Some(ValType::I32))?;
         let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
             let (_, idx) = self.pop_operand(Some(ty))?;
             pres.push(idx);
         }
-        self.push_ctrl(FrameKind::Block, ty, pres)?;
+        self.push_ctrl(FrameKind::If, ty, pres)?;
+        self.constraints.push(constraint!(not (= cond (i32 0))));
         Ok(())
     }
     fn visit_else(&mut self) -> Self::Output {
@@ -1423,8 +1455,8 @@ where
                 "br_if - branching condition not met"
             )
         }
-
         self.constraints.pop();
+
         self.constraints.push(constraint!(= cond (i32 0)));
 
         for ty in types {
@@ -1761,38 +1793,38 @@ where
         self.visit_i64_load32_s(memarg)
     }
     fn visit_i32_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I32))?;
         self.check_prechk_mem_access(memarg, 32)?;
-        self.push_operand(ValType::I32)?;
         Ok(())
     }
     fn visit_i64_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I64))?;
         self.check_prechk_mem_access(memarg, 64)?;
-        self.push_operand(ValType::I64)?;
         Ok(())
     }
     fn visit_i32_store8_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I32))?;
         self.check_prechk_mem_access(memarg, 8)?;
-        self.push_operand(ValType::I32)?;
         Ok(())
     }
     fn visit_i32_store16_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I32))?;
         self.check_prechk_mem_access(memarg, 16)?;
-        self.push_operand(ValType::I32)?;
         Ok(())
     }
     fn visit_i64_store8_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I64))?;
         self.check_prechk_mem_access(memarg, 8)?;
-        self.push_operand(ValType::I64)?;
         Ok(())
     }
     fn visit_i64_store16_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I64))?;
         self.check_prechk_mem_access(memarg, 16)?;
-        self.push_operand(ValType::I64)?;
         Ok(())
     }
     fn visit_i64_store32_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::I64))?;
         self.check_prechk_mem_access(memarg, 32)?;
-        self.push_operand(ValType::I64)?;
         Ok(())
     }
     fn visit_memory_size(&mut self, mem: u32, mem_byte: u8) -> Self::Output {

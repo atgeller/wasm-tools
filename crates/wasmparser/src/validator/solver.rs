@@ -89,10 +89,18 @@ impl<'a> Z3<'a> {
         }
     }
 
-    fn process_testop(&self, testop: &TestOp, _bv1: BV<'a>) -> BV<'a> {
+    fn process_testop(&self, testop: &TestOp, bv1: BV<'a>) -> BV<'a> {
         match testop {
-            TestOp::I32Eqz => todo!(),
-            TestOp::I64Eqz => todo!(),
+            TestOp::I32Eqz => {
+                let i32_true = BV::from_i64(self.ctx, 1, 32);
+                let i32_false = BV::from_i64(self.ctx, 0, 32);
+                bv1._eq(&i32_false).ite(&i32_true, &i32_false)
+            },
+            TestOp::I64Eqz => {
+                let i64_true = BV::from_i64(self.ctx, 1, 64);
+                let i64_false = BV::from_i64(self.ctx, 0, 64);
+                bv1._eq(&i64_false).ite(&i64_true, &i64_false)
+            },
         }
     }
 
