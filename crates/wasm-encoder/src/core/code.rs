@@ -371,6 +371,8 @@ pub enum Instruction<'a> {
     // Precbeck memory instructions.
     I32LoadPrechk(MemArg),
     I64LoadPrechk(MemArg),
+    F32LoadPrechk(MemArg),
+    F64LoadPrechk(MemArg),
     I32Load8SPrechk(MemArg),
     I32Load8UPrechk(MemArg),
     I32Load16SPrechk(MemArg),
@@ -383,6 +385,8 @@ pub enum Instruction<'a> {
     I64Load32UPrechk(MemArg),
     I32StorePrechk(MemArg),
     I64StorePrechk(MemArg),
+    F32StorePrechk(MemArg),
+    F64StorePrechk(MemArg),
     I32Store8Prechk(MemArg),
     I32Store16Prechk(MemArg),
     I64Store8Prechk(MemArg),
@@ -1125,6 +1129,16 @@ impl Encode for Instruction<'_> {
                 sink.push(0x29);
                 m.encode(sink);
             }
+            Instruction::F32LoadPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x2a);
+                m.encode(sink);
+            }
+            Instruction::F64LoadPrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x2b);
+                m.encode(sink);
+            }
             Instruction::I32Load8SPrechk(m) => {
                 sink.push(0xfa);
                 sink.push(0x2C);
@@ -1183,6 +1197,16 @@ impl Encode for Instruction<'_> {
             Instruction::I64StorePrechk(m) => {
                 sink.push(0xfa);
                 sink.push(0x37);
+                m.encode(sink);
+            }
+            Instruction::F32StorePrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x37);
+                m.encode(sink);
+            }
+            Instruction::F64StorePrechk(m) => {
+                sink.push(0xfa);
+                sink.push(0x38);
                 m.encode(sink);
             }
             Instruction::I32Store8Prechk(m) => {

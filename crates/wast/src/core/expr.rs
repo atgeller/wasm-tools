@@ -561,6 +561,8 @@ instructions! {
 
         I32LoadPrecheck(MemArg<4>) : [0xfa, 0x28] : "i32.load_prechk",
         I64LoadPrecheck(MemArg<8>) : [0xfa, 0x29] : "i64.load_prechk",
+        F32LoadPrecheck(MemArg<4>) : [0xfa, 0x2a] : "f32.load_prechk",
+        F64LoadPrecheck(MemArg<8>) : [0xfa, 0x2b] : "f64.load_prechk",
         I32Load8sPrecheck(MemArg<1>) : [0xfa, 0x2c] : "i32.load8_s_prechk",
         I32Load8uPrecheck(MemArg<1>) : [0xfa, 0x2d] : "i32.load8_u_prechk",
         I32Load16sPrecheck(MemArg<2>) : [0xfa, 0x2e] : "i32.load16_s_prechk",
@@ -573,6 +575,8 @@ instructions! {
         I64Load32uPrecheck(MemArg<4>) : [0xfa, 0x35] : "i64.load32_u_prechk",
         I32StorePrecheck(MemArg<4>) : [0xfa, 0x36] : "i32.store_prechk",
         I64StorePrecheck(MemArg<8>) : [0xfa, 0x37] : "i64.store_prechk",
+        F32StorePrecheck(MemArg<4>) : [0xfa, 0x38] : "f32.store_prechk",
+        F64StorePrecheck(MemArg<8>) : [0xfa, 0x39] : "f64.store_prechk",
         I32Store8Precheck(MemArg<1>) : [0xfa, 0x3a] : "i32.store8_prechk",
         I32Store16Precheck(MemArg<2>) : [0xfa, 0x3b] : "i32.store16_prechk",
         I64Store8Precheck(MemArg<1>) : [0xfa, 0x3c] : "i64.store8_prechk",

@@ -359,6 +359,8 @@ macro_rules! define_visit {
     (name I64Store32) => ("i64.store32");
     (name I32LoadPrechk) => ("i32.load_prechk");
     (name I64LoadPrechk) => ("i64.load_prechk");
+    (name F32LoadPrechk) => ("f32.load_prechk");
+    (name F64LoadPrechk) => ("f64.load_prechk");
     (name I32Load8SPrechk) => ("i32.load8_s_prechk");
     (name I32Load8UPrechk) => ("i32.load8_u_prechk");
     (name I32Load16SPrechk) => ("i32.load16_s_prechk");
@@ -371,6 +373,8 @@ macro_rules! define_visit {
     (name I64Load32UPrechk) => ("i64.load32_u_prechk");
     (name I32StorePrechk) => ("i32.store_prechk");
     (name I64StorePrechk) => ("i64.store_prechk");
+    (name F32StorePrechk) => ("f32.store_prechk");
+    (name F64StorePrechk) => ("f64.store_prechk");
     (name I32Store8Prechk) => ("i32.store8_prechk");
     (name I32Store16Prechk) => ("i32.store16_prechk");
     (name I64Store8Prechk) => ("i64.store8_prechk");

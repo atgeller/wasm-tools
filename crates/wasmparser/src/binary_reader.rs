@@ -993,6 +993,8 @@ impl<'a> BinaryReader<'a> {
         Ok(match code {
             0x28 => visitor.visit_i32_load_prechk(self.read_memarg(2)?),
             0x29 => visitor.visit_i64_load_prechk(self.read_memarg(3)?),
+            0x2a => visitor.visit_f32_load_prechk(self.read_memarg(2)?),
+            0x2b => visitor.visit_f64_load_prechk(self.read_memarg(3)?),
             0x2c => visitor.visit_i32_load8_s_prechk(self.read_memarg(0)?),
             0x2d => visitor.visit_i32_load8_u_prechk(self.read_memarg(0)?),
             0x2e => visitor.visit_i32_load16_s_prechk(self.read_memarg(1)?),
@@ -1005,6 +1007,8 @@ impl<'a> BinaryReader<'a> {
             0x35 => visitor.visit_i64_load32_u_prechk(self.read_memarg(2)?),
             0x36 => visitor.visit_i32_store_prechk(self.read_memarg(2)?),
             0x37 => visitor.visit_i64_store_prechk(self.read_memarg(3)?),
+            0x38 => visitor.visit_f32_store_prechk(self.read_memarg(2)?),
+            0x39 => visitor.visit_f64_store_prechk(self.read_memarg(3)?),
             0x3a => visitor.visit_i32_store8_prechk(self.read_memarg(0)?),
             0x3b => visitor.visit_i32_store16_prechk(self.read_memarg(1)?),
             0x3c => visitor.visit_i64_store8_prechk(self.read_memarg(0)?),

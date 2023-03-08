@@ -170,6 +170,8 @@ macro_rules! for_each_operator {
             @mvp I64Store32 { memarg: $crate::MemArg } => visit_i64_store32
             @precheck I32LoadPrechk { memarg: $crate::MemArg } => visit_i32_load_prechk
             @precheck I64LoadPrechk { memarg: $crate::MemArg } => visit_i64_load_prechk
+            @precheck F32LoadPrechk { memarg: $crate::MemArg } => visit_f32_load_prechk
+            @precheck F64LoadPrechk { memarg: $crate::MemArg } => visit_f64_load_prechk
             @precheck I32Load8SPrechk { memarg: $crate::MemArg } => visit_i32_load8_s_prechk
             @precheck I32Load8UPrechk { memarg: $crate::MemArg } => visit_i32_load8_u_prechk
             @precheck I32Load16SPrechk { memarg: $crate::MemArg } => visit_i32_load16_s_prechk
@@ -182,6 +184,8 @@ macro_rules! for_each_operator {
             @precheck I64Load32UPrechk { memarg: $crate::MemArg } => visit_i64_load32_u_prechk
             @precheck I32StorePrechk { memarg: $crate::MemArg } => visit_i32_store_prechk
             @precheck I64StorePrechk { memarg: $crate::MemArg } => visit_i64_store_prechk
+            @precheck F32StorePrechk { memarg: $crate::MemArg } => visit_f32_store_prechk
+            @precheck F64StorePrechk { memarg: $crate::MemArg } => visit_f64_store_prechk
             @precheck I32Store8Prechk { memarg: $crate::MemArg } => visit_i32_store8_prechk
             @precheck I32Store16Prechk { memarg: $crate::MemArg } => visit_i32_store16_prechk
             @precheck I64Store8Prechk { memarg: $crate::MemArg } => visit_i64_store8_prechk

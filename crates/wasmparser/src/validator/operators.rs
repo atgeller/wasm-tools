@@ -1752,6 +1752,16 @@ where
         self.push_operand(ValType::I64)?;
         Ok(())
     }
+    fn visit_f32_load_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 32)?;
+        self.push_operand(ValType::F32)?;
+        Ok(())
+    }
+    fn visit_f64_load_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.check_prechk_mem_access(memarg, 64)?;
+        self.push_operand(ValType::F64)?;
+        Ok(())
+    }
     fn visit_i32_load8_s_prechk(&mut self, memarg: MemArg) -> Self::Output {
         self.check_prechk_mem_access(memarg, 8)?;
         self.push_operand(ValType::I32)?;
@@ -1799,6 +1809,16 @@ where
     }
     fn visit_i64_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
         self.pop_operand(Some(ValType::I64))?;
+        self.check_prechk_mem_access(memarg, 64)?;
+        Ok(())
+    }
+    fn visit_f32_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::F32))?;
+        self.check_prechk_mem_access(memarg, 32)?;
+        Ok(())
+    }
+    fn visit_f64_store_prechk(&mut self, memarg: MemArg) -> Self::Output {
+        self.pop_operand(Some(ValType::F64))?;
         self.check_prechk_mem_access(memarg, 64)?;
         Ok(())
     }
