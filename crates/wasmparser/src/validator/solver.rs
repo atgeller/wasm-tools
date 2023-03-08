@@ -63,8 +63,6 @@ impl<'a> Z3<'a> {
     fn process_relop(&self, relop: &RelOp, bv1: BV<'a>, bv2: BV<'a>) -> BV<'a> {
         let i32_true = BV::from_i64(self.ctx, 1, 32);
         let i32_false = BV::from_i64(self.ctx, 0, 32);
-        let i64_true = BV::from_i64(self.ctx, 1, 64);
-        let i64_false = BV::from_i64(self.ctx, 0, 64);
         match relop {
             RelOp::I32Eq => bv1._eq(&bv2).ite(&i32_true, &i32_false),
             RelOp::I32Ne => bv1._eq(&bv2).ite(&i32_false, &i32_true),
@@ -76,30 +74,29 @@ impl<'a> Z3<'a> {
             RelOp::I32LeU => bv1.bvule(&bv2).ite(&i32_true, &i32_false),
             RelOp::I32GeS => bv1.bvsge(&bv2).ite(&i32_true, &i32_false),
             RelOp::I32GeU => bv1.bvuge(&bv2).ite(&i32_true, &i32_false),
-            RelOp::I64Eq => bv1._eq(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64Ne => bv1._eq(&bv2).ite(&i64_false, &i64_true),
-            RelOp::I64LtS => bv1.bvslt(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64LtU => bv1.bvult(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64GtS => bv1.bvsgt(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64GtU => bv1.bvugt(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64LeS => bv1.bvsle(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64LeU => bv1.bvule(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64GeS => bv1.bvsge(&bv2).ite(&i64_true, &i64_false),
-            RelOp::I64GeU => bv1.bvuge(&bv2).ite(&i64_true, &i64_false),
+            RelOp::I64Eq => bv1._eq(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64Ne => bv1._eq(&bv2).ite(&i32_false, &i32_true),
+            RelOp::I64LtS => bv1.bvslt(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64LtU => bv1.bvult(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64GtS => bv1.bvsgt(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64GtU => bv1.bvugt(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64LeS => bv1.bvsle(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64LeU => bv1.bvule(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64GeS => bv1.bvsge(&bv2).ite(&i32_true, &i32_false),
+            RelOp::I64GeU => bv1.bvuge(&bv2).ite(&i32_true, &i32_false),
         }
     }
 
     fn process_testop(&self, testop: &TestOp, bv1: BV<'a>) -> BV<'a> {
+        let i32_true = BV::from_i64(self.ctx, 1, 32);
+        let i32_false = BV::from_i64(self.ctx, 0, 32);
         match testop {
             TestOp::I32Eqz => {
-                let i32_true = BV::from_i64(self.ctx, 1, 32);
-                let i32_false = BV::from_i64(self.ctx, 0, 32);
                 bv1._eq(&i32_false).ite(&i32_true, &i32_false)
             },
             TestOp::I64Eqz => {
-                let i64_true = BV::from_i64(self.ctx, 1, 64);
                 let i64_false = BV::from_i64(self.ctx, 0, 64);
-                bv1._eq(&i64_false).ite(&i64_true, &i64_false)
+                bv1._eq(&i64_false).ite(&i32_true, &i32_false)
             },
         }
     }
@@ -183,7 +180,7 @@ impl ConstraintSolver for Z3<'static> {
                     let size = match ty {
                         ValType::I32 => 32,
                         ValType::I64 => 64,
-                        _ => todo!(),
+                        _ => 1, // No harm, no foul, right?
                     };
                     ast::BV::new_const(&ctx, format!("alpha_{:?}", idx),size)
                 })

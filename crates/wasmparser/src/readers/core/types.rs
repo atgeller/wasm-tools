@@ -486,6 +486,17 @@ impl<'a> FromReader<'a> for IndexedFuncType {
             params_results.push(result?);
         }
 
+        if reader.peek()? != 0xff {
+            return Ok(IndexedFuncType::from_raw_parts(
+                params_results.into(),
+                len_params,
+                vec![].into(),
+                0,
+            ));
+        }
+
+        reader.read_u8()?;
+
         let mut pres_posts = reader
             .read_iter(MAX_WASM_FUNCTION_PARAMS, "function pre-conditions")?
             .collect::<Result<Vec<_>>>()?;

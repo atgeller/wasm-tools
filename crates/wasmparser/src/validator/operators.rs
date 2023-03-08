@@ -982,7 +982,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn check_cmp_op(&mut self, ty: ValType, cop: Option<RelOp>) -> Result<()> {
         let (_, x) = self.pop_operand(Some(ty))?;
         let (_, y) = self.pop_operand(Some(ty))?;
-        let new = self.push_operand(ty)?;
+        let new = self.push_operand(ValType::I32)?;
         if let Some(c) = cop {
             self.constraints.push(Constraint::Eq(
                 IndexTerm::Alpha(new),
@@ -1882,7 +1882,7 @@ where
     visit_op!(CmpOpI32: visit_i32_ge_u, RelOp::I32GeU);
     fn visit_i64_eqz(&mut self) -> Self::Output {
         let (_, old) = self.pop_operand(Some(ValType::I64))?;
-        let new = self.push_operand(ValType::I64)?;
+        let new = self.push_operand(ValType::I32)?;
         self.constraints.push(constraint!(= new (i64.eqz old)));
         Ok(())
     }
