@@ -696,7 +696,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(mem) => {
                 let (_, index) = self.pop_operand(Some(mem.index_type()))?;
                 let initial_size = (mem.initial * 65536) as i32;
-                let offset = (memarg.offset + size) as i32;
+                let offset = (memarg.offset + size/8) as i32;
                 // Todo: should add memory access to index language since i33 technically
                 let cond = constraint!(= (i32 1) (i32.lt_u (i32.add (i32 offset) index) (i32 initial_size)));
                 if !self.check_condition_is_satisfied(&vec![cond]) {
