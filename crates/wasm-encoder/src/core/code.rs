@@ -1201,12 +1201,12 @@ impl Encode for Instruction<'_> {
             }
             Instruction::F32StorePrechk(m) => {
                 sink.push(0xfa);
-                sink.push(0x37);
+                sink.push(0x38);
                 m.encode(sink);
             }
             Instruction::F64StorePrechk(m) => {
                 sink.push(0xfa);
-                sink.push(0x38);
+                sink.push(0x39);
                 m.encode(sink);
             }
             Instruction::I32Store8Prechk(m) => {
