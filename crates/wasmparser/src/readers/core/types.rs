@@ -174,6 +174,7 @@ pub enum IndexTerm {
     Pre(u32),
     Post(u32),
     Local(u32),
+    OldLocal(u32),
     IConstant(Constant),
 }
 
@@ -654,12 +655,13 @@ impl<'a> FromReader<'a> for IndexTerm {
                 let x = reader.read()?;
                 IndexTerm::IUnOp(unop, Box::new(x))
             }
-            x @ 0x20..=0x22 => {
+            x @ 0x20..=0x23 => {
                 let index = reader.read()?;
                 match x {
                     0x20 => IndexTerm::Local(index),
                     0x21 => IndexTerm::Pre(index),
                     0x22 => IndexTerm::Post(index),
+                    0x23 => IndexTerm::OldLocal(index),
                     _ => panic!(),
                 }
             }

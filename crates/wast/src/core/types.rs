@@ -262,6 +262,7 @@ pub enum IndexTerm<'a> {
     Pre(Index<'a>),
     Post(Index<'a>),
     Local(Index<'a>),
+    OldLocal(Index<'a>),
     IConstant(Constant)
 }
 
@@ -304,6 +305,11 @@ impl<'a> Parse<'a> for IndexTerm<'a> {
             _parser.parse::<kw::local>()?;
             Ok(IndexTerm::Local(_parser.parse()?))
         }
+        fn OldLocal<'a>(_parser: Parser<'a>) -> Result<IndexTerm<'a>> {
+            //let vty = _parser.parse::<ValType>()?;
+            _parser.parse::<kw::old_local>()?;
+            Ok(IndexTerm::OldLocal(_parser.parse()?))
+        }
 
         if parser.peek::<Id>() {
             return Alpha(parser);
@@ -324,6 +330,8 @@ impl<'a> Parse<'a> for IndexTerm<'a> {
                 return Constant(parser);
             } else if inner.peek::<kw::local>() {
                 return Local(inner);
+            } else if inner.peek::<kw::old_local>() {
+                return OldLocal(inner);
             }
 
             return Err(inner.error("expected index term"))
@@ -340,6 +348,10 @@ impl<'a> Peek for IndexTerm<'a> {
 
         if let Some(next) = cursor.lparen() {
             if let Some(("local", _)) = next.keyword() {
+                return true
+            };
+
+            if let Some(("old_local", _)) = next.keyword() {
                 return true
             };
 

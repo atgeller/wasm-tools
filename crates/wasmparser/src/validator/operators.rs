@@ -557,16 +557,23 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType, consumed: Vec<u32>) -> Result<()> {
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
+
+        // Unify, resolve (to catch errors), check
         let height = self.operands.len();
         let unified = self.unify_block_type(&consumed, ty, true)?;
+        // Catch errors
+        let unified = self.resolve_old_locals_constraints(unified, true)?;
         let constraints = self.constraints.clone();
-
         if !self.check_condition_is_satisfied(&unified) {
             bail!(
                 self.offset,
-                "constraints do not satisfy block precondition!"
+                "constraints do not satisfy block precondition! (block type: {:?})", ty
             )
         }
+
+        // Unify `pre`s and resolve `old_local`s in annotation post condition 
+        let post = self.unify_block_type(&consumed, ty, false)?;
+        let post = self.resolve_old_locals_constraints(post, false)?;
 
         // All of the parameters are now also available in this control frame,
         // so we push them here in order.
@@ -576,10 +583,10 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             new_indices.push(x);
         }
         // Freshen locals before unifying
-        if !(kind == FrameKind::If || kind == FrameKind::Else) {
+        if !(kind == FrameKind::If || kind == FrameKind::Else || kind == FrameKind::Block) {
             self.freshen_locals();
-            self.constraints = self.unify_block_type(&new_indices, ty, true)?;
         }
+        self.constraints = self.unify_block_type(&new_indices, ty, true)?;
 
         let br_cond = if kind == FrameKind::Loop {
             Some(unified)
@@ -587,7 +594,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             None
         };
 
-        let post = self.unify_block_type(&new_indices, ty, false)?;
+        // Resolve posts, do not unify
         self.control.push(Frame {
             kind,
             block_type: ty,
@@ -614,11 +621,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         };
         let ty = frame.block_type;
         let height = frame.height;
-        let cond = if frame.kind == FrameKind::Loop {
-            frame.br_cond.clone().unwrap()
-        } else {
-            frame.post.clone()            
-        };
+        let cond = frame.post.clone();
 
         // Pop all the result types, in reverse order, from the operand stack.
         // These types will, possibly, be transferred to the next frame.
@@ -628,6 +631,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             results.push(idx);
         }
 
+        // Just unify and check
         let condition = self.unify_constraints(&results, cond, false, false)?;
 
         if !self.check_condition_is_satisfied(&condition) {
@@ -661,7 +665,9 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         match (self.control.len() - 1).checked_sub(depth as usize) {
             Some(i) => {
                 let frame = &self.control[i];
-                Ok((frame.block_type, frame.kind, frame.post.clone()))
+                // br_cond will only be Some(...) if the frame is a loop
+                let cond = frame.br_cond.clone().unwrap_or(frame.post.clone());
+                Ok((frame.block_type, frame.kind, cond))
             }
             None => bail!(self.offset, "unknown label: branch depth too large"),
         }
@@ -733,6 +739,75 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             bail!(self.offset, "SIMD index out of bounds");
         }
         Ok(())
+    }
+
+    /// Unifies an index_term
+    fn resolve_old_locals_index_term(&self, it: &mut IndexTerm, is_pre: bool) -> Result<()> {
+        match it {
+            IndexTerm::IBinOp(_, x, y)
+            | IndexTerm::IRelOp(_, x, y) => {
+                self.resolve_old_locals_index_term(&mut *x, is_pre)?;
+                self.resolve_old_locals_index_term(&mut *y, is_pre)?;
+            },
+            IndexTerm::ITestOp(_, x)
+            | IndexTerm::IUnOp(_, x) => {
+                self.resolve_old_locals_index_term(&mut *x, is_pre)?;
+            },
+            IndexTerm::OldLocal(idx) => {
+                if is_pre {
+                    bail!(self.offset, "illegal index variable reference: cannot have old_local in pre_condition");
+                } else {
+                    let (_, alpha) = self.local(*idx)?;
+                    *it = IndexTerm::Alpha(alpha);
+                    return Ok(());
+                }
+            },
+            _ => {}
+        };
+
+        Ok(())
+    }
+
+    /// Unifies a constraint
+    fn resolve_old_locals_contraint(
+        &self,
+        c: &mut Constraint,
+        is_pre: bool,
+    ) -> Result<()> {
+        match c {
+            Constraint::Eq(x, y) => {
+                self.resolve_old_locals_index_term(x, is_pre)?;
+                self.resolve_old_locals_index_term(y, is_pre)?;
+            },
+            Constraint::And(x, y)
+            | Constraint::Or(x, y) => {
+                self.resolve_old_locals_contraint(x, is_pre)?;
+                self.resolve_old_locals_contraint(y, is_pre)?;
+            },
+            Constraint::If(x, y, z) => {
+                self.resolve_old_locals_contraint(x, is_pre)?;
+                self.resolve_old_locals_contraint(y, is_pre)?;
+                self.resolve_old_locals_contraint(z, is_pre)?;
+            },
+            Constraint::Not(x) => {
+                self.resolve_old_locals_contraint(x, is_pre)?;
+            },
+        }
+
+        Ok(())
+    }
+
+    /// Unifies the constraints from a block_type
+    fn resolve_old_locals_constraints(&self, constraints: Vec<Constraint>, is_pre: bool) -> Result<Vec<Constraint>> {
+        let mut new_constraints = Vec::new();
+
+        for c in constraints.iter() {
+            let mut copy = c.clone();
+            self.resolve_old_locals_contraint(&mut copy, is_pre)?;
+            new_constraints.push(copy);
+        }
+
+        Ok(new_constraints)
     }
 
      /// Unifies an index_term
@@ -1426,6 +1501,7 @@ where
             let (_, idx) = self.pop_operand(Some(ty))?;
             args.push(idx);
         }
+        // Unify with br_cond and check
         let unified = self.unify_constraints(&args, post, false, false)?;
         if !self.check_condition_is_satisfied(&unified) {
             bail!(

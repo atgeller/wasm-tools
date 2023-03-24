@@ -200,7 +200,7 @@ impl ConstraintSolver for Z3<'static> {
         let result = solver.check();
         match result {
             SatResult::Unsat => true,
-            _ => { println!("Model: {:?}", solver.get_model()); false},
+            _ => { println!("Solver: {:?}\n\nModel: {:?}", solver, solver.get_model()); false},
         }
     }
 }

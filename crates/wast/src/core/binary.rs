@@ -159,6 +159,10 @@ impl Encode for IndexTerm<'_> {
                 e.push(0x20);
                 idx.encode(e);
             },
+            IndexTerm::OldLocal(idx) => {
+                e.push(0x23);
+                idx.encode(e);
+            },
             IndexTerm::IConstant(c) => {
                 c.encode(e);
             },

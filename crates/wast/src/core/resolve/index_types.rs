@@ -257,7 +257,8 @@ impl<'a> IndexTypeResolver<'a> {
 
     fn resolve_index_term(&self, it: &mut IndexTerm<'a>) -> Result<(), Error> {
         match it {
-            IndexTerm::Local(local) => self.resolve_local(local)?,
+            IndexTerm::Local(local)
+            | IndexTerm::OldLocal(local) => self.resolve_local(local)?,
             IndexTerm::Alpha(id) => {
                 if let Ok(n) = self.post_scope.resolve(&mut Index::Id(*id), "index") {
                     *it = IndexTerm::Post(Index::Num(n,id.span()));

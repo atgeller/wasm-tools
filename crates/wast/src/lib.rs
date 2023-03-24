@@ -439,6 +439,7 @@ pub mod kw {
     custom_keyword!(item);
     custom_keyword!(last);
     custom_keyword!(local);
+    custom_keyword!(old_local);
     custom_keyword!(memory);
     custom_keyword!(module);
     custom_keyword!(modulecode);
