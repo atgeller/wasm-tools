@@ -583,10 +583,10 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             new_indices.push(x);
         }
         // Freshen locals before unifying
-        if !(kind == FrameKind::If || kind == FrameKind::Else || kind == FrameKind::Block) {
+        if kind == FrameKind::Loop {
             self.freshen_locals();
+            self.constraints = self.unify_block_type(&new_indices, ty, true)?;
         }
-        self.constraints = self.unify_block_type(&new_indices, ty, true)?;
 
         let br_cond = if kind == FrameKind::Loop {
             Some(unified)
@@ -1483,6 +1483,10 @@ where
         }
 
         let mut constraints = frame.constraints.clone();
+        // I don't think an If is possible at this point, but maybe it is so better to be safe
+        if frame.kind == FrameKind::If || frame.kind == FrameKind::Else || frame.kind == FrameKind::Block {
+            self.freshen_locals();
+        }
         let mut new_constraints = self.unify_constraints(&new_indices, frame.post, false, false)?;
 
         new_constraints.append(&mut constraints);
