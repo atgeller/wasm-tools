@@ -25,9 +25,11 @@
 use index_language::constraint;
 
 use crate::{
-    limits::MAX_WASM_FUNCTION_LOCALS, BinOp, BinaryReaderError, BlockType, BrTable, Constant,
-    Constraint, Ieee32, Ieee64, IndexTerm, MemArg, RelOp, Result, UnOp, TestOp, ValType, VisitOperator,
-    WasmFeatures, WasmFuncType, WasmModuleResources, V128, validator::solver::{Z3, ConstraintSolver},
+    limits::MAX_WASM_FUNCTION_LOCALS,
+    validator::solver::{ConstraintSolver, Z3},
+    BinOp, BinaryReaderError, BlockType, BrTable, Constant, Constraint, Ieee32, Ieee64, IndexTerm,
+    MemArg, RelOp, Result, TestOp, UnOp, ValType, VisitOperator, WasmFeatures, WasmFuncType,
+    WasmModuleResources, V128,
 };
 use std::{
     ops::{Deref, DerefMut},
@@ -71,7 +73,6 @@ pub(super) struct Locals {
     // many locals and don't need a full binary search in the entire local space
     // below.
     first: Vec<(ValType, u32)>,
-
     // This is a "compressed" list of locals for this function. The list of
     // locals are represented as a list of tuples. The second element is the
     // type of the local, and the first element is monotonically increasing as
@@ -228,12 +229,12 @@ impl OperatorValidator {
             ret.locals.add_local(ty, index as u32);
         }
 
-        let unified = OperatorValidatorTemp {
-            // This offset is used by the `func_type_at` and `inputs`.
+        ret.constraints = Resolver::resolve_before_block(
+            &consumed,
+            &ret.locals,
+            functy.pre_conditions().to_vec().clone(),
             offset,
-            inner: &mut ret,
-            resources,
-        }.unify_constraints(&consumed, functy.pre_conditions().to_vec().clone(), true, true)?;
+        )?;
 
         ret.constraints = unified;
 
@@ -280,12 +281,16 @@ impl OperatorValidator {
             }
             let local_alpha = index as u32;
             match ty {
-                ValType::I32 => { self.constraints.push(constraint!((= local_alpha (i32 0)))); }
-                ValType::I64 => { self.constraints.push(constraint!((= local_alpha (i64 0)))); }
+                ValType::I32 => {
+                    self.constraints.push(constraint!((= local_alpha (i32 0))));
+                }
+                ValType::I64 => {
+                    self.constraints.push(constraint!((= local_alpha (i64 0))));
+                }
                 _ => {}
             }
         }
-        
+
         Ok(())
     }
 
@@ -386,6 +391,315 @@ impl<R> Deref for OperatorValidatorTemp<'_, '_, R> {
 impl<R> DerefMut for OperatorValidatorTemp<'_, '_, R> {
     fn deref_mut(&mut self) -> &mut OperatorValidator {
         self.inner
+    }
+}
+
+#[derive(PartialEq)]
+enum ToResolve {
+    Pres,
+    Posts,
+    Locals,
+    OldLocals,
+}
+
+struct Resolver<'a> {
+    to_resolve: ToResolve,
+    is_pre: bool,
+    is_call: bool,
+    stack_vars: &'a Vec<u32>,
+    locals: &'a Locals,
+    offset: usize,
+}
+
+impl<'a> Resolver<'a> {
+    /// Fetches the type for the local at `idx`, returning an error if it's out
+    /// of bounds.
+    fn local(&self, idx: u32) -> Result<(ValType, u32)> {
+        match self.locals.get(idx) {
+            Some(ty) => Ok(ty),
+            None => bail!(
+                self.offset,
+                "unknown local {}: local index out of bounds",
+                idx
+            ),
+        }
+    }
+
+    /// Unifies an index_term
+    fn resolve_index_term(&self, it: &mut IndexTerm) -> Result<()> {
+        let idx = match it {
+            IndexTerm::IBinOp(_, x, y) | IndexTerm::IRelOp(_, x, y) => {
+                self.resolve_index_term(&mut *x)?;
+                self.resolve_index_term(&mut *y)?;
+                None
+            }
+            IndexTerm::ITestOp(_, x) | IndexTerm::IUnOp(_, x) => {
+                self.resolve_index_term(&mut *x)?;
+                None
+            }
+            IndexTerm::Pre(idx) if self.to_resolve == ToResolve::Pres => Some(*idx as usize),
+            IndexTerm::Post(idx) if self.to_resolve == ToResolve::Posts => Some(*idx as usize),
+            IndexTerm::Local(idx) if self.to_resolve == ToResolve::Locals => {
+                if self.is_call {
+                    Some(*idx as usize)
+                } else {
+                    let (_, alpha) = self.local(*idx)?;
+                    *it = IndexTerm::Alpha(alpha);
+                    return Ok(());
+                }
+            }
+            IndexTerm::OldLocal(idx) if self.to_resolve == ToResolve::OldLocals => {
+                if self.is_pre {
+                    bail!(
+                        self.offset,
+                        "illegal index variable reference: cannot have old_local in pre_condition"
+                    );
+                } else {
+                    let (_, alpha) = self.local(*idx)?;
+                    *it = IndexTerm::Alpha(alpha);
+                    return Ok(());
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(x) = idx.and_then(|x| self.stack_vars.get(x)) {
+            *it = IndexTerm::Alpha(*x);
+        } else if idx.is_some() {
+            bail!(
+                self.offset,
+                "illegal index variable reference: unknown offset"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Unifies a constraint
+    fn resolve_constraint(&self, c: &mut Constraint) -> Result<()> {
+        match c {
+            Constraint::Eq(x, y) => {
+                self.resolve_index_term(x)?;
+                self.resolve_index_term(y)?;
+            }
+            Constraint::And(x, y) | Constraint::Or(x, y) => {
+                self.resolve_constraint(x)?;
+                self.resolve_constraint(y)?;
+            }
+            Constraint::If(x, y, z) => {
+                self.resolve_constraint(x)?;
+                self.resolve_constraint(y)?;
+                self.resolve_constraint(z)?;
+            }
+            Constraint::Not(x) => {
+                self.resolve_constraint(x)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn resolve_constraints(&self, constraints: Vec<Constraint>) -> Result<Vec<Constraint>> {
+        let mut new_constraints = Vec::new();
+
+        for c in constraints.iter() {
+            let mut copy = c.clone();
+            self.resolve_constraint(&mut copy)?;
+            new_constraints.push(copy);
+        }
+
+        Ok(new_constraints)
+    }
+
+    pub fn resolve_before_block(
+        consumed: &Vec<u32>,
+        locals: &Locals,
+        constraints: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<Vec<Constraint>> {
+        let resolver1 = Resolver {
+            to_resolve: ToResolve::Pres,
+            is_pre: true,
+            is_call: false,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        let resolved1 = resolver1.resolve_constraints(constraints)?;
+
+        let resolver2 = Resolver {
+            to_resolve: ToResolve::Locals,
+            is_pre: true,
+            is_call: false,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        let resolved2 = resolver2.resolve_constraints(resolved1)?;
+
+        // to catch errors
+        let resolver3 = Resolver {
+            to_resolve: ToResolve::OldLocals,
+            is_pre: true,
+            is_call: false,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        resolver3.resolve_constraints(resolved2)
+    }
+
+    pub fn preliminary_resolve_after_block(
+        consumed: &Vec<u32>,
+        locals: &Locals,
+        constraints: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<Vec<Constraint>> {
+        let resolver1 = Resolver {
+            to_resolve: ToResolve::Pres,
+            is_pre: false,
+            is_call: false,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        let resolved1 = resolver1.resolve_constraints(constraints)?;
+
+        let resolver2 = Resolver {
+            to_resolve: ToResolve::OldLocals,
+            is_pre: false,
+            is_call: false,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        resolver2.resolve_constraints(resolved1)
+    }
+
+    pub fn resolve_after_block(
+        produced: &Vec<u32>,
+        locals: &Locals,
+        constraints: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<Vec<Constraint>> {
+        let resolver1 = Resolver {
+            to_resolve: ToResolve::Posts,
+            is_pre: false,
+            is_call: false,
+            stack_vars: produced,
+            locals,
+            offset,
+        };
+
+        let resolved1 = resolver1.resolve_constraints(constraints)?;
+
+        let resolver2 = Resolver {
+            to_resolve: ToResolve::Locals,
+            is_pre: false,
+            is_call: false,
+            stack_vars: produced,
+            locals,
+            offset,
+        };
+
+        resolver2.resolve_constraints(resolved1)
+    }
+
+    fn resolve_before_call(
+        consumed: &Vec<u32>,
+        locals: &Locals,
+        constraints: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<Vec<Constraint>> {
+        let resolver1 = Resolver {
+            to_resolve: ToResolve::Pres,
+            is_pre: true,
+            is_call: true,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        let resolved1 = resolver1.resolve_constraints(constraints)?;
+
+        let resolver2 = Resolver {
+            to_resolve: ToResolve::Locals,
+            is_pre: true,
+            is_call: true,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        resolver2.resolve_constraints(resolved1)
+    }
+
+    fn preliminary_resolve_after_call(
+        consumed: &Vec<u32>,
+        locals: &Locals,
+        constraints: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<Vec<Constraint>> {
+        let resolver1 = Resolver {
+            to_resolve: ToResolve::Pres,
+            is_pre: false,
+            is_call: true,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        let resolved1 = resolver1.resolve_constraints(constraints)?;
+
+        let resolver2 = Resolver {
+            to_resolve: ToResolve::Locals,
+            is_pre: false,
+            is_call: true,
+            stack_vars: consumed,
+            locals,
+            offset,
+        };
+
+        resolver2.resolve_constraints(resolved1)
+    }
+
+    fn resolve_after_call(
+        produced: &Vec<u32>,
+        locals: &Locals,
+        constraints: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<Vec<Constraint>> {
+        let resolver1 = Resolver {
+            to_resolve: ToResolve::Posts,
+            is_pre: false,
+            is_call: true,
+            stack_vars: produced,
+            locals,
+            offset,
+        };
+
+        resolver1.resolve_constraints(constraints)
+    }
+
+    pub fn resolve_call(
+        consumed: &Vec<u32>,
+        produced: &Vec<u32>,
+        locals: &Locals,
+        pres: Vec<Constraint>,
+        posts: Vec<Constraint>,
+        offset: usize,
+    ) -> Result<(Vec<Constraint>, Vec<Constraint>)> {
+        let pre = Self::resolve_before_call(consumed, locals, pres, offset)?;
+        let preliminary_post =
+            Self::preliminary_resolve_after_call(consumed, locals, posts, offset)?;
+        let post = Self::resolve_after_call(produced, locals, preliminary_post, offset)?;
+
+        Ok((pre, post))
     }
 }
 
@@ -517,7 +831,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(_) => {
                 self.locals.replace_index(idx, alpha);
                 return Ok(());
-            },
+            }
             None => bail!(
                 self.offset,
                 "unknown local {}: local index out of bounds",
@@ -557,44 +871,52 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType, consumed: Vec<u32>) -> Result<()> {
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
-
-        // Unify, resolve (to catch errors), check
         let height = self.operands.len();
-        let unified = self.unify_block_type(&consumed, ty, true)?;
-        // Catch errors
-        let unified = self.resolve_old_locals_constraints(unified, true)?;
+
+        // This is what we want to check against
+        let pre = self.get_pres_from_block_type(ty)?;
+        let condition =
+            Resolver::resolve_before_block(&consumed, &self.locals, pre.clone(), self.offset)?;
+
         let constraints = self.constraints.clone();
-        if !self.check_condition_is_satisfied(&unified) {
+        if !self.check_condition_is_satisfied(&condition) {
             bail!(
                 self.offset,
-                "constraints do not satisfy block precondition! (block type: {:?})", ty
+                "constraints do not satisfy block precondition! (block type: {:?})",
+                ty
             )
         }
 
-        // Unify `pre`s and resolve `old_local`s in annotation post condition 
-        let post = self.unify_block_type(&consumed, ty, false)?;
-        let post = self.resolve_old_locals_constraints(post, false)?;
-
-        // All of the parameters are now also available in this control frame,
-        // so we push them here in order.
-        let mut new_indices = Vec::new();
-        for ty in self.params(ty)? {
-            let x = self.push_operand(ty)?;
-            new_indices.push(x);
-        }
-        // Freshen locals before unifying
-        if kind == FrameKind::Loop {
-            self.freshen_locals();
-            self.constraints = self.unify_block_type(&new_indices, ty, true)?;
-        }
+        // Resolve post condition against inital state, leaving post state unchanged
+        let post = self.get_posts_from_block_type(ty)?;
+        let preliminary_post =
+            Resolver::preliminary_resolve_after_block(&consumed, &self.locals, post, self.offset)?;
 
         let br_cond = if kind == FrameKind::Loop {
-            Some(unified)
+            self.freshen_locals();
+            let mut new_indices = Vec::new();
+            for ty in self.params(ty)? {
+                let x = self.push_operand(ty)?;
+                new_indices.push(x);
+            }
+            self.constraints = Resolver::resolve_before_block(
+                &new_indices,
+                &self.locals,
+                pre.clone(),
+                self.offset,
+            )?;
+            Some(pre)
         } else {
+            for (idx, ty) in self.params(ty)?.enumerate() {
+                let old_idx = consumed[idx];
+                // Hack: reuse old indices for variables unless it's a loop
+                self.operands.push((Some(ty), old_idx));
+            }
+
             None
         };
 
-        // Resolve posts, do not unify
+        // Resolve posts
         self.control.push(Frame {
             kind,
             block_type: ty,
@@ -602,7 +924,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             unreachable: false,
             constraints,
             br_cond,
-            post,
+            post: preliminary_post,
         });
 
         Ok(())
@@ -631,13 +953,15 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             results.push(idx);
         }
 
-        // Just unify and check
-        let condition = self.unify_constraints(&results, cond, false, false)?;
+        // Just resolve and check
+        let resolved_condition =
+            Resolver::resolve_after_block(&results, &self.locals, cond, self.offset)?;
 
-        if !self.check_condition_is_satisfied(&condition) {
+        if !self.check_condition_is_satisfied(&resolved_condition) {
             bail!(
                 self.offset,
-                "constraints do not satisfy block post-condition"
+                "constraints do not satisfy block post-condition (block type: {:?})",
+                ty
             )
         }
 
@@ -702,17 +1026,14 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(mem) => {
                 let (_, index) = self.pop_operand(Some(mem.index_type()))?;
                 let initial_size = (mem.initial * 65536) as i32;
-                let offset = (memarg.offset + size/8) as i32;
+                let offset = (memarg.offset + size / 8) as i32;
                 // Todo: should add memory access to index language since i33 technically
                 let cond = constraint!(= (i32 1) (i32.lt_u (i32.add (i32 offset) index) (i32 initial_size)));
                 if !self.check_condition_is_satisfied(&vec![cond]) {
-                    bail!(
-                        self.offset,
-                        "memory access pre-condition not satisfied"
-                    )
+                    bail!(self.offset, "memory access pre-condition not satisfied")
                 }
                 return Ok(mem.index_type());
-            },
+            }
             None => bail!(self.offset, "unknown memory {}", memarg.memory),
         }
     }
@@ -740,7 +1061,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         }
         Ok(())
     }
-
+    /*
     /// Unifies an index_term
     fn resolve_old_locals_index_term(&self, it: &mut IndexTerm, is_pre: bool) -> Result<()> {
         match it {
@@ -808,118 +1129,31 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         }
 
         Ok(new_constraints)
-    }
+    }*/
 
-     /// Unifies an index_term
-     fn unify_index_term(&self, consumed: &Vec<u32>, it: &mut IndexTerm, is_pre: bool, is_call: bool) -> Result<()> {
-        let idx = match it {
-            IndexTerm::IBinOp(_, x, y)
-            | IndexTerm::IRelOp(_, x, y) => {
-                self.unify_index_term(consumed, &mut *x, is_pre, is_call)?;
-                self.unify_index_term(consumed, &mut *y, is_pre, is_call)?;
-                None
-            },
-            IndexTerm::ITestOp(_, x)
-            | IndexTerm::IUnOp(_, x) => {
-                self.unify_index_term(consumed, &mut *x, is_pre, is_call)?;
-                None
-            },
-            IndexTerm::Pre(idx) => {
-                if !is_pre {
-                    None
-                } else {
-                    Some(*idx as usize)
-                }
-            },
-            IndexTerm::Post(idx) => {
-                if is_pre {
-                    None
-                } else {
-                    Some(*idx as usize)
-                }
-            },
-            IndexTerm::Local(idx) => {
-                if is_call {
-                    Some(*idx as usize)
-                } else {
-                    let (_, alpha) = self.local(*idx)?;
-                    *it = IndexTerm::Alpha(alpha);
-                    return Ok(());
-                }
-            },
-            _ => None
-        };
-
-        if let Some(x) = idx.and_then(|x| consumed.get(x)) {
-            *it = IndexTerm::Alpha(*x);
-        } else if idx.is_some() {
-            bail!(self.offset, "illegal index variable reference: unknown offset");
-        }
-
-        Ok(())
-    }
-
-    /// Unifies a constraint
-    fn unify_constraint(
-        &self,
-        consumed: &Vec<u32>,
-        c: &mut Constraint,
-        is_pre: bool,
-        is_call: bool
-    ) -> Result<()> {
-        match c {
-            Constraint::Eq(x, y) => {
-                self.unify_index_term(consumed, x, is_pre, is_call)?;
-                self.unify_index_term(consumed, y, is_pre, is_call)?;
-            },
-            Constraint::And(x, y)
-            | Constraint::Or(x, y) => {
-                self.unify_constraint(consumed, x, is_pre, is_call)?;
-                self.unify_constraint(consumed, y, is_pre, is_call)?;
-            },
-            Constraint::If(x, y, z) => {
-                self.unify_constraint(consumed, x, is_pre, is_call)?;
-                self.unify_constraint(consumed, y, is_pre, is_call)?;
-                self.unify_constraint(consumed, z, is_pre, is_call)?;
-            },
-            Constraint::Not(x) => {
-                self.unify_constraint(consumed, x, is_pre, is_call)?;
-            },
-        }
-
-        Ok(())
-    }
-
-    /// Unifies the constraints from a block_type
-    fn unify_constraints(&self, consumed: &Vec<u32>, constraints: Vec<Constraint>, is_pre: bool, is_call: bool) -> Result<Vec<Constraint>> {
-        let mut new_constraints = Vec::new();
-
-        for c in constraints.iter() {
-            let mut copy = c.clone();
-            self.unify_constraint(consumed, &mut copy, is_pre, is_call)?;
-            new_constraints.push(copy);
-        }
-
-        Ok(new_constraints)
-    }
-
-    /// Unifies a block type against the stack and local environment
-    fn unify_block_type(&self, consumed: &Vec<u32>, ty: BlockType, pre: bool) -> Result<Vec<Constraint>> {
+    /// Gets the pre conditions from a block type
+    fn get_pres_from_block_type(&self, ty: BlockType) -> Result<Vec<Constraint>> {
         match ty {
             BlockType::FuncType(idx) => {
                 let ft = self.func_type_at(idx)?;
 
-                let constraints = if pre {
-                    ft.pre_conditions()
-                } else {
-                    ft.post_conditions()
-                };
+                let vec: Vec<Constraint> = ft.pre_conditions().to_vec().clone();
 
-                let new_constraints = constraints.iter().map(|x| x.clone()).collect();
+                Ok(vec)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
 
-                let unified = self.unify_constraints(consumed, new_constraints, true, false)?;
+    /// Gets the post conditions from a block type
+    fn get_posts_from_block_type(&self, ty: BlockType) -> Result<Vec<Constraint>> {
+        match ty {
+            BlockType::FuncType(idx) => {
+                let ft = self.func_type_at(idx)?;
 
-                Ok(unified)
+                let vec: Vec<Constraint> = ft.post_conditions().to_vec().clone();
+
+                Ok(vec)
             }
             _ => Ok(Vec::new()),
         }
@@ -983,15 +1217,18 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             outputs.push(self.push_operand(ty)?);
         }
 
-        let pre = self.unify_constraints(&inputs, ty.pre_conditions().into(), true, true)?;
-        let post = self.unify_constraints(&inputs, ty.post_conditions().into(), true, true)?;
-        let mut post = self.unify_constraints(&outputs, post, false, true)?;
+        // Pres and locals (representing pres in calls) in both pre and post condition are resolved against inputs
+        let (pre, mut post) = Resolver::resolve_call(
+            &inputs,
+            &outputs,
+            &self.locals,
+            ty.pre_conditions().to_vec(),
+            ty.post_conditions().to_vec(),
+            self.offset,
+        )?;
 
         if !self.check_condition_is_satisfied(&pre) {
-            bail!(
-                self.offset,
-                "call - function pre-condition not satisfied"
-            )
+            bail!(self.offset, "call - function pre-condition not satisfied")
         }
         self.constraints.append(&mut post);
 
@@ -1037,13 +1274,14 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             returns.push(idx);
         }
 
-        let unified = self.unify_constraints(
+        let condition = Resolver::resolve_after_block(
             &returns,
+            &self.locals,
             self.control[0].post.clone(),
-            false,
-            false
+            self.offset,
         )?;
-        if !self.check_condition_is_satisfied(&unified) {
+
+        if !self.check_condition_is_satisfied(&condition) {
             bail!(
                 self.offset,
                 "return - function post condition not satisfied"
@@ -1415,7 +1653,7 @@ where
             pres.push(idx);
         }
         self.push_ctrl(FrameKind::Block, ty, pres)?;
-        
+
         Ok(())
     }
     fn visit_loop(&mut self, ty: BlockType) -> Self::Output {
@@ -1483,14 +1721,11 @@ where
         }
 
         let mut constraints = frame.constraints.clone();
-        // I don't think an If is possible at this point, but maybe it is so better to be safe
-        if frame.kind == FrameKind::If || frame.kind == FrameKind::Else || frame.kind == FrameKind::Block {
-            self.freshen_locals();
-        }
-        let mut new_constraints = self.unify_constraints(&new_indices, frame.post, false, false)?;
-
-        new_constraints.append(&mut constraints);
-        self.constraints = new_constraints;
+        self.freshen_locals();
+        let mut resolved_constraints =
+            Resolver::resolve_after_block(&new_indices, &self.locals, frame.post, self.offset)?;
+        constraints.append(&mut resolved_constraints);
+        self.constraints = constraints;
 
         if self.control.is_empty() && self.end_which_emptied_control.is_none() {
             assert_ne!(self.offset, 0);
@@ -1505,13 +1740,10 @@ where
             let (_, idx) = self.pop_operand(Some(ty))?;
             args.push(idx);
         }
-        // Unify with br_cond and check
-        let unified = self.unify_constraints(&args, post, false, false)?;
-        if !self.check_condition_is_satisfied(&unified) {
-            bail!(
-                self.offset,
-                "br - branching condition not met"
-            )
+
+        let condition = Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?;
+        if !self.check_condition_is_satisfied(&condition) {
+            bail!(self.offset, "br - branching condition not met")
         }
         self.unreachable()?;
         Ok(())
@@ -1527,13 +1759,10 @@ where
             args.push(idx);
         }
 
-        let unified = self.unify_constraints(&args, post, false, false)?;
+        let condition = Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?;
         self.constraints.push(constraint!(not (= cond (i32 0))));
-        if !self.check_condition_is_satisfied(&unified) {
-            bail!(
-                self.offset,
-                "br_if - branching condition not met"
-            )
+        if !self.check_condition_is_satisfied(&condition) {
+            bail!(self.offset, "br_if - branching condition not met")
         }
         self.constraints.pop();
 
@@ -1640,7 +1869,8 @@ where
             )
         }
         let x = self.push_operand(ty1.or(ty2))?;
-        self.constraints.push(constraint!(r#if (= a0 (i32 0)) (= x a1) (= x a2)));
+        self.constraints
+            .push(constraint!(r#if (= a0 (i32 0)) (= x a1) (= x a2)));
         Ok(())
     }
     fn visit_typed_select(&mut self, ty: ValType) -> Self::Output {
