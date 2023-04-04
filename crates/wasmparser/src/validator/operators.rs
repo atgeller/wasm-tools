@@ -104,11 +104,15 @@ pub struct Frame {
     /// Whether this frame is unreachable so far.
     pub unreachable: bool,
     /// The list of constraints with which we hit the control frame
-    pub constraints: Vec<Constraint>,
-    /// The label condition (for loops, when different from post condition)
-    pub br_cond: Option<Vec<Constraint>>,
-    /// The post-condition for exiting the control frame
-    pub post: Vec<Constraint>,
+    /// plus the added constraints from the post condition of the annotation.
+    /// Should have pres and old_locals resolved.
+    /// Unify with fresh stack variables and locals when visiting end to produce
+    /// resulting program state.
+    pub constraints_after_end: Vec<Constraint>,
+    /// The post-condition for exiting the control frame.
+    /// Should have pres and old_locals resolved.
+    /// Resolve posts and locals when branching/visiting end to check.
+    pub post_condition: Vec<Constraint>,
 }
 
 /// The kind of a control flow [`Frame`].
@@ -210,16 +214,6 @@ impl OperatorValidator {
         }
         .func_type_at(ty)?;
 
-        ret.control.push(Frame {
-            kind: FrameKind::Block,
-            block_type: BlockType::FuncType(ty),
-            height: 0,
-            unreachable: false,
-            constraints: Vec::new(),
-            br_cond: None,
-            post: functy.post_conditions().to_vec(),
-        });
-
         let params = functy.inputs();
         let mut consumed = Vec::new();
         for ty in params {
@@ -229,14 +223,25 @@ impl OperatorValidator {
             ret.locals.add_local(ty, index as u32);
         }
 
-        ret.constraints = Resolver::resolve_before_block(
+        let mut initial_state = Resolver::resolve_before_block(
             &consumed,
             &ret.locals,
             functy.pre_conditions().to_vec().clone(),
             offset,
         )?;
 
-        ret.constraints = unified;
+        ret.constraints.append(&mut initial_state);
+
+        let post_condition = Resolver::preliminary_resolve_after_block(&consumed, &ret.locals, functy.post_conditions().to_vec().clone(), offset)?;
+
+        ret.control.push(Frame {
+            kind: FrameKind::Block,
+            block_type: BlockType::FuncType(ty),
+            height: 0,
+            unreachable: false,
+            constraints_after_end: Vec::new(),
+            post_condition,
+        });
 
         Ok(ret)
     }
@@ -255,9 +260,8 @@ impl OperatorValidator {
             block_type: BlockType::Type(ty),
             height: 0,
             unreachable: false,
-            constraints: Vec::new(),
-            br_cond: None,
-            post: Vec::new(),
+            constraints_after_end: Vec::new(),
+            post_condition: Vec::new(),
         });
         ret
     }
@@ -873,12 +877,11 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // operand stack.
         let height = self.operands.len();
 
-        // This is what we want to check against
+        // Perform check against annotation precondition with current state
         let pre = self.get_pres_from_block_type(ty)?;
         let condition =
             Resolver::resolve_before_block(&consumed, &self.locals, pre.clone(), self.offset)?;
 
-        let constraints = self.constraints.clone();
         if !self.check_condition_is_satisfied(&condition) {
             bail!(
                 self.offset,
@@ -887,25 +890,32 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             )
         }
 
-        // Resolve post condition against inital state, leaving post state unchanged
+        // Resolve post condition against inital state for resulting state
+        // which is stored in the frame
         let post = self.get_posts_from_block_type(ty)?;
-        let preliminary_post =
-            Resolver::preliminary_resolve_after_block(&consumed, &self.locals, post, self.offset)?;
+        let mut preliminary_post =
+            Resolver::preliminary_resolve_after_block(&consumed, &self.locals, post.clone(), self.offset)?;
+        let mut constraints_after_end = self.constraints.clone();
+        constraints_after_end.append(&mut preliminary_post);
 
-        let br_cond = if kind == FrameKind::Loop {
+        // Compute initial state (freshening on loops) and determine
+        // post-condition based on initial state
+        let post_condition = if kind == FrameKind::Loop {
             self.freshen_locals();
             let mut new_indices = Vec::new();
             for ty in self.params(ty)? {
                 let x = self.push_operand(ty)?;
                 new_indices.push(x);
             }
+            // For loop, freshen locals and stack variables, overwrite constraints
             self.constraints = Resolver::resolve_before_block(
                 &new_indices,
                 &self.locals,
                 pre.clone(),
                 self.offset,
             )?;
-            Some(pre)
+
+            Resolver::preliminary_resolve_after_block(&new_indices, &self.locals, post, self.offset)?
         } else {
             for (idx, ty) in self.params(ty)?.enumerate() {
                 let old_idx = consumed[idx];
@@ -913,7 +923,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 self.operands.push((Some(ty), old_idx));
             }
 
-            None
+            Resolver::preliminary_resolve_after_block(&consumed, &self.locals, post, self.offset)?
         };
 
         // Resolve posts
@@ -922,9 +932,8 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             block_type: ty,
             height,
             unreachable: false,
-            constraints,
-            br_cond,
-            post: preliminary_post,
+            constraints_after_end,
+            post_condition,
         });
 
         Ok(())
@@ -943,7 +952,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         };
         let ty = frame.block_type;
         let height = frame.height;
-        let cond = frame.post.clone();
+        let cond = frame.post_condition.clone();
 
         // Pop all the result types, in reverse order, from the operand stack.
         // These types will, possibly, be transferred to the next frame.
@@ -953,7 +962,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             results.push(idx);
         }
 
-        // Just resolve and check
+        // Check against post-condition
         let resolved_condition =
             Resolver::resolve_after_block(&results, &self.locals, cond, self.offset)?;
 
@@ -989,8 +998,11 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         match (self.control.len() - 1).checked_sub(depth as usize) {
             Some(i) => {
                 let frame = &self.control[i];
-                // br_cond will only be Some(...) if the frame is a loop
-                let cond = frame.br_cond.clone().unwrap_or(frame.post.clone());
+                let cond = if frame.kind == FrameKind::Loop {
+                    self.get_pres_from_block_type(frame.block_type)?
+                } else {
+                    frame.post_condition.clone()
+                };
                 Ok((frame.block_type, frame.kind, cond))
             }
             None => bail!(self.offset, "unknown label: branch depth too large"),
@@ -1061,75 +1073,6 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         }
         Ok(())
     }
-    /*
-    /// Unifies an index_term
-    fn resolve_old_locals_index_term(&self, it: &mut IndexTerm, is_pre: bool) -> Result<()> {
-        match it {
-            IndexTerm::IBinOp(_, x, y)
-            | IndexTerm::IRelOp(_, x, y) => {
-                self.resolve_old_locals_index_term(&mut *x, is_pre)?;
-                self.resolve_old_locals_index_term(&mut *y, is_pre)?;
-            },
-            IndexTerm::ITestOp(_, x)
-            | IndexTerm::IUnOp(_, x) => {
-                self.resolve_old_locals_index_term(&mut *x, is_pre)?;
-            },
-            IndexTerm::OldLocal(idx) => {
-                if is_pre {
-                    bail!(self.offset, "illegal index variable reference: cannot have old_local in pre_condition");
-                } else {
-                    let (_, alpha) = self.local(*idx)?;
-                    *it = IndexTerm::Alpha(alpha);
-                    return Ok(());
-                }
-            },
-            _ => {}
-        };
-
-        Ok(())
-    }
-
-    /// Unifies a constraint
-    fn resolve_old_locals_contraint(
-        &self,
-        c: &mut Constraint,
-        is_pre: bool,
-    ) -> Result<()> {
-        match c {
-            Constraint::Eq(x, y) => {
-                self.resolve_old_locals_index_term(x, is_pre)?;
-                self.resolve_old_locals_index_term(y, is_pre)?;
-            },
-            Constraint::And(x, y)
-            | Constraint::Or(x, y) => {
-                self.resolve_old_locals_contraint(x, is_pre)?;
-                self.resolve_old_locals_contraint(y, is_pre)?;
-            },
-            Constraint::If(x, y, z) => {
-                self.resolve_old_locals_contraint(x, is_pre)?;
-                self.resolve_old_locals_contraint(y, is_pre)?;
-                self.resolve_old_locals_contraint(z, is_pre)?;
-            },
-            Constraint::Not(x) => {
-                self.resolve_old_locals_contraint(x, is_pre)?;
-            },
-        }
-
-        Ok(())
-    }
-
-    /// Unifies the constraints from a block_type
-    fn resolve_old_locals_constraints(&self, constraints: Vec<Constraint>, is_pre: bool) -> Result<Vec<Constraint>> {
-        let mut new_constraints = Vec::new();
-
-        for c in constraints.iter() {
-            let mut copy = c.clone();
-            self.resolve_old_locals_contraint(&mut copy, is_pre)?;
-            new_constraints.push(copy);
-        }
-
-        Ok(new_constraints)
-    }*/
 
     /// Gets the pre conditions from a block type
     fn get_pres_from_block_type(&self, ty: BlockType) -> Result<Vec<Constraint>> {
@@ -1274,10 +1217,11 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             returns.push(idx);
         }
 
+        // Resolve postcondition
         let condition = Resolver::resolve_after_block(
             &returns,
             &self.locals,
-            self.control[0].post.clone(),
+            self.control[0].post_condition.clone(),
             self.offset,
         )?;
 
@@ -1720,12 +1664,11 @@ where
             new_indices.push(self.push_operand(ty)?);
         }
 
-        let mut constraints = frame.constraints.clone();
+        let constraints = frame.constraints_after_end;
         self.freshen_locals();
-        let mut resolved_constraints =
-            Resolver::resolve_after_block(&new_indices, &self.locals, frame.post, self.offset)?;
-        constraints.append(&mut resolved_constraints);
-        self.constraints = constraints;
+        let resolved_constraints =
+            Resolver::resolve_after_block(&new_indices, &self.locals, constraints, self.offset)?;
+        self.constraints = resolved_constraints;
 
         if self.control.is_empty() && self.end_which_emptied_control.is_none() {
             assert_ne!(self.offset, 0);
@@ -1741,7 +1684,11 @@ where
             args.push(idx);
         }
 
-        let condition = Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?;
+        let condition = if kind == FrameKind::Loop {
+            Resolver::resolve_before_block(&args, &self.locals, post, self.offset)?
+        } else {
+            Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?
+        };
         if !self.check_condition_is_satisfied(&condition) {
             bail!(self.offset, "br - branching condition not met")
         }
@@ -1759,7 +1706,11 @@ where
             args.push(idx);
         }
 
-        let condition = Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?;
+        let condition = if kind == FrameKind::Loop {
+            Resolver::resolve_before_block(&args, &self.locals, post, self.offset)?
+        } else {
+            Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?
+        };
         self.constraints.push(constraint!(not (= cond (i32 0))));
         if !self.check_condition_is_satisfied(&condition) {
             bail!(self.offset, "br_if - branching condition not met")
@@ -1768,8 +1719,10 @@ where
 
         self.constraints.push(constraint!(= cond (i32 0)));
 
-        for ty in types {
-            self.push_operand(ty)?;
+        for (idx, ty) in types.clone().rev().enumerate() {
+            let old_idx = args[idx];
+            // Reuse old indices for variables to avoid accidental freshening
+            self.operands.push((Some(ty), old_idx));
         }
 
         Ok(())
@@ -3825,6 +3778,7 @@ impl Locals {
             return false;
         }
         self.first.push((ty, alpha));
+        self.num_locals = self.num_locals + 1;
         true
     }
 
