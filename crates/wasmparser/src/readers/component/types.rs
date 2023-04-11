@@ -1,7 +1,7 @@
 use crate::limits::*;
 use crate::{
-    BinaryReader, ComponentAlias, ComponentImport, ComponentTypeRef, FromReader, Import, IndexedFuncType,
-    Result, SectionLimited, Type, TypeRef,
+    BinaryReader, ComponentAlias, ComponentImport, ComponentTypeRef, FromReader, Import,
+    IndexedFuncType, Result, SectionLimited, Type, TypeRef,
 };
 
 /// Represents the kind of an outer core alias in a WebAssembly component.

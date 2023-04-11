@@ -561,12 +561,8 @@ impl<'a> FromReader<'a> for IndexTerm {
         let byte = reader.peek()?;
         reader.position += 1;
         let index_term = match byte {
-            0x41 => {
-                IndexTerm::IConstant(Constant::I32Const(reader.read_var_i32()?))
-            }
-            0x42 => {
-                IndexTerm::IConstant(Constant::I64Const(reader.read_var_i64()?))
-            }
+            0x41 => IndexTerm::IConstant(Constant::I32Const(reader.read_var_i32()?)),
+            0x42 => IndexTerm::IConstant(Constant::I64Const(reader.read_var_i64()?)),
             x @ 0x6a..=0x78 | x @ 0x7c..=0x8a => {
                 let binop = match x {
                     0x6a => BinOp::I32Add,

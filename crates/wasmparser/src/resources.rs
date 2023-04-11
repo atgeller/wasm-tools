@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-use crate::{GlobalType, IndexedFuncType, MemoryType, TableType, ValType, Constraint};
+use crate::{Constraint, GlobalType, IndexedFuncType, MemoryType, TableType, ValType};
 use std::ops::Range;
 
 /// Types that qualify as Wasm function types for validation purposes.

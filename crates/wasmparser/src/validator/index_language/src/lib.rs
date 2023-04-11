@@ -1,13 +1,13 @@
 #![feature(proc_macro_quote)]
 
 extern crate proc_macro;
-use proc_macro::{TokenStream};
-use proc_macro2::{Ident,Span,Punct,Spacing,Group,Delimiter};
+use proc_macro::TokenStream;
+use proc_macro2::{Delimiter, Group, Ident, Punct, Spacing, Span};
 use quote::{quote, ToTokens, TokenStreamExt};
 extern crate syn;
 use syn::parse::{Parse, ParseBuffer, ParseStream};
 use syn::token::{Dot, Paren};
-use syn::{parenthesized, parse_macro_input, Expr, Result, Token, ExprUnary, ExprBinary};
+use syn::{parenthesized, parse_macro_input, Expr, ExprBinary, ExprUnary, Result, Token};
 
 macro_rules! parenthesize {
     ($first:ident, Boxed: $rest:ident $(,$commas:ident)*) => {
@@ -130,7 +130,7 @@ impl Parse for BinOp {
     fn parse(input: ParseStream) -> Result<Self> {
         let lookahead = input.lookahead1();
         let is_i32 = if lookahead.peek(kw::i32) {
-			input.parse::<kw::i32>()?;
+            input.parse::<kw::i32>()?;
             true
         } else {
             input.parse::<kw::i64>()?;
@@ -140,105 +140,105 @@ impl Parse for BinOp {
         input.parse::<Dot>()?;
         let lookahead = input.lookahead1();
         let binop = if lookahead.peek(kw::add) {
-			input.parse::<kw::add>()?;
+            input.parse::<kw::add>()?;
             if is_i32 {
                 Self::I32Add
             } else {
                 Self::I64Add
             }
         } else if lookahead.peek(kw::sub) {
-			input.parse::<kw::sub>()?;
+            input.parse::<kw::sub>()?;
             if is_i32 {
                 Self::I32Sub
             } else {
                 Self::I64Sub
             }
         } else if lookahead.peek(kw::mul) {
-			input.parse::<kw::mul>()?;
+            input.parse::<kw::mul>()?;
             if is_i32 {
                 Self::I32Mul
             } else {
                 Self::I64Mul
             }
         } else if lookahead.peek(kw::div_s) {
-			input.parse::<kw::div_s>()?;
+            input.parse::<kw::div_s>()?;
             if is_i32 {
                 Self::I32DivS
             } else {
                 Self::I64DivS
             }
         } else if lookahead.peek(kw::div_u) {
-			input.parse::<kw::div_u>()?;
+            input.parse::<kw::div_u>()?;
             if is_i32 {
                 Self::I32DivU
             } else {
                 Self::I64DivU
             }
         } else if lookahead.peek(kw::rem_s) {
-			input.parse::<kw::rem_s>()?;
+            input.parse::<kw::rem_s>()?;
             if is_i32 {
                 Self::I32RemS
             } else {
                 Self::I64RemS
             }
         } else if lookahead.peek(kw::rem_u) {
-			input.parse::<kw::rem_u>()?;
+            input.parse::<kw::rem_u>()?;
             if is_i32 {
                 Self::I32RemU
             } else {
                 Self::I64RemU
             }
         } else if lookahead.peek(kw::and) {
-			input.parse::<kw::and>()?;
+            input.parse::<kw::and>()?;
             if is_i32 {
                 Self::I32And
             } else {
                 Self::I64And
             }
         } else if lookahead.peek(kw::or) {
-			input.parse::<kw::or>()?;
+            input.parse::<kw::or>()?;
             if is_i32 {
                 Self::I32Or
             } else {
                 Self::I64Or
             }
         } else if lookahead.peek(kw::xor) {
-			input.parse::<kw::xor>()?;
+            input.parse::<kw::xor>()?;
             if is_i32 {
                 Self::I32Xor
             } else {
                 Self::I64Xor
             }
         } else if lookahead.peek(kw::shl) {
-			input.parse::<kw::shl>()?;
+            input.parse::<kw::shl>()?;
             if is_i32 {
                 Self::I32Shl
             } else {
                 Self::I64Shl
             }
         } else if lookahead.peek(kw::shr_s) {
-			input.parse::<kw::shr_s>()?;
+            input.parse::<kw::shr_s>()?;
             if is_i32 {
                 Self::I32ShrS
             } else {
                 Self::I64ShrS
             }
         } else if lookahead.peek(kw::shr_u) {
-			input.parse::<kw::shr_u>()?;
+            input.parse::<kw::shr_u>()?;
             if is_i32 {
                 Self::I32ShrU
             } else {
                 Self::I64ShrU
             }
         } else if lookahead.peek(kw::rotl) {
-			input.parse::<kw::rotl>()?;
+            input.parse::<kw::rotl>()?;
             if is_i32 {
                 Self::I32Rotl
             } else {
                 Self::I64Rotl
             }
         } else if lookahead.peek(kw::rotr) {
-			input.parse::<kw::rotr>()?;
+            input.parse::<kw::rotr>()?;
             if is_i32 {
                 Self::I32Rotr
             } else {
@@ -322,7 +322,7 @@ impl Parse for RelOp {
     fn parse(input: ParseStream) -> Result<Self> {
         let lookahead = input.lookahead1();
         let is_i32 = if lookahead.peek(kw::i32) {
-			input.parse::<kw::i32>()?;
+            input.parse::<kw::i32>()?;
             true
         } else {
             input.parse::<kw::i64>()?;
@@ -332,70 +332,70 @@ impl Parse for RelOp {
         input.parse::<Dot>()?;
         let lookahead = input.lookahead1();
         let relop = if lookahead.peek(kw::eq) {
-			input.parse::<kw::eq>()?;
+            input.parse::<kw::eq>()?;
             if is_i32 {
                 Self::I32Eq
             } else {
                 Self::I64Eq
             }
         } else if lookahead.peek(kw::ne) {
-			input.parse::<kw::ne>()?;
+            input.parse::<kw::ne>()?;
             if is_i32 {
                 Self::I32Ne
             } else {
                 Self::I64Ne
             }
         } else if lookahead.peek(kw::lt_s) {
-			input.parse::<kw::lt_s>()?;
+            input.parse::<kw::lt_s>()?;
             if is_i32 {
                 Self::I32LtS
             } else {
                 Self::I64LtS
             }
         } else if lookahead.peek(kw::lt_u) {
-			input.parse::<kw::lt_u>()?;
+            input.parse::<kw::lt_u>()?;
             if is_i32 {
                 Self::I32LtU
             } else {
                 Self::I64LtU
             }
         } else if lookahead.peek(kw::gt_s) {
-			input.parse::<kw::gt_s>()?;
+            input.parse::<kw::gt_s>()?;
             if is_i32 {
                 Self::I32GtS
             } else {
                 Self::I64GtS
             }
         } else if lookahead.peek(kw::gt_u) {
-			input.parse::<kw::gt_u>()?;
+            input.parse::<kw::gt_u>()?;
             if is_i32 {
                 Self::I32GtU
             } else {
                 Self::I64GtU
             }
         } else if lookahead.peek(kw::le_s) {
-			input.parse::<kw::le_s>()?;
+            input.parse::<kw::le_s>()?;
             if is_i32 {
                 Self::I32LeS
             } else {
                 Self::I64LeS
             }
         } else if lookahead.peek(kw::le_u) {
-			input.parse::<kw::le_u>()?;
+            input.parse::<kw::le_u>()?;
             if is_i32 {
                 Self::I32LeU
             } else {
                 Self::I64LeU
             }
         } else if lookahead.peek(kw::ge_s) {
-			input.parse::<kw::ge_s>()?;
+            input.parse::<kw::ge_s>()?;
             if is_i32 {
                 Self::I32GeS
             } else {
                 Self::I64GeS
             }
         } else if lookahead.peek(kw::ge_u) {
-			input.parse::<kw::ge_u>()?;
+            input.parse::<kw::ge_u>()?;
             if is_i32 {
                 Self::I32GeU
             } else {
@@ -455,7 +455,7 @@ impl Parse for UnOp {
     fn parse(input: ParseStream) -> Result<Self> {
         let lookahead = input.lookahead1();
         let is_i32 = if lookahead.peek(kw::i32) {
-			input.parse::<kw::i32>()?;
+            input.parse::<kw::i32>()?;
             true
         } else {
             input.parse::<kw::i64>()?;
@@ -465,21 +465,21 @@ impl Parse for UnOp {
         input.parse::<Dot>()?;
         let lookahead = input.lookahead1();
         let unop = if lookahead.peek(kw::clz) {
-			input.parse::<kw::clz>()?;
+            input.parse::<kw::clz>()?;
             if is_i32 {
                 Self::I32Clz
             } else {
                 Self::I64Clz
             }
         } else if lookahead.peek(kw::ctz) {
-			input.parse::<kw::ctz>()?;
+            input.parse::<kw::ctz>()?;
             if is_i32 {
                 Self::I32Ctz
             } else {
                 Self::I64Ctz
             }
         } else if lookahead.peek(kw::popcnt) {
-			input.parse::<kw::popcnt>()?;
+            input.parse::<kw::popcnt>()?;
             if is_i32 {
                 Self::I32Popcnt
             } else {
@@ -521,7 +521,7 @@ impl Parse for TestOp {
     fn parse(input: ParseStream) -> Result<Self> {
         let lookahead = input.lookahead1();
         let is_i32 = if lookahead.peek(kw::i32) {
-			input.parse::<kw::i32>()?;
+            input.parse::<kw::i32>()?;
             true
         } else {
             input.parse::<kw::i64>()?;
@@ -531,7 +531,7 @@ impl Parse for TestOp {
         input.parse::<Dot>()?;
         let lookahead = input.lookahead1();
         let testop = if lookahead.peek(kw::eqz) {
-			input.parse::<kw::eqz>()?;
+            input.parse::<kw::eqz>()?;
             if is_i32 {
                 Self::I32Eqz
             } else {
@@ -568,7 +568,7 @@ impl Parse for Constant {
     fn parse(input: ParseStream) -> Result<Self> {
         let lookahead = input.lookahead1();
         let is_i32 = if lookahead.peek(kw::i32) {
-			input.parse::<kw::i32>()?;
+            input.parse::<kw::i32>()?;
             true
         } else {
             input.parse::<kw::i64>()?;
@@ -607,7 +607,7 @@ impl ToTokens for Constant {
             Self::I32Const(constant) => {
                 tokens.append(Ident::new("I32Const", Span::call_site()));
                 constant
-            },
+            }
             Self::I64Const(constant) => {
                 tokens.append(Ident::new("I64Const", Span::call_site()));
                 constant
@@ -682,28 +682,28 @@ impl ToTokens for IndexTerm {
         let group = match self {
             IndexTerm::IBinOp(bop, x, y) => {
                 tokens.append(Ident::new("IBinOp", Span::call_site()));
-                parenthesize!(bop, Boxed: x,y)
-            },
+                parenthesize!(bop, Boxed: x, y)
+            }
             IndexTerm::IRelOp(rop, x, y) => {
                 tokens.append(Ident::new("IRelOp", Span::call_site()));
-                parenthesize!(rop, Boxed: x,y)
-            },
+                parenthesize!(rop, Boxed: x, y)
+            }
             IndexTerm::ITestOp(top, x) => {
                 tokens.append(Ident::new("ITestOp", Span::call_site()));
                 parenthesize!(top, Boxed: x)
-            },
+            }
             IndexTerm::IUnOp(uop, x) => {
                 tokens.append(Ident::new("IUnOp", Span::call_site()));
                 parenthesize!(uop, Boxed: x)
-            },
+            }
             IndexTerm::Alpha(expr) => {
                 tokens.append(Ident::new("Alpha", Span::call_site()));
                 parenthesize!(expr)
-            },
+            }
             IndexTerm::IConstant(c) => {
                 tokens.append(Ident::new("IConstant", Span::call_site()));
                 parenthesize!(c)
-            },
+            }
         };
         group.to_tokens(tokens);
     }
@@ -748,7 +748,7 @@ impl Parse for Constraint {
                 let x = content.parse::<Constraint>()?;
                 return Ok(Constraint::Not(Box::new(x)));
             }
-    
+
             Err(lookahead.error())
         }
 
@@ -756,7 +756,7 @@ impl Parse for Constraint {
         if lookahead.peek(Paren) {
             let content: ParseBuffer;
             parenthesized!(content in input);
-            return help(&content);   
+            return help(&content);
         } else {
             return help(&input);
         }
@@ -771,24 +771,24 @@ impl ToTokens for Constraint {
         let group = match self {
             Constraint::Eq(x, y) => {
                 tokens.append(Ident::new("Eq", Span::call_site()));
-                parenthesize!(x,y)
-            },
+                parenthesize!(x, y)
+            }
             Constraint::And(x, y) => {
                 tokens.append(Ident::new("And", Span::call_site()));
-                parenthesize!(Boxed: x,y)
-            },
+                parenthesize!(Boxed: x, y)
+            }
             Constraint::Or(x, y) => {
                 tokens.append(Ident::new("Or", Span::call_site()));
-                parenthesize!(Boxed: x,y)
-            },
+                parenthesize!(Boxed: x, y)
+            }
             Constraint::If(x, y, z) => {
                 tokens.append(Ident::new("If", Span::call_site()));
-                parenthesize!(Boxed: x,y,z)
-            },
+                parenthesize!(Boxed: x, y, z)
+            }
             Constraint::Not(x) => {
                 tokens.append(Ident::new("Not", Span::call_site()));
                 parenthesize!(Boxed: x)
-            },
+            }
         };
 
         group.to_tokens(tokens);

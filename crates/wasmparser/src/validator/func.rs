@@ -188,7 +188,7 @@ impl<T: WasmModuleResources> FuncValidator<T> {
 
     /// Returns the type of the local variable at the given `index` if any.
     pub fn get_local_type(&self, index: u32) -> Option<ValType> {
-        self.validator.locals.get(index).map(|(ty,_)| ty)
+        self.validator.locals.get(index).map(|(ty, _)| ty)
     }
 
     /// Get the current height of the operand stack.

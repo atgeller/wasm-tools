@@ -1,14 +1,15 @@
 //use index_language::constraint;
 
-use crate::{
-    BinOp, Constant, Constraint, IndexTerm, RelOp, UnOp, TestOp, ValType,
-};
-use z3::{Config, Context, ast, SatResult};
-use z3::ast::{Bool, BV, Ast};
-
+use crate::{BinOp, Constant, Constraint, IndexTerm, RelOp, TestOp, UnOp, ValType};
+use z3::ast::{Ast, Bool, BV};
+use z3::{ast, Config, Context, SatResult};
 
 pub trait ConstraintSolver {
-    fn satisfies(gamma: &Vec<Option<ValType>>, phi1: &Vec<Constraint>, phi2: &Vec<Constraint>) -> bool;
+    fn satisfies(
+        gamma: &Vec<Option<ValType>>,
+        phi1: &Vec<Constraint>,
+        phi2: &Vec<Constraint>,
+    ) -> bool;
 }
 
 pub struct Z3<'a> {
@@ -91,13 +92,11 @@ impl<'a> Z3<'a> {
         let i32_true = BV::from_i64(self.ctx, 1, 32);
         let i32_false = BV::from_i64(self.ctx, 0, 32);
         match testop {
-            TestOp::I32Eqz => {
-                bv1._eq(&i32_false).ite(&i32_true, &i32_false)
-            },
+            TestOp::I32Eqz => bv1._eq(&i32_false).ite(&i32_true, &i32_false),
             TestOp::I64Eqz => {
                 let i64_false = BV::from_i64(self.ctx, 0, 64);
                 bv1._eq(&i64_false).ite(&i32_true, &i32_false)
-            },
+            }
         }
     }
 
@@ -132,15 +131,11 @@ impl<'a> Z3<'a> {
                 let bv1 = self.process_index_term(&*x);
                 self.process_unop(unop, bv1)
             }
-            IndexTerm::Alpha(idx) => {
-                self.vars[*idx as usize].clone()
-            }
-            IndexTerm::IConstant(c) => {
-                match c {
-                    Constant::I32Const(val) => BV::from_i64(&self.ctx, (*val).into(), 32),
-                    Constant::I64Const(val) => BV::from_i64(&self.ctx, *val, 64),
-                }
-            }
+            IndexTerm::Alpha(idx) => self.vars[*idx as usize].clone(),
+            IndexTerm::IConstant(c) => match c {
+                Constant::I32Const(val) => BV::from_i64(&self.ctx, (*val).into(), 32),
+                Constant::I64Const(val) => BV::from_i64(&self.ctx, *val, 64),
+            },
             _ => panic!("Unresolved variable in index term!"),
         }
     }
@@ -151,40 +146,46 @@ impl<'a> Z3<'a> {
                 let bv1 = self.process_index_term(x);
                 let bv2 = self.process_index_term(y);
                 bv1._eq(&bv2)
-            },
-            Constraint::And(x, y) => {
-                Bool::and(&self.ctx, &[&self.process_constraint(&*x), &self.process_constraint(&*y)])
-            },
-            Constraint::Or(x, y) => {
-                Bool::or(&self.ctx, &[&self.process_constraint(&*x), &self.process_constraint(&*y)])
-            },
-            Constraint::Not(x) => {
-                self.process_constraint(&*x).not()
-            },
-            Constraint::If(x, y, z) => {
-                self.process_constraint(&*x).ite(&self.process_constraint(&*y), &self.process_constraint(&*z))
-            },
+            }
+            Constraint::And(x, y) => Bool::and(
+                &self.ctx,
+                &[&self.process_constraint(&*x), &self.process_constraint(&*y)],
+            ),
+            Constraint::Or(x, y) => Bool::or(
+                &self.ctx,
+                &[&self.process_constraint(&*x), &self.process_constraint(&*y)],
+            ),
+            Constraint::Not(x) => self.process_constraint(&*x).not(),
+            Constraint::If(x, y, z) => self
+                .process_constraint(&*x)
+                .ite(&self.process_constraint(&*y), &self.process_constraint(&*z)),
         }
     }
 }
 
 impl ConstraintSolver for Z3<'static> {
-    fn satisfies(gamma: &Vec<Option<ValType>>, phi1: &Vec<Constraint>, phi2: &Vec<Constraint>) -> bool {
+    fn satisfies(
+        gamma: &Vec<Option<ValType>>,
+        phi1: &Vec<Constraint>,
+        phi2: &Vec<Constraint>,
+    ) -> bool {
         let cfg = Config::new();
         let ctx = Context::new(&cfg);
         let solver = z3::Solver::new(&ctx);
-        let vars = gamma.iter()
+        let vars = gamma
+            .iter()
             .enumerate()
-            .filter_map(|(idx,opty)| {
+            .filter_map(|(idx, opty)| {
                 opty.map(|ty| {
                     let size = match ty {
                         ValType::I32 => 32,
                         ValType::I64 => 64,
                         _ => 1, // No harm, no foul, right?
                     };
-                    ast::BV::new_const(&ctx, format!("alpha_{:?}", idx),size)
+                    ast::BV::new_const(&ctx, format!("alpha_{:?}", idx), size)
                 })
-            }).collect();
+            })
+            .collect();
         let instance = Z3 { ctx: &ctx, vars };
         for c in phi1 {
             solver.assert(&instance.process_constraint(c));
@@ -197,10 +198,15 @@ impl ConstraintSolver for Z3<'static> {
         let binding = rhs.iter().map(|x| x).collect::<Vec<&Bool>>();
         solver.assert(&Bool::and(&ctx, binding.as_slice()).not());
 
+        //println!("Solver: {:?}", solver);
+
         let result = solver.check();
         match result {
             SatResult::Unsat => true,
-            _ => { println!("Solver: {:?}\n\nModel: {:?}", solver, solver.get_model()); false},
+            _ => {
+                println!("Solver: {:?}\n\nModel: {:?}", solver, solver.get_model());
+                false
+            }
         }
     }
 }
