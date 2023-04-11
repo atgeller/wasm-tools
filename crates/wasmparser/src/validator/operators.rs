@@ -1156,6 +1156,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             let (_, idx) = self.pop_operand(Some(ty))?;
             inputs.push(idx);
         }
+        inputs.reverse();
         for ty in ty.outputs() {
             outputs.push(self.push_operand(ty)?);
         }
