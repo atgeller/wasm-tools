@@ -15,7 +15,7 @@ exclude = ["benches/*.wasm"]
 [dependencies]
 indexmap = { workspace = true }
 index_language = { path = "./src/validator/index_language" }
-z3 = { git="https://github.com/Trolldemorted/z3.rs/", rev="2d8ed61411f6d0672c7987a7ceafbd0e68db5ed9", features = ["dynamic-link-z3"] }
+z3 = { git="https://github.com/Trolldemorted/z3.rs/", branch="buildfix3", features = ["dynamic-link-z3"] }
 url = "2.3.1"
 
 [dev-dependencies]
