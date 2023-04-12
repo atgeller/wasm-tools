@@ -1686,7 +1686,12 @@ where
         // missing an `else` block which have the same parameter/return
         // types on the block (since that's valid).
         if frame.kind == FrameKind::If {
-            self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new())?;
+            // TODO: abstract into a helper along with visit_else
+            let (constraints, locals, cond) = frame.else_setup.unwrap();
+            self.constraints = constraints;
+            self.locals = locals;
+            self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new(), Some(cond))?;
+            self.constraints.push(constraint!(= cond (i32 0)));
             frame = self.pop_ctrl()?;
         }
         let mut new_indices = Vec::new();
