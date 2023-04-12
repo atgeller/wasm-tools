@@ -64,7 +64,8 @@ pub(crate) struct OperatorValidator {
 // it if you so like.
 const _MAX_LOCALS_TO_TRACK: usize = 50;
 
-pub(super) struct Locals {
+#[derive(Debug, Clone)]
+pub struct Locals {
     // Total number of locals in the function.
     num_locals: u32,
 
@@ -113,6 +114,9 @@ pub struct Frame {
     /// Should have pres and old_locals resolved.
     /// Resolve posts and locals when branching/visiting end to check.
     pub post_condition: Vec<Constraint>,
+    /// If the frame is an if, we need to remember the state so we can
+    /// reconstruct it for the if
+    pub else_setup: Option<(Vec<Constraint>, Locals, u32)>,
 }
 
 /// The kind of a control flow [`Frame`].
@@ -241,6 +245,7 @@ impl OperatorValidator {
             unreachable: false,
             constraints_after_end: Vec::new(),
             post_condition,
+            else_setup: None,
         });
 
         Ok(ret)
@@ -262,6 +267,7 @@ impl OperatorValidator {
             unreachable: false,
             constraints_after_end: Vec::new(),
             post_condition: Vec::new(),
+            else_setup: None,
         });
         ret
     }
@@ -872,7 +878,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// or block itself. The `kind` of block is specified which indicates how
     /// breaks interact with this block's type. Additionally the type signature
     /// of the block is specified by `ty`.
-    fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType, consumed: Vec<u32>) -> Result<()> {
+    fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType, consumed: Vec<u32>, cond: Option<u32>) -> Result<()> {
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
         let height = self.operands.len();
@@ -885,8 +891,9 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         if !self.check_condition_is_satisfied(&condition) {
             bail!(
                 self.offset,
-                "constraints do not satisfy block precondition! (block type: {:?})",
-                ty
+                "constraints do not satisfy block precondition! (block type: {:?}, frame kind: {:?})",
+                ty,
+                kind
             )
         }
 
@@ -927,14 +934,29 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         };
 
         // Resolve posts
-        self.control.push(Frame {
-            kind,
-            block_type: ty,
-            height,
-            unreachable: false,
-            constraints_after_end,
-            post_condition,
-        });
+        if kind == FrameKind::If {
+            let constraints = self.constraints.clone();
+            let locals = self.locals.clone();
+            self.control.push(Frame {
+                kind,
+                block_type: ty,
+                height,
+                unreachable: false,
+                constraints_after_end: Vec::new(),
+                post_condition,
+                else_setup: Some((constraints, locals, cond.unwrap()))
+            });
+        } else {
+            self.control.push(Frame {
+                kind,
+                block_type: ty,
+                height,
+                unreachable: false,
+                constraints_after_end,
+                post_condition,
+                else_setup: None,
+            });
+        }
 
         Ok(())
     }
@@ -950,6 +972,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(f) => f,
             None => return Err(self.err_beyond_end(self.offset)),
         };
+        let kind = frame.kind.clone();
         let ty = frame.block_type;
         let height = frame.height;
         let cond = frame.post_condition.clone();
@@ -969,8 +992,9 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         if !self.check_condition_is_satisfied(&resolved_condition) {
             bail!(
                 self.offset,
-                "constraints do not satisfy block post-condition (block type: {:?})",
-                ty
+                "constraints do not satisfy block post-condition (block type: {:?}, frame kind: {:?})",
+                ty,
+                kind
             )
         }
 
@@ -1597,7 +1621,7 @@ where
             let (_, idx) = self.pop_operand(Some(ty))?;
             pres.push(idx);
         }
-        self.push_ctrl(FrameKind::Block, ty, pres)?;
+        self.push_ctrl(FrameKind::Block, ty, pres, None)?;
 
         Ok(())
     }
@@ -1608,7 +1632,7 @@ where
             let (_, idx) = self.pop_operand(Some(ty))?;
             pres.push(idx);
         }
-        self.push_ctrl(FrameKind::Loop, ty, pres)?;
+        self.push_ctrl(FrameKind::Loop, ty, pres, None)?;
         Ok(())
     }
     fn visit_if(&mut self, ty: BlockType) -> Self::Output {
@@ -1619,7 +1643,7 @@ where
             let (_, idx) = self.pop_operand(Some(ty))?;
             pres.push(idx);
         }
-        self.push_ctrl(FrameKind::If, ty, pres)?;
+        self.push_ctrl(FrameKind::If, ty, pres, Some(cond))?;
         self.constraints.push(constraint!(not (= cond (i32 0))));
         Ok(())
     }
@@ -1628,7 +1652,12 @@ where
         if frame.kind != FrameKind::If {
             bail!(self.offset, "else found outside of an `if` block");
         }
-        self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new())?;
+        // Must be Some if it's an If
+        let (constraints, locals, cond) = frame.else_setup.unwrap();
+        self.constraints = constraints;
+        self.locals = locals;
+        self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new(), Some(cond))?;
+        self.constraints.push(constraint!(= cond (i32 0)));
         Ok(())
     }
     fn visit_try(&mut self, _ty: BlockType) -> Self::Output {
