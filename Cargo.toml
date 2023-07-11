@@ -118,6 +118,7 @@ harness = false
 [features]
 # By default, all subcommands are built
 default = [
+  'size',
   'shrink',
   'smith',
   'mutate',
@@ -136,6 +137,7 @@ default = [
 validate = ['wasmparser', 'rayon']
 print = []
 parse = []
+size = ['wasmparser']
 smith = ['wasm-smith', 'arbitrary', 'serde', 'serde_json']
 shrink = ['wasm-shrink', 'is_executable']
 mutate = ['wasm-mutate']

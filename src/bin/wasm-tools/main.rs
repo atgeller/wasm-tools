@@ -47,6 +47,7 @@ subcommands! {
     (dump, "dump")
     (objdump, "objdump")
     (strip, "strip")
+    (size, "size")
     (compose, "compose")
     (demangle, "demangle")
     #[command(subcommand)]
