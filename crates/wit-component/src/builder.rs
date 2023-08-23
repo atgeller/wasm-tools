@@ -1,5 +1,6 @@
 use std::mem;
 use wasm_encoder::*;
+use wasm_metadata::Producers;
 
 /// Helper type used when encoding a component to have helpers that
 /// simultaneously encode an item while returning its corresponding index in the
@@ -28,10 +29,19 @@ pub struct ComponentBuilder {
     funcs: u32,
     instances: u32,
     types: u32,
+    components: u32,
+
+    producers: Producers,
 }
 
 impl ComponentBuilder {
     pub fn finish(mut self) -> Vec<u8> {
+        // Ideally the Default for self.producers would be crate::base_producers,
+        // but in lieu we stick it in now:
+        let mut base = crate::base_producers();
+        base.merge(&self.producers);
+        // Write producers section as last section:
+        self.component.section(&base.section());
         self.flush();
         self.component.finish()
     }
@@ -46,8 +56,11 @@ impl ComponentBuilder {
     }
 
     pub fn alias_func(&mut self, instance: u32, name: &str) -> u32 {
-        self.aliases()
-            .instance_export(instance, ComponentExportKind::Func, name);
+        self.aliases().alias(Alias::InstanceExport {
+            instance,
+            kind: ComponentExportKind::Func,
+            name,
+        });
         inc(&mut self.funcs)
     }
 
@@ -79,15 +92,6 @@ impl ComponentBuilder {
         inc(&mut self.core_instances)
     }
 
-    pub fn instantiate_exports<'a, E>(&mut self, exports: E) -> u32
-    where
-        E: IntoIterator<Item = (&'a str, ComponentExportKind, u32)>,
-        E::IntoIter: ExactSizeIterator,
-    {
-        self.component_instances().export_items(exports);
-        inc(&mut self.instances)
-    }
-
     pub fn core_module(&mut self, module: &Module) -> u32 {
         self.flush();
         self.component.section(&ModuleSection(module));
@@ -104,7 +108,11 @@ impl ComponentBuilder {
     }
 
     pub fn alias_core_item(&mut self, instance: u32, kind: ExportKind, name: &str) -> u32 {
-        self.aliases().core_instance_export(instance, kind, name);
+        self.aliases().alias(Alias::CoreInstanceExport {
+            instance,
+            kind,
+            name,
+        });
         match kind {
             ExportKind::Func => inc(&mut self.core_funcs),
             ExportKind::Table => inc(&mut self.core_tables),
@@ -113,23 +121,43 @@ impl ComponentBuilder {
         }
     }
 
-    pub fn export(&mut self, name: &str, url: &str, kind: ComponentExportKind, idx: u32) {
-        self.exports().export(name, url, kind, idx);
+    pub fn export(
+        &mut self,
+        name: &str,
+        kind: ComponentExportKind,
+        idx: u32,
+        ty: Option<ComponentTypeRef>,
+    ) -> u32 {
+        self.exports().export(name, kind, idx, ty);
+        match kind {
+            ComponentExportKind::Type => inc(&mut self.types),
+            ComponentExportKind::Func => inc(&mut self.funcs),
+            ComponentExportKind::Module => inc(&mut self.core_modules),
+            ComponentExportKind::Instance => inc(&mut self.instances),
+            ComponentExportKind::Component | ComponentExportKind::Value => unimplemented!(),
+        }
     }
 
-    pub fn import(&mut self, name: &str, url: &str, ty: ComponentTypeRef) -> u32 {
+    pub fn import(&mut self, name: &str, ty: ComponentTypeRef) -> u32 {
         let ret = match &ty {
             ComponentTypeRef::Instance(_) => inc(&mut self.instances),
             ComponentTypeRef::Func(_) => inc(&mut self.funcs),
+            ComponentTypeRef::Type(..) => inc(&mut self.types),
             _ => unimplemented!(),
         };
-        self.imports().import(name, url, ty);
+        self.imports().import(name, ty);
         ret
     }
 
     pub fn instance_type(&mut self, ty: &InstanceType) -> u32 {
         let ret = inc(&mut self.types);
         self.types().instance(ty);
+        ret
+    }
+
+    pub fn component_type(&mut self, ty: &ComponentType) -> u32 {
+        let ret = inc(&mut self.types);
+        self.types().component(ty);
         ret
     }
 
@@ -142,15 +170,35 @@ impl ComponentBuilder {
     }
 
     pub fn alias_type_export(&mut self, instance: u32, name: &str) -> u32 {
-        self.aliases()
-            .instance_export(instance, ComponentExportKind::Type, name);
+        self.aliases().alias(Alias::InstanceExport {
+            instance,
+            kind: ComponentExportKind::Type,
+            name,
+        });
         inc(&mut self.types)
     }
 
-    pub fn alias_outer_type(&mut self, depth: u32, index: u32) -> u32 {
-        self.aliases()
-            .outer(depth, ComponentOuterAliasKind::Type, index);
-        inc(&mut self.types)
+    pub fn component(&mut self, mut builder: ComponentBuilder) -> u32 {
+        builder.flush();
+        self.flush();
+        self.component
+            .section(&NestedComponentSection(&builder.component));
+        inc(&mut self.components)
+    }
+
+    pub fn instantiate_component<A, S>(&mut self, component_index: u32, args: A) -> u32
+    where
+        A: IntoIterator<Item = (S, ComponentExportKind, u32)>,
+        A::IntoIter: ExactSizeIterator,
+        S: AsRef<str>,
+    {
+        self.component_instances()
+            .instantiate(component_index, args);
+        inc(&mut self.instances)
+    }
+
+    pub fn add_producers(&mut self, producers: &Producers) {
+        self.producers.merge(producers)
     }
 }
 

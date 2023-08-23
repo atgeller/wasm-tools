@@ -234,7 +234,11 @@ impl ShrinkRun {
             sign_extension: true,
             component_model: false,
             precheck: true,
+            function_references: false,
+            gc: false,
+
             floats: true,
+            memory_control: true,
         });
 
         validator.validate_all(wasm)?;

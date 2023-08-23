@@ -1,3 +1,4 @@
+use crate::binary_reader::WASM_MAGIC_NUMBER;
 use crate::CoreTypeSectionReader;
 use crate::{
     limits::MAX_WASM_MODULE_SIZE, BinaryReader, BinaryReaderError, ComponentCanonicalSectionReader,
@@ -12,9 +13,20 @@ use std::fmt;
 use std::iter;
 use std::ops::Range;
 
-pub(crate) const WASM_EXPERIMENTAL_VERSION: u32 = 0xd;
-pub(crate) const WASM_MODULE_VERSION: u32 = 0x1;
-pub(crate) const WASM_COMPONENT_VERSION: u32 = 0x0001000a;
+pub(crate) const WASM_MODULE_VERSION: u16 = 0x1;
+
+// Note that this started at `0xa` and we're incrementing up from there. When
+// the component model is stabilized this will become 0x1. The changes here are:
+//
+// * [????-??-??] 0xa - original version
+// * [2023-01-05] 0xb - `export` introduces an alias
+// * [2023-02-06] 0xc - `export` has an optional type ascribed to it
+// * [2023-05-10] 0xd - imports/exports drop URLs, new discriminator byte which
+//                      allows for `(import (interface "...") ...)` syntax.
+pub(crate) const WASM_COMPONENT_VERSION: u16 = 0xd;
+
+const KIND_MODULE: u16 = 0x00;
+const KIND_COMPONENT: u16 = 0x01;
 
 /// The supported encoding formats for the parser.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -95,7 +107,7 @@ pub enum Payload<'a> {
     /// Indicates the header of a WebAssembly module or component.
     Version {
         /// The version number found in the header.
-        num: u32,
+        num: u16,
         /// The encoding format being parsed.
         encoding: Encoding,
         /// The range of bytes that were parsed to consume the header of the
@@ -326,6 +338,42 @@ impl Parser {
         }
     }
 
+    /// Tests whether `bytes` looks like a core WebAssembly module.
+    ///
+    /// This will inspect the first 8 bytes of `bytes` and return `true` if it
+    /// starts with the standard core WebAssembly header.
+    pub fn is_core_wasm(bytes: &[u8]) -> bool {
+        const HEADER: [u8; 8] = [
+            WASM_MAGIC_NUMBER[0],
+            WASM_MAGIC_NUMBER[1],
+            WASM_MAGIC_NUMBER[2],
+            WASM_MAGIC_NUMBER[3],
+            WASM_MODULE_VERSION.to_le_bytes()[0],
+            WASM_MODULE_VERSION.to_le_bytes()[1],
+            KIND_MODULE.to_le_bytes()[0],
+            KIND_MODULE.to_le_bytes()[1],
+        ];
+        bytes.starts_with(&HEADER)
+    }
+
+    /// Tests whether `bytes` looks like a WebAssembly component.
+    ///
+    /// This will inspect the first 8 bytes of `bytes` and return `true` if it
+    /// starts with the standard WebAssembly component header.
+    pub fn is_component(bytes: &[u8]) -> bool {
+        const HEADER: [u8; 8] = [
+            WASM_MAGIC_NUMBER[0],
+            WASM_MAGIC_NUMBER[1],
+            WASM_MAGIC_NUMBER[2],
+            WASM_MAGIC_NUMBER[3],
+            WASM_COMPONENT_VERSION.to_le_bytes()[0],
+            WASM_COMPONENT_VERSION.to_le_bytes()[1],
+            KIND_COMPONENT.to_le_bytes()[0],
+            KIND_COMPONENT.to_le_bytes()[1],
+        ];
+        bytes.starts_with(&HEADER)
+    }
+
     /// Attempts to parse a chunk of data.
     ///
     /// This method will attempt to parse the next incremental portion of a
@@ -515,17 +563,13 @@ impl Parser {
         match self.state {
             State::Header => {
                 let start = reader.original_position();
-                let num = reader.read_header_version()?;
-                self.encoding = match num {
-                    WASM_EXPERIMENTAL_VERSION | WASM_MODULE_VERSION => Encoding::Module,
-                    WASM_COMPONENT_VERSION => Encoding::Component,
-                    _ => {
-                        return Err(BinaryReaderError::new(
-                            "unknown binary version",
-                            reader.original_position() - 4,
-                        ))
-                    }
+                let header_version = reader.read_header_version()?;
+                self.encoding = match (header_version >> 16) as u16 {
+                    KIND_MODULE => Encoding::Module,
+                    KIND_COMPONENT => Encoding::Component,
+                    _ => bail!(start + 4, "unknown binary version: {header_version:#10x}"),
                 };
+                let num = header_version as u16;
                 self.state = State::SectionStart;
                 Ok(Version {
                     num,
@@ -1162,7 +1206,7 @@ mod tests {
     fn parser_after_component_header() -> Parser {
         let mut p = Parser::default();
         assert_matches!(
-            p.parse(b"\0asm\x0a\0\x01\0", false),
+            p.parse(b"\0asm\x0d\0\x01\0", false),
             Ok(Chunk::Parsed {
                 consumed: 8,
                 payload: Payload::Version {

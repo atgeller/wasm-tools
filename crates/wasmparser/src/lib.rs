@@ -49,6 +49,7 @@
 /// - `@threads`: [Wasm `threads` proposal]
 /// - `@simd`: [Wasm `simd` proposal]
 /// - `@relaxed_simd`: [Wasm `relaxed-simd` proposal]
+/// - `@gc`: [Wasm `gc` proposal]
 ///
 /// [Wasm `expection-handling` proposal]:
 /// https://github.com/WebAssembly/exception-handling
@@ -76,6 +77,9 @@
 ///
 /// [Wasm `relaxed-simd` proposal]:
 /// https://github.com/WebAssembly/relaxed-simd
+///
+/// [Wasm `gc` proposal]:
+/// https://github.com/WebAssembly/gc
 ///
 /// ```
 /// macro_rules! define_visit_operator {
@@ -197,7 +201,7 @@ macro_rules! for_each_operator {
             @mvp I64Const { value: i64 } => visit_i64_const
             @mvp F32Const { value: $crate::Ieee32 } => visit_f32_const
             @mvp F64Const { value: $crate::Ieee64 } => visit_f64_const
-            @reference_types RefNull { ty: $crate::ValType } => visit_ref_null
+            @reference_types RefNull { hty: $crate::HeapType } => visit_ref_null
             @reference_types RefIsNull => visit_ref_is_null
             @reference_types RefFunc { function_index: u32 } => visit_ref_func
             @mvp I32Eqz => visit_i32_eqz
@@ -329,6 +333,13 @@ macro_rules! for_each_operator {
             @sign_extension I64Extend16S => visit_i64_extend16_s
             @sign_extension I64Extend32S => visit_i64_extend32_s
 
+            // 0xFB prefixed operators
+            // Garbage Collection
+            // http://github.com/WebAssembly/gc
+            @gc I31New => visit_i31_new
+            @gc I31GetS => visit_i31_get_s
+            @gc I31GetU => visit_i31_get_u
+
             // 0xFC operators
             // Non-trapping Float-to-int Conversions
             // https://github.com/WebAssembly/nontrapping-float-to-int-conversions
@@ -360,6 +371,11 @@ macro_rules! for_each_operator {
             @reference_types TableSet { table: u32 } => visit_table_set
             @reference_types TableGrow { table: u32 } => visit_table_grow
             @reference_types TableSize { table: u32 } => visit_table_size
+
+            // OxFC prefixed operators
+            // memory control (experimental)
+            // https://github.com/WebAssembly/design/issues/1439
+            @memory_control MemoryDiscard { mem: u32 } => visit_memory_discard
 
             // 0xFE prefixed operators
             // threads
@@ -676,14 +692,14 @@ macro_rules! for_each_operator {
             // Relaxed SIMD operators
             // https://github.com/WebAssembly/relaxed-simd
             @relaxed_simd I8x16RelaxedSwizzle => visit_i8x16_relaxed_swizzle
-            @relaxed_simd I32x4RelaxedTruncSatF32x4S => visit_i32x4_relaxed_trunc_sat_f32x4_s
-            @relaxed_simd I32x4RelaxedTruncSatF32x4U => visit_i32x4_relaxed_trunc_sat_f32x4_u
-            @relaxed_simd I32x4RelaxedTruncSatF64x2SZero => visit_i32x4_relaxed_trunc_sat_f64x2_s_zero
-            @relaxed_simd I32x4RelaxedTruncSatF64x2UZero => visit_i32x4_relaxed_trunc_sat_f64x2_u_zero
-            @relaxed_simd F32x4RelaxedFma => visit_f32x4_relaxed_fma
-            @relaxed_simd F32x4RelaxedFnma => visit_f32x4_relaxed_fnma
-            @relaxed_simd F64x2RelaxedFma => visit_f64x2_relaxed_fma
-            @relaxed_simd F64x2RelaxedFnma => visit_f64x2_relaxed_fnma
+            @relaxed_simd I32x4RelaxedTruncF32x4S => visit_i32x4_relaxed_trunc_f32x4_s
+            @relaxed_simd I32x4RelaxedTruncF32x4U => visit_i32x4_relaxed_trunc_f32x4_u
+            @relaxed_simd I32x4RelaxedTruncF64x2SZero => visit_i32x4_relaxed_trunc_f64x2_s_zero
+            @relaxed_simd I32x4RelaxedTruncF64x2UZero => visit_i32x4_relaxed_trunc_f64x2_u_zero
+            @relaxed_simd F32x4RelaxedMadd => visit_f32x4_relaxed_madd
+            @relaxed_simd F32x4RelaxedNmadd => visit_f32x4_relaxed_nmadd
+            @relaxed_simd F64x2RelaxedMadd => visit_f64x2_relaxed_madd
+            @relaxed_simd F64x2RelaxedNmadd => visit_f64x2_relaxed_nmadd
             @relaxed_simd I8x16RelaxedLaneselect => visit_i8x16_relaxed_laneselect
             @relaxed_simd I16x8RelaxedLaneselect => visit_i16x8_relaxed_laneselect
             @relaxed_simd I32x4RelaxedLaneselect => visit_i32x4_relaxed_laneselect
@@ -693,9 +709,15 @@ macro_rules! for_each_operator {
             @relaxed_simd F64x2RelaxedMin => visit_f64x2_relaxed_min
             @relaxed_simd F64x2RelaxedMax => visit_f64x2_relaxed_max
             @relaxed_simd I16x8RelaxedQ15mulrS => visit_i16x8_relaxed_q15mulr_s
-            @relaxed_simd I16x8DotI8x16I7x16S => visit_i16x8_dot_i8x16_i7x16_s
-            @relaxed_simd I32x4DotI8x16I7x16AddS => visit_i32x4_dot_i8x16_i7x16_add_s
-            @relaxed_simd F32x4RelaxedDotBf16x8AddF32x4 => visit_f32x4_relaxed_dot_bf16x8_add_f32x4
+            @relaxed_simd I16x8RelaxedDotI8x16I7x16S => visit_i16x8_relaxed_dot_i8x16_i7x16_s
+            @relaxed_simd I32x4RelaxedDotI8x16I7x16AddS => visit_i32x4_relaxed_dot_i8x16_i7x16_add_s
+
+            // Typed Function references
+            @function_references CallRef { type_index: u32 } => visit_call_ref
+            @function_references ReturnCallRef { type_index: u32 } => visit_return_call_ref
+            @function_references RefAsNonNull => visit_ref_as_non_null
+            @function_references BrOnNull { relative_depth: u32 } => visit_br_on_null
+            @function_references BrOnNonNull { relative_depth: u32 } => visit_br_on_non_null
         }
     };
 }

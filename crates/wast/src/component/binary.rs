@@ -90,6 +90,10 @@ fn encode_type(encoder: ComponentTypeEncoder, ty: &TypeDef) {
         TypeDef::Instance(i) => {
             encoder.instance(&i.into());
         }
+        TypeDef::Resource(i) => {
+            let dtor = i.dtor.as_ref().map(|i| i.idx.into());
+            encoder.resource(i.rep.into(), dtor);
+        }
     }
 }
 
@@ -130,6 +134,8 @@ fn encode_defined_type(encoder: ComponentDefinedTypeEncoder, ty: &ComponentDefin
                 e.err.as_deref().map(Into::into),
             );
         }
+        ComponentDefinedType::Own(i) => encoder.own((*i).into()),
+        ComponentDefinedType::Borrow(i) => encoder.borrow((*i).into()),
     }
 }
 
@@ -256,7 +262,7 @@ impl<'a> Encoder<'a> {
             InstanceKind::BundleOfExports(exports) => {
                 self.instances.export_items(exports.iter().map(|e| {
                     let (kind, index) = (&e.kind).into();
-                    (e.name, kind, index)
+                    (e.name.into(), kind, index)
                 }));
             }
         }
@@ -266,28 +272,15 @@ impl<'a> Encoder<'a> {
 
     fn encode_alias(&mut self, alias: &Alias<'a>) {
         let name = get_name(&alias.id, &alias.name);
+        self.aliases.alias((&alias.target).into());
         match &alias.target {
-            AliasTarget::Export {
-                instance,
-                name: export_name,
-                kind,
-            } => {
-                self.aliases
-                    .instance_export((*instance).into(), (*kind).into(), export_name);
+            AliasTarget::Export { kind, .. } => {
                 self.names_for_component_export_alias(*kind).push(name);
             }
-            AliasTarget::CoreExport {
-                instance,
-                name: export_name,
-                kind,
-            } => {
-                self.aliases
-                    .core_instance_export((*instance).into(), (*kind).into(), export_name);
+            AliasTarget::CoreExport { kind, .. } => {
                 self.names_for_core_export_alias(*kind).push(name);
             }
-            AliasTarget::Outer { outer, index, kind } => {
-                self.aliases
-                    .outer((*outer).into(), (*kind).into(), (*index).into());
+            AliasTarget::Outer { kind, .. } => {
                 self.names_for_component_outer_alias(*kind).push(name);
             }
         }
@@ -328,6 +321,18 @@ impl<'a> Encoder<'a> {
                 self.funcs
                     .lower(info.func.idx.into(), info.opts.iter().map(Into::into));
             }
+            CanonicalFuncKind::ResourceNew(info) => {
+                self.core_func_names.push(name);
+                self.funcs.resource_new(info.ty.into());
+            }
+            CanonicalFuncKind::ResourceDrop(info) => {
+                self.core_func_names.push(name);
+                self.funcs.resource_drop((&info.ty).into());
+            }
+            CanonicalFuncKind::ResourceRep(info) => {
+                self.core_func_names.push(name);
+                self.funcs.resource_rep(info.ty.into());
+            }
         }
 
         self.flush(Some(self.funcs.id()));
@@ -337,17 +342,29 @@ impl<'a> Encoder<'a> {
         let name = get_name(&import.item.id, &import.item.name);
         self.names_for_item_kind(&import.item.kind).push(name);
         self.imports.import(
-            import.name,
-            import.url.unwrap_or(""),
+            wasm_encoder::ComponentExternName::from(import.name),
             (&import.item.kind).into(),
         );
         self.flush(Some(self.imports.id()));
     }
 
-    fn encode_export(&mut self, export: &ComponentExport) {
+    fn encode_export(&mut self, export: &ComponentExport<'a>) {
+        let name = get_name(&export.id, &export.debug_name);
         let (kind, index) = (&export.kind).into();
-        self.exports
-            .export(export.name, export.url.unwrap_or(""), kind, index);
+        self.exports.export(
+            wasm_encoder::ComponentExternName::from(export.name),
+            kind,
+            index,
+            export.ty.as_ref().map(|ty| (&ty.0.kind).into()),
+        );
+        match &export.kind {
+            ComponentExportKind::CoreModule(_) => self.core_module_names.push(name),
+            ComponentExportKind::Func(_) => self.func_names.push(name),
+            ComponentExportKind::Instance(_) => self.instance_names.push(name),
+            ComponentExportKind::Value(_) => self.value_names.push(name),
+            ComponentExportKind::Component(_) => self.component_names.push(name),
+            ComponentExportKind::Type(_) => self.type_names.push(name),
+        }
         self.flush(Some(self.exports.id()));
     }
 
@@ -551,17 +568,35 @@ impl From<core::ValType<'_>> for wasm_encoder::ValType {
             core::ValType::F32 => Self::F32,
             core::ValType::F64 => Self::F64,
             core::ValType::V128 => Self::V128,
-            core::ValType::Ref(r) => r.into(),
+            core::ValType::Ref(r) => Self::Ref(r.into()),
         }
     }
 }
 
-impl From<core::RefType<'_>> for wasm_encoder::ValType {
+impl From<core::RefType<'_>> for wasm_encoder::RefType {
     fn from(r: core::RefType<'_>) -> Self {
-        match r.heap {
-            core::HeapType::Func => Self::FuncRef,
-            core::HeapType::Extern => Self::ExternRef,
-            _ => {
+        wasm_encoder::RefType {
+            nullable: r.nullable,
+            heap_type: r.heap.into(),
+        }
+    }
+}
+
+impl From<core::HeapType<'_>> for wasm_encoder::HeapType {
+    fn from(r: core::HeapType<'_>) -> Self {
+        match r {
+            core::HeapType::Func => Self::Func,
+            core::HeapType::Extern => Self::Extern,
+            core::HeapType::Index(Index::Num(i, _)) => Self::Indexed(i),
+            core::HeapType::Index(_) => panic!("unresolved index"),
+            core::HeapType::Any
+            | core::HeapType::Eq
+            | core::HeapType::Struct
+            | core::HeapType::Array
+            | core::HeapType::NoFunc
+            | core::HeapType::NoExtern
+            | core::HeapType::None
+            | core::HeapType::I31 => {
                 todo!("encoding of GC proposal types not yet implemented")
             }
         }
@@ -758,7 +793,10 @@ impl From<&ItemSigKind<'_>> for wasm_encoder::ComponentTypeRef {
             ItemSigKind::Value(v) => Self::Value((&v.0).into()),
             ItemSigKind::Func(f) => Self::Func(f.into()),
             ItemSigKind::Type(TypeBounds::Eq(t)) => {
-                Self::Type(wasm_encoder::TypeBounds::Eq, (*t).into())
+                Self::Type(wasm_encoder::TypeBounds::Eq((*t).into()))
+            }
+            ItemSigKind::Type(TypeBounds::SubResource) => {
+                Self::Type(wasm_encoder::TypeBounds::SubResource)
             }
         }
     }
@@ -776,28 +814,20 @@ impl From<&ComponentType<'_>> for wasm_encoder::ComponentType {
                 ComponentTypeDecl::Type(t) => {
                     encode_type(encoded.ty(), &t.def);
                 }
-                ComponentTypeDecl::Alias(a) => match &a.target {
-                    AliasTarget::Outer {
-                        outer,
-                        index,
-                        kind: ComponentOuterAliasKind::CoreType,
-                    } => {
-                        encoded.alias_outer_core_type(u32::from(*outer), u32::from(*index));
-                    }
-                    AliasTarget::Outer {
-                        outer,
-                        index,
-                        kind: ComponentOuterAliasKind::Type,
-                    } => {
-                        encoded.alias_outer_type(u32::from(*outer), u32::from(*index));
-                    }
-                    _ => unreachable!("only outer type aliases are supported"),
-                },
+                ComponentTypeDecl::Alias(a) => {
+                    encoded.alias((&a.target).into());
+                }
                 ComponentTypeDecl::Import(i) => {
-                    encoded.import(i.name, i.url.unwrap_or(""), (&i.item.kind).into());
+                    encoded.import(
+                        wasm_encoder::ComponentExternName::from(i.name),
+                        (&i.item.kind).into(),
+                    );
                 }
                 ComponentTypeDecl::Export(e) => {
-                    encoded.export(e.name, e.url.unwrap_or(""), (&e.item.kind).into());
+                    encoded.export(
+                        wasm_encoder::ComponentExternName::from(e.name),
+                        (&e.item.kind).into(),
+                    );
                 }
             }
         }
@@ -818,25 +848,14 @@ impl From<&InstanceType<'_>> for wasm_encoder::InstanceType {
                 InstanceTypeDecl::Type(t) => {
                     encode_type(encoded.ty(), &t.def);
                 }
-                InstanceTypeDecl::Alias(a) => match &a.target {
-                    AliasTarget::Outer {
-                        outer,
-                        index,
-                        kind: ComponentOuterAliasKind::CoreType,
-                    } => {
-                        encoded.alias_outer_core_type(u32::from(*outer), u32::from(*index));
-                    }
-                    AliasTarget::Outer {
-                        outer,
-                        index,
-                        kind: ComponentOuterAliasKind::Type,
-                    } => {
-                        encoded.alias_outer_type(u32::from(*outer), u32::from(*index));
-                    }
-                    _ => unreachable!("only outer type aliases are supported"),
-                },
+                InstanceTypeDecl::Alias(a) => {
+                    encoded.alias((&a.target).into());
+                }
                 InstanceTypeDecl::Export(e) => {
-                    encoded.export(e.name, e.url.unwrap_or(""), (&e.item.kind).into());
+                    encoded.export(
+                        wasm_encoder::ComponentExternName::from(e.name),
+                        (&e.item.kind).into(),
+                    );
                 }
             }
         }
@@ -946,6 +965,45 @@ impl From<&CanonOpt<'_>> for wasm_encoder::CanonicalOption {
             CanonOpt::Memory(m) => Self::Memory(m.idx.into()),
             CanonOpt::Realloc(f) => Self::Realloc(f.idx.into()),
             CanonOpt::PostReturn(f) => Self::PostReturn(f.idx.into()),
+        }
+    }
+}
+
+impl<'a> From<&AliasTarget<'a>> for wasm_encoder::Alias<'a> {
+    fn from(target: &AliasTarget<'a>) -> Self {
+        match target {
+            AliasTarget::Export {
+                instance,
+                name,
+                kind,
+            } => wasm_encoder::Alias::InstanceExport {
+                instance: (*instance).into(),
+                kind: (*kind).into(),
+                name,
+            },
+            AliasTarget::CoreExport {
+                instance,
+                name,
+                kind,
+            } => wasm_encoder::Alias::CoreInstanceExport {
+                instance: (*instance).into(),
+                kind: (*kind).into(),
+                name,
+            },
+            AliasTarget::Outer { outer, index, kind } => wasm_encoder::Alias::Outer {
+                count: (*outer).into(),
+                kind: (*kind).into(),
+                index: (*index).into(),
+            },
+        }
+    }
+}
+
+impl<'a> From<ComponentExternName<'a>> for wasm_encoder::ComponentExternName<'a> {
+    fn from(name: ComponentExternName<'a>) -> Self {
+        match name {
+            ComponentExternName::Kebab(name) => Self::Kebab(name),
+            ComponentExternName::Interface(name) => Self::Interface(name),
         }
     }
 }

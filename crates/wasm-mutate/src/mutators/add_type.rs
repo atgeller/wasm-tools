@@ -1,7 +1,8 @@
 //! A mutator to add a new type to a Wasm module.
 
 use super::Mutator;
-use crate::Result;
+use crate::module::map_type;
+use crate::{Error, Result};
 use rand::Rng;
 use std::iter;
 
@@ -22,8 +23,8 @@ impl AddTypeMutator {
             2 => wasm_encoder::ValType::F32,
             3 => wasm_encoder::ValType::F64,
             4 => wasm_encoder::ValType::V128,
-            5 => wasm_encoder::ValType::ExternRef,
-            6 => wasm_encoder::ValType::FuncRef,
+            5 => wasm_encoder::ValType::EXTERNREF,
+            6 => wasm_encoder::ValType::FUNCREF,
             _ => unreachable!(),
         }
     }
@@ -35,7 +36,7 @@ impl Mutator for AddTypeMutator {
     }
 
     fn mutate<'a>(
-        self,
+        &self,
         config: &'a mut crate::WasmMutate,
     ) -> crate::Result<Box<dyn Iterator<Item = crate::Result<wasm_encoder::Module>> + 'a>> {
         let count = config.rng().gen_range(0..=self.max_params);
@@ -60,14 +61,19 @@ impl Mutator for AddTypeMutator {
                         let params = ty
                             .params()
                             .iter()
-                            .map(translate_type)
+                            .copied()
+                            .map(map_type)
                             .collect::<Result<Vec<_>, _>>()?;
                         let results = ty
                             .results()
                             .iter()
-                            .map(translate_type)
+                            .copied()
+                            .map(map_type)
                             .collect::<Result<Vec<_>, _>>()?;
                         types.function(params, results);
+                    }
+                    wasmparser::Type::Array(_) => {
+                        return Err(Error::unsupported("Array types are not supported yet."));
                     }
                 }
             }
@@ -84,18 +90,6 @@ impl Mutator for AddTypeMutator {
                 .insert_section(0, &types)))))
         }
     }
-}
-
-fn translate_type(ty: &wasmparser::ValType) -> Result<wasm_encoder::ValType> {
-    Ok(match ty {
-        wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
-        wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
-        wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
-        wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
-        wasmparser::ValType::V128 => wasm_encoder::ValType::V128,
-        wasmparser::ValType::FuncRef => wasm_encoder::ValType::FuncRef,
-        wasmparser::ValType::ExternRef => wasm_encoder::ValType::ExternRef,
-    })
 }
 
 #[cfg(test)]

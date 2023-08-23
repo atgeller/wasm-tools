@@ -1,15 +1,15 @@
 (component
   (import "i" (instance $i
-    (export "f1" (func $f1))
-    (export "f2" (func $f2 (param "p1" string)))
+    (export "f1" (func))
+    (export "f2" (func (param "p1" string)))
   ))
   (export "run" (func $i "f1"))
 )
 
 (component
   (import "i" (component $c
-    (export "f1" (func $f1))
-    (export "f2" (func $f2 (param "p1" string)))
+    (export "f1" (func))
+    (export "f2" (func (param "p1" string)))
   ))
   (instance $i (instantiate $c))
   (export "run" (func $i "f1"))
@@ -65,9 +65,9 @@
     (export "b" (core module))
     (export "c" (instance))
   ))
-  (export "a" (func $i "a"))
-  (export "b" (core module $i "b"))
-  (export "c" (instance $i "c"))
+  (export "b" (func $i "a"))
+  (export "c" (core module $i "b"))
+  (export "d" (instance $i "c"))
 )
 
 (component

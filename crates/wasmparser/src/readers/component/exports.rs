@@ -1,4 +1,6 @@
-use crate::{BinaryReader, FromReader, Result, SectionLimited};
+use crate::{
+    BinaryReader, ComponentExternName, ComponentTypeRef, FromReader, Result, SectionLimited,
+};
 
 /// Represents the kind of an external items of a WebAssembly component.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,19 +50,32 @@ impl ComponentExternalKind {
             }
         })
     }
+
+    /// Returns a simple string description of this kind.
+    pub fn desc(&self) -> &'static str {
+        use ComponentExternalKind::*;
+        match self {
+            Module => "module",
+            Func => "func",
+            Value => "value",
+            Type => "type",
+            Instance => "instance",
+            Component => "component",
+        }
+    }
 }
 
 /// Represents an export in a WebAssembly component.
 #[derive(Debug, Clone)]
 pub struct ComponentExport<'a> {
     /// The name of the exported item.
-    pub name: &'a str,
-    /// The optional URL of the exported item.
-    pub url: &'a str,
+    pub name: ComponentExternName<'a>,
     /// The kind of the export.
     pub kind: ComponentExternalKind,
     /// The index of the exported item.
     pub index: u32,
+    /// An optionally specified type ascribed to this export.
+    pub ty: Option<ComponentTypeRef>,
 }
 
 /// A reader for the export section of a WebAssembly component.
@@ -70,9 +85,19 @@ impl<'a> FromReader<'a> for ComponentExport<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
         Ok(ComponentExport {
             name: reader.read()?,
-            url: reader.read()?,
             kind: reader.read()?,
             index: reader.read()?,
+            ty: match reader.read_u8()? {
+                0x00 => None,
+                0x01 => Some(reader.read()?),
+                other => {
+                    return Err(BinaryReader::invalid_leading_byte_error(
+                        other,
+                        "optional component export type",
+                        reader.original_position() - 1,
+                    ))
+                }
+            },
         })
     }
 }

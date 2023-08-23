@@ -143,9 +143,9 @@ impl<'a> ModuleInfo<'a> {
                     info.table_count += reader.count();
                     info.section(SectionId::Table.into(), reader.range(), input_wasm);
 
-                    for ty in reader {
-                        let ty = ty?;
-                        let ty = PrimitiveTypeInfo::try_from(ty.element_type).unwrap();
+                    for table in reader {
+                        let table = table?;
+                        let ty = PrimitiveTypeInfo::try_from(table.ty.element_type).unwrap();
                         info.table_elem_types.push(ty);
                     }
                 }
@@ -306,6 +306,31 @@ impl<'a> ModuleInfo<'a> {
         if self.raw_sections.len() == i {
             module.section(new_section);
         }
+        module
+    }
+
+    /// Move a section from index `src_idx` to `dest_idx` in the Wasm module
+    pub fn move_section(&self, src_idx: usize, dest_idx: usize) -> wasm_encoder::Module {
+        log::trace!(
+            "moving section from index {} to index {}",
+            src_idx,
+            dest_idx
+        );
+        assert!(src_idx < self.raw_sections.len());
+        assert!(dest_idx < self.raw_sections.len());
+        assert_ne!(src_idx, dest_idx);
+        let mut module = wasm_encoder::Module::new();
+        self.raw_sections.iter().enumerate().for_each(|(i, s)| {
+            if src_idx < dest_idx && i == dest_idx {
+                module.section(&self.raw_sections[src_idx]);
+            }
+            if i != src_idx {
+                module.section(s);
+            }
+            if dest_idx < src_idx && i == dest_idx {
+                module.section(&self.raw_sections[src_idx]);
+            }
+        });
         module
     }
 

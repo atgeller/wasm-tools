@@ -117,7 +117,7 @@ impl<'a, 'b> PrintOperator<'a, 'b> {
 
     fn type_index(&mut self, idx: u32) -> Result<()> {
         self.push_str(" ");
-        self.printer.print_type_ref(self.state, idx, true, None)
+        self.printer.print_core_type_ref(self.state, idx)
     }
 
     fn data_index(&mut self, idx: u32) -> Result<()> {
@@ -217,7 +217,7 @@ macro_rules! define_visit {
             $self.table_index($table)?;
         }
         $self.type_index($ty)?;
-        drop($byte);
+        let _ = $byte;
     );
     (payload $self:ident ReturnCallIndirect $ty:ident $table:ident) => (
         if $table != 0 {
@@ -226,14 +226,22 @@ macro_rules! define_visit {
         }
         $self.type_index($ty)?;
     );
+    (payload $self:ident CallRef $ty:ident) => (
+        $self.push_str(" ");
+        $self.printer.print_idx(&$self.state.core.type_names, $ty)?;
+    );
+    (payload $self:ident ReturnCallRef $ty:ident) => (
+        $self.push_str(" ");
+        $self.printer.print_idx(&$self.state.core.type_names, $ty)?;
+    );
     (payload $self:ident TypedSelect $ty:ident) => (
         $self.push_str(" (result ");
         $self.printer.print_valtype($ty)?;
         $self.push_str(")")
     );
-    (payload $self:ident RefNull $ty:ident) => (
+    (payload $self:ident RefNull $hty:ident) => (
         $self.push_str(" ");
-        $self.printer.print_reftype($ty)?;
+        $self.printer.print_heaptype($hty)?;
     );
     (payload $self:ident TableInit $segment:ident $table:ident) => (
         $self.push_str(" ");
@@ -279,6 +287,12 @@ macro_rules! define_visit {
             $self.memory_index($mem)?;
         }
     );
+    (payload $self:ident MemoryDiscard $mem:ident) => (
+        if $mem != 0 {
+            $self.push_str(" ");
+            $self.memory_index($mem)?;
+        }
+    );
     (payload $self:ident I32Const $val:ident) => (write!($self.result(), " {}", $val)?);
     (payload $self:ident I64Const $val:ident) => (write!($self.result(), " {}", $val)?);
     (payload $self:ident F32Const $val:ident) => (
@@ -318,12 +332,16 @@ macro_rules! define_visit {
     (name Nop) => ("nop");
     (name Br) => ("br");
     (name BrIf) => ("br_if");
+    (name BrOnNull) => ("br_on_null");
+    (name BrOnNonNull) => ("br_on_non_null");
     (name BrTable) => ("br_table");
     (name Return) => ("return");
     (name Call) => ("call");
     (name CallIndirect) => ("call_indirect");
+    (name CallRef) => ("call_ref");
     (name ReturnCall) => ("return_call");
     (name ReturnCallIndirect) => ("return_call_indirect");
+    (name ReturnCallRef) => ("return_call_ref");
     (name Drop) => ("drop");
     (name Select) => ("select");
     (name TypedSelect) => ("select");
@@ -385,6 +403,7 @@ macro_rules! define_visit {
     (name MemoryInit) => ("memory.init");
     (name MemoryCopy) => ("memory.copy");
     (name MemoryFill) => ("memory.fill");
+    (name MemoryDiscard) => ("memory.discard");
     (name DataDrop) => ("data.drop");
     (name ElemDrop) => ("elem.drop");
     (name TableInit) => ("table.init");
@@ -392,6 +411,7 @@ macro_rules! define_visit {
     (name TableFill) => ("table.fill");
     (name TableSize) => ("table.size");
     (name TableGrow) => ("table.grow");
+    (name RefAsNonNull) => ("ref.as_non_null");
     (name RefNull) => ("ref.null");
     (name RefIsNull) => ("ref.is_null");
     (name RefFunc) => ("ref.func");
@@ -845,14 +865,14 @@ macro_rules! define_visit {
     (name Delegate) => ("delegate");
     (name CatchAll) => ("catch_all");
     (name I8x16RelaxedSwizzle) => ("i8x16.relaxed_swizzle");
-    (name I32x4RelaxedTruncSatF32x4S) => ("i32x4.relaxed_trunc_sat_f32x4_s");
-    (name I32x4RelaxedTruncSatF32x4U) => ("i32x4.relaxed_trunc_sat_f32x4_u");
-    (name I32x4RelaxedTruncSatF64x2SZero) => ("i32x4.relaxed_trunc_sat_f64x2_s_zero");
-    (name I32x4RelaxedTruncSatF64x2UZero) => ("i32x4.relaxed_trunc_sat_f64x2_u_zero");
-    (name F32x4RelaxedFma) => ("f32x4.relaxed_fma");
-    (name F32x4RelaxedFnma) => ("f32x4.relaxed_fnma");
-    (name F64x2RelaxedFma) => ("f64x2.relaxed_fma");
-    (name F64x2RelaxedFnma) => ("f64x2.relaxed_fnma");
+    (name I32x4RelaxedTruncF32x4S) => ("i32x4.relaxed_trunc_f32x4_s");
+    (name I32x4RelaxedTruncF32x4U) => ("i32x4.relaxed_trunc_f32x4_u");
+    (name I32x4RelaxedTruncF64x2SZero) => ("i32x4.relaxed_trunc_f64x2_s_zero");
+    (name I32x4RelaxedTruncF64x2UZero) => ("i32x4.relaxed_trunc_f64x2_u_zero");
+    (name F32x4RelaxedMadd) => ("f32x4.relaxed_madd");
+    (name F32x4RelaxedNmadd) => ("f32x4.relaxed_nmadd");
+    (name F64x2RelaxedMadd) => ("f64x2.relaxed_madd");
+    (name F64x2RelaxedNmadd) => ("f64x2.relaxed_nmadd");
     (name I8x16RelaxedLaneselect) => ("i8x16.relaxed_laneselect");
     (name I16x8RelaxedLaneselect) => ("i16x8.relaxed_laneselect");
     (name I32x4RelaxedLaneselect) => ("i32x4.relaxed_laneselect");
@@ -862,9 +882,11 @@ macro_rules! define_visit {
     (name F64x2RelaxedMin) => ("f64x2.relaxed_min");
     (name F64x2RelaxedMax) => ("f64x2.relaxed_max");
     (name I16x8RelaxedQ15mulrS) => ("i16x8.relaxed_q15mulr_s");
-    (name I16x8DotI8x16I7x16S) => ("i16x8.dot_i8x16_i7x16_s");
-    (name I32x4DotI8x16I7x16AddS) => ("i32x4.dot_i8x16_i7x16_add_s");
-    (name F32x4RelaxedDotBf16x8AddF32x4) => ("f32x4.relaxed_dot_bf16x8_add_f32x4");
+    (name I16x8RelaxedDotI8x16I7x16S) => ("i16x8.relaxed_dot_i8x16_i7x16_s");
+    (name I32x4RelaxedDotI8x16I7x16AddS) => ("i32x4.relaxed_dot_i8x16_i7x16_add_s");
+    (name I31New) => ("i31.new");
+    (name I31GetS) => ("i31.get_s");
+    (name I31GetU) => ("i31.get_u");
 }
 
 impl<'a> VisitOperator<'a> for PrintOperator<'_, '_> {

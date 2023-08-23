@@ -4,17 +4,22 @@ use crate::parser::{Parse, Parser, Result};
 use crate::token::{Id, Index, NameAnnotation, Span};
 
 /// A inline alias for component exported items.
+///
+/// Handles both `core export` and `export` aliases
 #[derive(Debug)]
-pub struct InlineExportAlias<'a> {
+pub struct InlineExportAlias<'a, const CORE: bool> {
     /// The instance to alias the export from.
     pub instance: Index<'a>,
     /// The name of the export to alias.
     pub name: &'a str,
 }
 
-impl<'a> Parse<'a> for InlineExportAlias<'a> {
+impl<'a, const CORE: bool> Parse<'a> for InlineExportAlias<'a, CORE> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         parser.parse::<kw::alias>()?;
+        if CORE {
+            parser.parse::<kw::core>()?;
+        }
         parser.parse::<kw::export>()?;
         let instance = parser.parse()?;
         let name = parser.parse()?;
@@ -38,7 +43,7 @@ pub struct Alias<'a> {
 
 impl<'a> Alias<'a> {
     /// Parses only an outer type alias.
-    pub fn parse_outer_type_alias(parser: Parser<'a>, core_prefix_assumed: bool) -> Result<Self> {
+    pub fn parse_outer_core_type_alias(parser: Parser<'a>) -> Result<Self> {
         let span = parser.parse::<kw::alias>()?.0;
         parser.parse::<kw::outer>()?;
         let outer = parser.parse()?;
@@ -47,14 +52,11 @@ impl<'a> Alias<'a> {
         let (kind, id, name) = parser.parens(|parser| {
             let mut kind: ComponentOuterAliasKind = parser.parse()?;
             match kind {
-                ComponentOuterAliasKind::CoreType | ComponentOuterAliasKind::Type => {
-                    if core_prefix_assumed {
-                        // Error if the core prefix was present (should not be present in module type aliases).
-                        if kind == ComponentOuterAliasKind::CoreType {
-                            return Err(parser.error("expected type for outer alias"));
-                        }
-                        kind = ComponentOuterAliasKind::CoreType;
-                    }
+                ComponentOuterAliasKind::CoreType => {
+                    return Err(parser.error("expected type for outer alias"))
+                }
+                ComponentOuterAliasKind::Type => {
+                    kind = ComponentOuterAliasKind::CoreType;
                 }
                 _ => return Err(parser.error("expected core type or type for outer alias")),
             }

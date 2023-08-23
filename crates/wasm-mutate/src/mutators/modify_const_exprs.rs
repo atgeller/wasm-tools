@@ -91,7 +91,7 @@ impl<'cfg, 'wasm> Translator for InitTranslator<'cfg, 'wasm> {
             // as other values may not necessarily be valid (e.g. maximum table size is limited)
             let is_element_offset = matches!(kind, ConstExprKind::ElementOffset);
             let should_zero = is_element_offset || self.config.rng().gen::<u8>() & 0b11 == 0;
-            match ty {
+            match *ty {
                 T::I32 if should_zero => CE::i32_const(0),
                 T::I64 if should_zero => CE::i64_const(0),
                 T::V128 if should_zero => CE::v128_const(0),
@@ -124,8 +124,9 @@ impl<'cfg, 'wasm> Translator for InitTranslator<'cfg, 'wasm> {
                 } else {
                     f64::from_bits(self.config.rng().gen())
                 }),
-                T::FuncRef => CE::ref_null(wasm_encoder::ValType::FuncRef),
-                T::ExternRef => CE::ref_null(wasm_encoder::ValType::ExternRef),
+                T::FUNCREF => CE::ref_null(wasm_encoder::HeapType::Func),
+                T::EXTERNREF => CE::ref_null(wasm_encoder::HeapType::Extern),
+                T::Ref(_) => unimplemented!(),
             }
         } else {
             // FIXME: implement non-reducing mutations for constant expressions.
@@ -139,7 +140,7 @@ impl<'cfg, 'wasm> Translator for InitTranslator<'cfg, 'wasm> {
 
 impl Mutator for ConstExpressionMutator {
     fn mutate<'a>(
-        self,
+        &self,
         config: &'a mut crate::WasmMutate,
     ) -> crate::Result<Box<dyn Iterator<Item = crate::Result<wasm_encoder::Module>> + 'a>> {
         let translator_kind = match self {

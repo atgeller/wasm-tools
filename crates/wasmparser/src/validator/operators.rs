@@ -24,36 +24,39 @@
 
 use index_language::constraint;
 
+use std::ops::{Deref, DerefMut};
+use std::u32::MAX;
+
 use crate::{
-    limits::MAX_WASM_FUNCTION_LOCALS,
+    limits::MAX_WASM_FUNCTION_LOCALS, BinaryReaderError, BlockType, BrTable, 
     validator::solver::{ConstraintSolver, Z3},
-    BinOp, BinaryReaderError, BlockType, BrTable, Constant, Constraint, Ieee32, Ieee64, IndexTerm,
-    MemArg, RelOp, Result, TestOp, UnOp, ValType, VisitOperator, WasmFeatures, WasmFuncType,
+    BinOp, Constant, Constraint, HeapType, Ieee32,
+    Ieee64, IndexTerm, MemArg, RefType, RelOp, Result, TestOp, UnOp, ValType, VisitOperator, WasmFeatures, WasmFuncType,
     WasmModuleResources, V128,
-};
-use std::{
-    ops::{Deref, DerefMut},
-    u32::MAX,
 };
 
 pub(crate) struct OperatorValidator {
     pub(super) locals: Locals,
+    pub(super) local_inits: Vec<bool>,
 
     // This is a list of flags for wasm features which are used to gate various
     // instructions.
     pub(crate) features: WasmFeatures,
 
     // Temporary storage used during the validation of `br_table`.
-    br_table_tmp: Vec<Option<ValType>>,
+    br_table_tmp: Vec<MaybeType>,
 
     /// The `control` list is the list of blocks that we're currently in.
     control: Vec<Frame>,
     /// The `operands` is the current type stack.
-    operands: Vec<(Option<ValType>, u32)>,
+    operands: Vec<(MaybeType, u32)>,
     /// Current constraints
     constraints: Vec<Constraint>,
     /// Current constraints
-    indices: Vec<Option<ValType>>,
+    indices: Vec<Option<MaybeType>>,
+    /// When local_inits is modified, the relevant index is recorded here to be
+    /// undone when control pops
+    inits: Vec<u32>,
 
     /// Offset of the `end` instruction which emptied the `control` stack, which
     /// must be the end of the function.
@@ -117,6 +120,8 @@ pub struct Frame {
     /// If the frame is an if, we need to remember the state so we can
     /// reconstruct it for the if
     pub else_setup: Option<(Vec<Constraint>, Locals, u32)>,
+    /// The number of initializations in the stack at the time of its creation
+    pub init_height: usize,
 }
 
 /// The kind of a control flow [`Frame`].
@@ -158,11 +163,43 @@ struct OperatorValidatorTemp<'validator, 'resources, T> {
 
 #[derive(Default)]
 pub struct OperatorValidatorAllocations {
-    br_table_tmp: Vec<Option<ValType>>,
+    br_table_tmp: Vec<MaybeType>,
     control: Vec<Frame>,
-    operands: Vec<(Option<ValType>, u32)>,
+    operands: Vec<(MaybeType, u32)>,
     locals_first: Vec<(ValType, u32)>,
-    locals_all: Vec<(u32, ValType)>,
+    local_inits: Vec<bool>,
+    inits: Vec<u32>,
+}
+
+/// Type storage within the validator.
+///
+/// This is used to manage the operand stack and notably isn't just `ValType` to
+/// handle unreachable code and the "bottom" type.
+#[derive(Debug, Copy, Clone)]
+enum MaybeType {
+    Bot,
+    HeapBot,
+    Type(ValType),
+}
+
+// The validator is pretty performance-sensitive and `MaybeType` is the main
+// unit of storage, so assert that it doesn't exceed 4 bytes which is the
+// current expected size.
+const _: () = {
+    assert!(std::mem::size_of::<MaybeType>() == 4);
+};
+
+impl From<ValType> for MaybeType {
+    fn from(ty: ValType) -> MaybeType {
+        MaybeType::Type(ty)
+    }
+}
+
+impl From<RefType> for MaybeType {
+    fn from(ty: RefType) -> MaybeType {
+        let ty: ValType = ty.into();
+        ty.into()
+    }
 }
 
 impl OperatorValidator {
@@ -171,19 +208,23 @@ impl OperatorValidator {
             br_table_tmp,
             control,
             operands,
+            local_inits,
+            inits,
             locals_first,
-            locals_all,
         } = allocs;
         debug_assert!(br_table_tmp.is_empty());
         debug_assert!(control.is_empty());
         debug_assert!(operands.is_empty());
+        debug_assert!(local_inits.is_empty());
+        debug_assert!(inits.is_empty());
         debug_assert!(locals_first.is_empty());
-        debug_assert!(locals_all.is_empty());
         OperatorValidator {
             locals: Locals {
                 num_locals: 0,
                 first: locals_first,
             },
+            local_inits,
+            inits,
             features: *features,
             br_table_tmp,
             operands,
@@ -223,8 +264,9 @@ impl OperatorValidator {
         for ty in params {
             let index = ret.indices.len();
             consumed.push(ret.indices.len() as u32);
-            ret.indices.push(Some(ty));
+            ret.indices.push(Some(ty.into()));
             ret.locals.add_local(ty, index as u32);
+            ret.local_inits.push(true);
         }
 
         let mut initial_state = Resolver::resolve_before_block(
@@ -246,6 +288,7 @@ impl OperatorValidator {
             constraints_after_end: Vec::new(),
             post_condition,
             else_setup: None,
+            init_height: 0,
         });
 
         Ok(ret)
@@ -268,21 +311,26 @@ impl OperatorValidator {
             constraints_after_end: Vec::new(),
             post_condition: Vec::new(),
             else_setup: None,
+            init_height: 0,
         });
         ret
     }
 
-    pub fn define_locals(&mut self, offset: usize, count: u32, ty: ValType) -> Result<()> {
-        self.features
-            .check_value_type(ty)
-            .map_err(|e| BinaryReaderError::new(e, offset))?;
+    pub fn define_locals(
+        &mut self,
+        offset: usize,
+        count: u32,
+        ty: ValType,
+        resources: &impl WasmModuleResources,
+    ) -> Result<()> {
+        resources.check_value_type(ty, &self.features, offset)?;
         if count == 0 {
             return Ok(());
         }
 
         for _ in 0..count {
             let index = self.indices.len();
-            self.indices.push(Some(ty));
+            self.indices.push(Some(ty.into()));
             if !self.locals.add_local(ty, index as u32) {
                 return Err(BinaryReaderError::new(
                     "too many locals: locals exceed maximum",
@@ -300,7 +348,8 @@ impl OperatorValidator {
                 _ => {}
             }
         }
-
+        self.local_inits
+            .resize(self.local_inits.len() + count as usize, ty.is_defaultable());
         Ok(())
     }
 
@@ -320,12 +369,10 @@ impl OperatorValidator {
     ///
     /// A `depth` of 0 will refer to the last operand on the stack.
     pub fn peek_operand_at(&self, depth: usize) -> Option<Option<ValType>> {
-        self.operands
-            .iter()
-            .rev()
-            .nth(depth)
-            .copied()
-            .map(|(x, _)| x)
+        Some(match self.operands.iter().rev().nth(depth)? {
+            (MaybeType::Type(t), _) => Some(*t),
+            (MaybeType::Bot, _) | (MaybeType::HeapBot, _) => None,
+        })
     }
 
     /// Returns the number of frames on the control flow stack.
@@ -385,8 +432,9 @@ impl OperatorValidator {
             br_table_tmp: truncate(self.br_table_tmp),
             control: truncate(self.control),
             operands: truncate(self.operands),
+            local_inits: truncate(self.local_inits),
+            inits: truncate(self.inits),
             locals_first: truncate(self.locals.first),
-            locals_all: truncate(Vec::new()),
         }
     }
 }
@@ -723,11 +771,11 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// Returns: the index associated with the index variable returned
     fn push_operand<T>(&mut self, ty: T) -> Result<u32>
     where
-        T: Into<Option<ValType>>,
+        T: Into<MaybeType>,
     {
         let maybe_ty = ty.into();
         let index = self.indices.len() as u32;
-        self.indices.push(maybe_ty);
+        self.indices.push(Some(maybe_ty));
         self.operands.push((maybe_ty, index));
         Ok(index)
     }
@@ -739,7 +787,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// simply that something is needed to be popped.
     ///
     /// If `expected` is `Some(T)` then this will be guaranteed to return
-    /// `Some(T)`, and it will only return success if the current block is
+    /// `T`, and it will only return success if the current block is
     /// unreachable or if `T` was found at the top of the operand stack.
     ///
     /// If `expected` is `None` then it indicates that something must be on the
@@ -750,7 +798,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// matches `expected`. If `None` is returned then it means that `None` was
     /// expected and a type was successfully popped, but its exact type is
     /// indeterminate because the current block is unreachable.
-    fn pop_operand(&mut self, expected: Option<ValType>) -> Result<(Option<ValType>, u32)> {
+    fn pop_operand(&mut self, expected: Option<ValType>) -> Result<(MaybeType, u32)> {
         // This method is one of the hottest methods in the validator so to
         // improve codegen this method, contains a fast-path success case where
         // if the top operand on the stack is as expected it's returned
@@ -762,17 +810,18 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // matched against the state of the world to see if we could actually
         // pop it. If we shouldn't have popped it then it's passed to the slow
         // path to get pushed back onto the stack.
-        let popped = if let Some(actual_ty) = self.operands.pop() {
-            if actual_ty.0 == expected {
-                if let Some(control) = self.control.last() {
-                    if self.operands.len() >= control.height {
-                        return Ok(actual_ty);
+        let popped = match self.operands.pop() {
+            Some((MaybeType::Type(actual_ty), idx)) => {
+                if Some(actual_ty) == expected {
+                    if let Some(control) = self.control.last() {
+                        if self.operands.len() >= control.height {
+                            return Ok((MaybeType::Type(actual_ty), idx));
+                        }
                     }
                 }
+                Some((MaybeType::Type(actual_ty), idx))
             }
-            Some(actual_ty)
-        } else {
-            None
+            other => other,
         };
 
         self._pop_operand(expected, popped)
@@ -785,17 +834,17 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     fn _pop_operand(
         &mut self,
         expected: Option<ValType>,
-        popped: Option<(Option<ValType>, u32)>,
-    ) -> Result<(Option<ValType>, u32)> {
+        popped: Option<(MaybeType, u32)>,
+    ) -> Result<(MaybeType, u32)> {
         self.operands.extend(popped);
         let control = match self.control.last() {
             Some(c) => c,
             None => return Err(self.err_beyond_end(self.offset)),
         };
-        let actual = if self.operands.len() == control.height {
-            if control.unreachable {
-                (None, MAX)
-            } else {
+        let actual = if self.operands.len() == control.height && control.unreachable {
+            (MaybeType::Bot, MAX)
+        } else {
+            if self.operands.len() == control.height {
                 let desc = match expected {
                     Some(ty) => ty_to_str(ty),
                     None => "a type",
@@ -804,21 +853,58 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                     self.offset,
                     "type mismatch: expected {desc} but nothing on stack"
                 )
+            } else {
+                self.operands.pop().unwrap()
             }
-        } else {
-            self.operands.pop().unwrap()
         };
-        if let ((Some(actual_ty), _), Some(expected_ty)) = (actual, expected) {
-            if actual_ty != expected_ty {
-                bail!(
-                    self.offset,
-                    "type mismatch: expected {}, found {}",
-                    ty_to_str(expected_ty),
-                    ty_to_str(actual_ty)
-                )
+
+        if let Some(expected) = expected {
+            match (actual.0, expected) {
+                // The bottom type matches all expectations
+                (MaybeType::Bot, _)
+                // The "heap bottom" type only matches other references types,
+                // but not any integer types.
+                | (MaybeType::HeapBot, ValType::Ref(_)) => {}
+
+                // Use the `matches` predicate to test if a found type matches
+                // the expectation.
+                (MaybeType::Type(actual), expected) => {
+                    if !self.resources.matches(actual, expected) {
+                        bail!(
+                            self.offset,
+                            "type mismatch: expected {}, found {}",
+                            ty_to_str(expected),
+                            ty_to_str(actual)
+                        );
+                    }
+                }
+
+                // A "heap bottom" type cannot match any numeric types.
+                (
+                    MaybeType::HeapBot,
+                    ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 | ValType::V128,
+                ) => {
+                    bail!(
+                        self.offset,
+                        "type mismatch: expected {}, found heap type",
+                        ty_to_str(expected)
+                    )
+                }
             }
         }
         Ok(actual)
+    }
+
+    fn pop_ref(&mut self) -> Result<Option<RefType>> {
+        match self.pop_operand(None)?.0 {
+            MaybeType::Bot | MaybeType::HeapBot => Ok(None),
+            MaybeType::Type(ValType::Ref(rt)) => Ok(Some(rt)),
+            MaybeType::Type(ty) => bail!(
+                self.offset,
+                "type mismatch: expected ref but found {}",
+                ty_to_str(ty)
+            ),
+        }
     }
 
     /// Fetches the type for the local at `idx`, returning an error if it's out
@@ -854,7 +940,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         for idx in 0..self.locals.num_locals {
             let (ty, _) = self.locals.get(idx).unwrap();
             let new_alpha = self.indices.len() as u32;
-            self.indices.push(Some(ty));
+            self.indices.push(Some(ty.into()));
             self.locals.replace_index(idx, new_alpha);
         }
     }
@@ -882,7 +968,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
         let height = self.operands.len();
-
+        let init_height = self.inits.len();
         // Perform check against annotation precondition with current state
         let pre = self.get_pres_from_block_type(ty)?;
         let condition =
@@ -927,7 +1013,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             for (idx, ty) in self.params(ty)?.enumerate() {
                 let old_idx = consumed[idx];
                 // Hack: reuse old indices for variables unless it's a loop
-                self.operands.push((Some(ty), old_idx));
+                self.operands.push((ty.into(), old_idx));
             }
 
             Resolver::preliminary_resolve_after_block(&consumed, &self.locals, post, self.offset)?
@@ -944,7 +1030,8 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 unreachable: false,
                 constraints_after_end: Vec::new(),
                 post_condition,
-                else_setup: Some((constraints, locals, cond.unwrap()))
+                else_setup: Some((constraints, locals, cond.unwrap())),
+                init_height,
             });
         } else {
             self.control.push(Frame {
@@ -955,6 +1042,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 constraints_after_end,
                 post_condition,
                 else_setup: None,
+                init_height,
             });
         }
 
@@ -976,6 +1064,12 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         let ty = frame.block_type;
         let height = frame.height;
         let cond = frame.post_condition.clone();
+        let init_height = frame.init_height;
+
+        // reset_locals in the spec
+        for init in self.inits.split_off(init_height) {
+            self.local_inits[init as usize] = false;
+        }
 
         // Pop all the result types, in reverse order, from the operand stack.
         // These types will, possibly, be transferred to the next frame.
@@ -1133,18 +1227,29 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(frame) => frame,
             None => return false,
         };
+        
+        if control.unreachable {
+            return true;
+        }
 
-        control.unreachable || Z3::satisfies(&self.indices, &self.constraints, condition)
+        let gamma = &self.indices.iter().map(|maybe_ty| {
+            if let Some(MaybeType::Type(ty)) = maybe_ty {
+                Some(ty.clone())
+            } else {
+                None
+            }
+        }).collect();
+
+        Z3::satisfies(gamma, &self.constraints, condition)
     }
 
     /// Validates a block type, primarily with various in-flight proposals.
     fn check_block_type(&self, ty: BlockType) -> Result<()> {
         match ty {
             BlockType::Empty => Ok(()),
-            BlockType::Type(ty) => self
-                .features
-                .check_value_type(ty)
-                .map_err(|e| BinaryReaderError::new(e, self.offset)),
+            BlockType::Type(t) => self
+                .resources
+                .check_value_type(t, &self.features, self.offset),
             BlockType::FuncType(idx) => {
                 if !self.features.multi_value {
                     bail!(
@@ -1162,13 +1267,25 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// Validates a `call` instruction, ensuring that the function index is
     /// in-bounds and the right types are on the stack to call the function.
     fn check_call(&mut self, function_index: u32) -> Result<()> {
-        let ty = match self.resources.type_of_function(function_index) {
+        let ty = match self.resources.type_index_of_function(function_index) {
             Some(i) => i,
             None => {
                 bail!(
                     self.offset,
-                    "unknown function {}: function index out of bounds",
-                    function_index
+                    "unknown function {function_index}: function index out of bounds",
+                );
+            }
+        };
+        self.check_call_ty(ty)
+    }
+
+    fn check_call_ty(&mut self, type_index: u32) -> Result<()> {
+        let ty = match self.resources.func_type_at(type_index) {
+            Some(i) => i,
+            None => {
+                bail!(
+                    self.offset,
+                    "unknown type {type_index}: type index out of bounds",
                 );
             }
         };
@@ -1209,10 +1326,13 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 bail!(self.offset, "unknown table: table index out of bounds");
             }
             Some(tab) => {
-                if tab.element_type != ValType::FuncRef {
+                if !self
+                    .resources
+                    .matches(ValType::Ref(tab.element_type), ValType::FUNCREF)
+                {
                     bail!(
                         self.offset,
-                        "indirect calls must go through a table of funcref"
+                        "indirect calls must go through a table with type <= funcref",
                     );
                 }
             }
@@ -1400,14 +1520,6 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 
     /// Checks a [`V128`] binary operator.
-    fn check_v128_relaxed_binary_op(&mut self) -> Result<()> {
-        self.pop_operand(Some(ValType::V128))?;
-        self.pop_operand(Some(ValType::V128))?;
-        self.push_operand(ValType::V128)?;
-        Ok(())
-    }
-
-    /// Checks a [`V128`] binary operator.
     fn check_v128_unary_op(&mut self) -> Result<()> {
         self.pop_operand(Some(ValType::V128))?;
         self.push_operand(ValType::V128)?;
@@ -1420,15 +1532,8 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         self.check_v128_unary_op()
     }
 
-    /// Checks a [`V128`] binary operator.
-    fn check_v128_relaxed_unary_op(&mut self) -> Result<()> {
-        self.pop_operand(Some(ValType::V128))?;
-        self.push_operand(ValType::V128)?;
-        Ok(())
-    }
-
     /// Checks a [`V128`] relaxed ternary operator.
-    fn check_v128_relaxed_ternary_op(&mut self) -> Result<()> {
+    fn check_v128_ternary_op(&mut self) -> Result<()> {
         self.pop_operand(Some(ValType::V128))?;
         self.pop_operand(Some(ValType::V128))?;
         self.pop_operand(Some(ValType::V128))?;
@@ -1498,15 +1603,14 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 }
 
-fn ty_to_str(ty: ValType) -> &'static str {
+pub fn ty_to_str(ty: ValType) -> &'static str {
     match ty {
         ValType::I32 => "i32",
         ValType::I64 => "i64",
         ValType::F32 => "f32",
         ValType::F64 => "f64",
         ValType::V128 => "v128",
-        ValType::FuncRef => "funcref",
-        ValType::ExternRef => "externref",
+        ValType::Ref(r) => r.wat(),
     }
 }
 
@@ -1589,6 +1693,9 @@ macro_rules! validate_proposal {
     (desc exceptions) => ("exceptions");
     (desc tail_call) => ("tail calls");
     (desc precheck) => ("precheck");
+    (desc function_references) => ("function references");
+    (desc memory_control) => ("memory control");
+    (desc gc) => ("gc");
 }
 
 impl<'a, T> VisitOperator<'a> for WasmProposalValidator<'_, '_, T>
@@ -1756,7 +1863,7 @@ where
         for (idx, ty) in types.clone().rev().enumerate() {
             let old_idx = args[idx];
             // Reuse old indices for variables to avoid accidental freshening
-            self.operands.push((Some(ty), old_idx));
+            self.operands.push((ty.into(), old_idx));
         }
 
         Ok(())
@@ -1804,6 +1911,31 @@ where
         self.check_return()?;
         Ok(())
     }
+    fn visit_call_ref(&mut self, type_index: u32) -> Self::Output {
+        let hty = HeapType::Indexed(type_index);
+        self.resources
+            .check_heap_type(hty, &self.features, self.offset)?;
+        // If `None` is popped then that means a "bottom" type was popped which
+        // is always considered equivalent to the `hty` tag.
+        if let Some(rt) = self.pop_ref()? {
+            let expected = RefType::indexed_func(true, type_index)
+                .expect("existing heap types should be within our limits");
+            if !self
+                .resources
+                .matches(ValType::Ref(rt), ValType::Ref(expected))
+            {
+                bail!(
+                    self.offset,
+                    "type mismatch: funcref on stack does not match specified type",
+                );
+            }
+        }
+        self.check_call_ty(type_index)
+    }
+    fn visit_return_call_ref(&mut self, type_index: u32) -> Self::Output {
+        self.visit_call_ref(type_index)?;
+        self.check_return()
+    }
     fn visit_call_indirect(
         &mut self,
         index: u32,
@@ -1832,38 +1964,44 @@ where
         let (_, a0) = self.pop_operand(Some(ValType::I32))?;
         let (ty1, a1) = self.pop_operand(None)?;
         let (ty2, a2) = self.pop_operand(None)?;
-        fn is_num(ty: Option<ValType>) -> bool {
-            matches!(
-                ty,
-                Some(ValType::I32)
-                    | Some(ValType::I64)
-                    | Some(ValType::F32)
-                    | Some(ValType::F64)
-                    | Some(ValType::V128)
-                    | None
-            )
-        }
-        if !is_num(ty1) || !is_num(ty2) {
-            bail!(
-                self.offset,
-                "type mismatch: select only takes integral types"
-            )
-        }
-        if ty1 != ty2 && ty1.is_some() && ty2.is_some() {
-            bail!(
-                self.offset,
-                "type mismatch: select operands have different types"
-            )
-        }
-        let x = self.push_operand(ty1.or(ty2))?;
+
+        let ty = match (ty1, ty2) {
+            // All heap-related types aren't allowed with the `select`
+            // instruction
+            (MaybeType::HeapBot, _)
+            | (_, MaybeType::HeapBot)
+            | (MaybeType::Type(ValType::Ref(_)), _)
+            | (_, MaybeType::Type(ValType::Ref(_))) => {
+                bail!(
+                    self.offset,
+                    "type mismatch: select only takes integral types"
+                )
+            }
+
+            // If one operand is the "bottom" type then whatever the other
+            // operand is is the result of the `select`
+            (MaybeType::Bot, t) | (t, MaybeType::Bot) => t,
+
+            // Otherwise these are two integral types and they must match for
+            // `select` to typecheck.
+            (t @ MaybeType::Type(t1), MaybeType::Type(t2)) => {
+                if t1 != t2 {
+                    bail!(
+                        self.offset,
+                        "type mismatch: select operands have different types"
+                    );
+                }
+                t
+            }
+        };
+        let x = self.push_operand(ty)?;
         self.constraints
             .push(constraint!(r#if (= a0 (i32 0)) (= x a1) (= x a2)));
         Ok(())
     }
     fn visit_typed_select(&mut self, ty: ValType) -> Self::Output {
-        self.features
-            .check_value_type(ty)
-            .map_err(|e| BinaryReaderError::new(e, self.offset))?;
+        self.resources
+            .check_value_type(ty, &self.features, self.offset)?;
         self.pop_operand(Some(ValType::I32))?;
         self.pop_operand(Some(ty))?;
         self.pop_operand(Some(ty))?;
@@ -1872,6 +2010,9 @@ where
     }
     fn visit_local_get(&mut self, local_index: u32) -> Self::Output {
         let (ty, l_idx) = self.local(local_index)?;
+        if !self.local_inits[local_index as usize] {
+            bail!(self.offset, "uninitialized local: {}", local_index);
+        }
         let new = self.push_operand(ty)?;
         self.constraints.push(constraint!(= l_idx new));
         Ok(())
@@ -1879,12 +2020,20 @@ where
     fn visit_local_set(&mut self, local_index: u32) -> Self::Output {
         let (ty, _) = self.local(local_index)?;
         let (_, new) = self.pop_operand(Some(ty))?;
+        if !self.local_inits[local_index as usize] {
+            self.local_inits[local_index as usize] = true;
+            self.inits.push(local_index);
+        }
         self.replace_local(local_index, new)?;
         Ok(())
     }
     fn visit_local_tee(&mut self, local_index: u32) -> Self::Output {
         let (ty, _) = self.local(local_index)?;
         let (_, new_local) = self.pop_operand(Some(ty))?;
+        if !self.local_inits[local_index as usize] {
+            self.local_inits[local_index as usize] = true;
+            self.inits.push(local_index);
+        }
         self.replace_local(local_index, new_local)?;
         let new_stack = self.push_operand(ty)?;
         self.constraints.push(constraint!(= new_local new_stack));
@@ -2694,31 +2843,116 @@ where
     fn visit_atomic_fence(&mut self) -> Self::Output {
         Ok(())
     }
-    fn visit_ref_null(&mut self, ty: ValType) -> Self::Output {
-        self.features
-            .check_value_type(ty)
-            .map_err(|e| BinaryReaderError::new(e, self.offset))?;
-        if !ty.is_reference_type() {
-            bail!(self.offset, "invalid non-reference type in ref.null");
-        }
+    fn visit_ref_null(&mut self, heap_type: HeapType) -> Self::Output {
+        self.resources
+            .check_heap_type(heap_type, &self.features, self.offset)?;
+        self.push_operand(ValType::Ref(
+            RefType::new(true, heap_type).expect("existing heap types should be within our limits"),
+        ))?;
+        Ok(())
+    }
+
+    fn visit_ref_as_non_null(&mut self) -> Self::Output {
+        let ty = match self.pop_ref()? {
+            Some(ty) => MaybeType::Type(ValType::Ref(ty.as_non_null())),
+            None => MaybeType::HeapBot,
+        };
         self.push_operand(ty)?;
         Ok(())
     }
+    fn visit_br_on_null(&mut self, relative_depth: u32) -> Self::Output {
+        bail!(
+            self.offset,
+            "unsupported instruction: br_on_non_null",
+        );
+        /*
+        let ty = match self.pop_ref()? {
+            None => MaybeType::HeapBot,
+            Some(ty) => MaybeType::Type(ValType::Ref(ty.as_non_null())),
+        };
+        let (ft, kind, cond) = self.jump(relative_depth)?;
+        for ty in self.label_types(ft, kind)?.rev() {
+            self.pop_operand(Some(ty))?;
+        }
+        for ty in self.label_types(ft, kind)? {
+            self.push_operand(ty)?;
+        }
+        self.push_operand(ty)?;
+        Ok(())
+        */
+    }
+    fn visit_br_on_non_null(&mut self, relative_depth: u32) -> Self::Output {
+        bail!(
+            self.offset,
+            "unsupported instruction: visit_br_on_non_null",
+        );
+        /*
+        let ty = self.pop_ref()?;
+        let (ft, kind, cond) = self.jump(relative_depth)?;
+        let mut lts = self.label_types(ft, kind)?;
+        match (lts.next_back(), ty) {
+            (None, _) => bail!(
+                self.offset,
+                "type mismatch: br_on_non_null target has no label types",
+            ),
+            (Some(ValType::Ref(_)), None) => {}
+            (Some(rt1 @ ValType::Ref(_)), Some(rt0)) => {
+                // Switch rt0, our popped type, to a non-nullable type and
+                // perform the match because if the branch is taken it's a
+                // non-null value.
+                let ty = rt0.as_non_null();
+                if !self.resources.matches(ty.into(), rt1) {
+                    bail!(
+                        self.offset,
+                        "type mismatch: expected {} but found {}",
+                        ty_to_str(rt0.into()),
+                        ty_to_str(rt1)
+                    )
+                }
+            }
+            (Some(_), _) => bail!(
+                self.offset,
+                "type mismatch: br_on_non_null target does not end with heap type",
+            ),
+        }
+        for ty in self.label_types(ft, kind)?.rev().skip(1) {
+            self.pop_operand(Some(ty))?;
+        }
+        for ty in lts {
+            self.push_operand(ty)?;
+        }
+        Ok(())
+        */
+    }
+
     fn visit_ref_is_null(&mut self) -> Self::Output {
-        bail!(self.offset, "no")
+        self.pop_ref()?;
+        self.push_operand(ValType::I32)?;
+        Ok(())
     }
     fn visit_ref_func(&mut self, function_index: u32) -> Self::Output {
-        if self.resources.type_of_function(function_index).is_none() {
-            bail!(
+        let type_index = match self.resources.type_index_of_function(function_index) {
+            Some(idx) => idx,
+            None => bail!(
                 self.offset,
                 "unknown function {}: function index out of bounds",
                 function_index,
-            );
-        }
+            ),
+        };
         if !self.resources.is_function_referenced(function_index) {
             bail!(self.offset, "undeclared function reference");
         }
-        self.push_operand(ValType::FuncRef)?;
+
+        // FIXME(#924) this should not be conditional based on enabled
+        // proposals.
+        if self.features.function_references {
+            self.push_operand(
+                RefType::indexed_func(false, type_index)
+                    .expect("our limits on number of types should fit into ref type"),
+            )?;
+        } else {
+            self.push_operand(ValType::FUNCREF)?;
+        }
         Ok(())
     }
     fn visit_v128_load(&mut self, memarg: MemArg) -> Self::Output {
@@ -2928,24 +3162,6 @@ where
     }
     fn visit_f64x2_pmax(&mut self) -> Self::Output {
         self.check_v128_fbinary_op()
-    }
-    fn visit_f32x4_relaxed_min(&mut self) -> Self::Output {
-        self.check_v128_relaxed_binary_op()
-    }
-    fn visit_f32x4_relaxed_max(&mut self) -> Self::Output {
-        self.check_v128_relaxed_binary_op()
-    }
-    fn visit_f64x2_relaxed_min(&mut self) -> Self::Output {
-        self.check_v128_relaxed_binary_op()
-    }
-    fn visit_f64x2_relaxed_max(&mut self) -> Self::Output {
-        self.check_v128_relaxed_binary_op()
-    }
-    fn visit_i16x8_relaxed_q15mulr_s(&mut self) -> Self::Output {
-        self.check_v128_relaxed_binary_op()
-    }
-    fn visit_i16x8_dot_i8x16_i7x16_s(&mut self) -> Self::Output {
-        self.check_v128_relaxed_binary_op()
     }
     fn visit_i8x16_eq(&mut self) -> Self::Output {
         self.check_v128_binary_op()
@@ -3370,18 +3586,6 @@ where
     fn visit_i32x4_extadd_pairwise_i16x8_u(&mut self) -> Self::Output {
         self.check_v128_unary_op()
     }
-    fn visit_i32x4_relaxed_trunc_sat_f32x4_s(&mut self) -> Self::Output {
-        self.check_v128_relaxed_unary_op()
-    }
-    fn visit_i32x4_relaxed_trunc_sat_f32x4_u(&mut self) -> Self::Output {
-        self.check_v128_relaxed_unary_op()
-    }
-    fn visit_i32x4_relaxed_trunc_sat_f64x2_s_zero(&mut self) -> Self::Output {
-        self.check_v128_relaxed_unary_op()
-    }
-    fn visit_i32x4_relaxed_trunc_sat_f64x2_u_zero(&mut self) -> Self::Output {
-        self.check_v128_relaxed_unary_op()
-    }
     fn visit_v128_bitselect(&mut self) -> Self::Output {
         self.pop_operand(Some(ValType::V128))?;
         self.pop_operand(Some(ValType::V128))?;
@@ -3389,35 +3593,68 @@ where
         self.push_operand(ValType::V128)?;
         Ok(())
     }
-    fn visit_f32x4_relaxed_fma(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+    fn visit_i8x16_relaxed_swizzle(&mut self) -> Self::Output {
+        self.pop_operand(Some(ValType::V128))?;
+        self.pop_operand(Some(ValType::V128))?;
+        self.push_operand(ValType::V128)?;
+        Ok(())
     }
-    fn visit_f32x4_relaxed_fnma(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+    fn visit_i32x4_relaxed_trunc_f32x4_s(&mut self) -> Self::Output {
+        self.check_v128_unary_op()
     }
-    fn visit_f64x2_relaxed_fma(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+    fn visit_i32x4_relaxed_trunc_f32x4_u(&mut self) -> Self::Output {
+        self.check_v128_unary_op()
     }
-    fn visit_f64x2_relaxed_fnma(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+    fn visit_i32x4_relaxed_trunc_f64x2_s_zero(&mut self) -> Self::Output {
+        self.check_v128_unary_op()
+    }
+    fn visit_i32x4_relaxed_trunc_f64x2_u_zero(&mut self) -> Self::Output {
+        self.check_v128_unary_op()
+    }
+    fn visit_f32x4_relaxed_madd(&mut self) -> Self::Output {
+        self.check_v128_ternary_op()
+    }
+    fn visit_f32x4_relaxed_nmadd(&mut self) -> Self::Output {
+        self.check_v128_ternary_op()
+    }
+    fn visit_f64x2_relaxed_madd(&mut self) -> Self::Output {
+        self.check_v128_ternary_op()
+    }
+    fn visit_f64x2_relaxed_nmadd(&mut self) -> Self::Output {
+        self.check_v128_ternary_op()
     }
     fn visit_i8x16_relaxed_laneselect(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+        self.check_v128_ternary_op()
     }
     fn visit_i16x8_relaxed_laneselect(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+        self.check_v128_ternary_op()
     }
     fn visit_i32x4_relaxed_laneselect(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+        self.check_v128_ternary_op()
     }
     fn visit_i64x2_relaxed_laneselect(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+        self.check_v128_ternary_op()
     }
-    fn visit_i32x4_dot_i8x16_i7x16_add_s(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+    fn visit_f32x4_relaxed_min(&mut self) -> Self::Output {
+        self.check_v128_binary_op()
     }
-    fn visit_f32x4_relaxed_dot_bf16x8_add_f32x4(&mut self) -> Self::Output {
-        self.check_v128_relaxed_ternary_op()
+    fn visit_f32x4_relaxed_max(&mut self) -> Self::Output {
+        self.check_v128_binary_op()
+    }
+    fn visit_f64x2_relaxed_min(&mut self) -> Self::Output {
+        self.check_v128_binary_op()
+    }
+    fn visit_f64x2_relaxed_max(&mut self) -> Self::Output {
+        self.check_v128_binary_op()
+    }
+    fn visit_i16x8_relaxed_q15mulr_s(&mut self) -> Self::Output {
+        self.check_v128_binary_op()
+    }
+    fn visit_i16x8_relaxed_dot_i8x16_i7x16_s(&mut self) -> Self::Output {
+        self.check_v128_binary_op()
+    }
+    fn visit_i32x4_relaxed_dot_i8x16_i7x16_add_s(&mut self) -> Self::Output {
+        self.check_v128_ternary_op()
     }
     fn visit_v128_any_true(&mut self) -> Self::Output {
         self.check_v128_bitmask_op()
@@ -3483,12 +3720,6 @@ where
         self.check_v128_shift_op()
     }
     fn visit_i8x16_swizzle(&mut self) -> Self::Output {
-        self.pop_operand(Some(ValType::V128))?;
-        self.pop_operand(Some(ValType::V128))?;
-        self.push_operand(ValType::V128)?;
-        Ok(())
-    }
-    fn visit_i8x16_relaxed_swizzle(&mut self) -> Self::Output {
         self.pop_operand(Some(ValType::V128))?;
         self.pop_operand(Some(ValType::V128))?;
         self.push_operand(ValType::V128)?;
@@ -3652,6 +3883,12 @@ where
         self.pop_operand(Some(ty))?;
         Ok(())
     }
+    fn visit_memory_discard(&mut self, mem: u32) -> Self::Output {
+        let ty = self.check_memory_index(mem)?;
+        self.pop_operand(Some(ty))?;
+        self.pop_operand(Some(ty))?;
+        Ok(())
+    }
     fn visit_table_init(&mut self, segment: u32, table: u32) -> Self::Output {
         if table > 0 {}
         let table = match self.resources.table_at(table) {
@@ -3697,7 +3934,10 @@ where
             (Some(a), Some(b)) => (a, b),
             _ => bail!(self.offset, "table index out of bounds"),
         };
-        if src.element_type != dst.element_type {
+        if !self.resources.matches(
+            ValType::Ref(src.element_type),
+            ValType::Ref(dst.element_type),
+        ) {
             bail!(self.offset, "type mismatch");
         }
         self.pop_operand(Some(ValType::I32))?;
@@ -3711,7 +3951,7 @@ where
             None => bail!(self.offset, "table index out of bounds"),
         };
         self.pop_operand(Some(ValType::I32))?;
-        self.push_operand(ty)?;
+        self.push_operand(ValType::Ref(ty))?;
         Ok(())
     }
     fn visit_table_set(&mut self, table: u32) -> Self::Output {
@@ -3719,7 +3959,7 @@ where
             Some(ty) => ty.element_type,
             None => bail!(self.offset, "table index out of bounds"),
         };
-        self.pop_operand(Some(ty))?;
+        self.pop_operand(Some(ValType::Ref(ty)))?;
         self.pop_operand(Some(ValType::I32))?;
         Ok(())
     }
@@ -3729,7 +3969,7 @@ where
             None => bail!(self.offset, "table index out of bounds"),
         };
         self.pop_operand(Some(ValType::I32))?;
-        self.pop_operand(Some(ty))?;
+        self.pop_operand(Some(ValType::Ref(ty)))?;
         self.push_operand(ValType::I32)?;
         Ok(())
     }
@@ -3746,8 +3986,33 @@ where
             None => bail!(self.offset, "table index out of bounds"),
         };
         self.pop_operand(Some(ValType::I32))?;
-        self.pop_operand(Some(ty))?;
+        self.pop_operand(Some(ValType::Ref(ty)))?;
         self.pop_operand(Some(ValType::I32))?;
+        Ok(())
+    }
+    fn visit_i31_new(&mut self) -> Self::Output {
+        self.pop_operand(Some(ValType::I32))?;
+        self.push_operand(ValType::Ref(RefType::I31))?;
+        Ok(())
+    }
+    fn visit_i31_get_s(&mut self) -> Self::Output {
+        match self.pop_ref()? {
+            Some(ref_type) => match ref_type.heap_type() {
+                HeapType::I31 => self.push_operand(ValType::I32)?,
+                _ => bail!(self.offset, "ref heap type mismatch: expected i31"),
+            },
+            _ => bail!(self.offset, "type mismatch: expected (ref null? i31)"),
+        };
+        Ok(())
+    }
+    fn visit_i31_get_u(&mut self) -> Self::Output {
+        match self.pop_ref()? {
+            Some(ref_type) => match ref_type.heap_type() {
+                HeapType::I31 => self.push_operand(ValType::I32)?,
+                _ => bail!(self.offset, "ref heap type mismatch: expected i31"),
+            },
+            _ => bail!(self.offset, "type mismatch: expected (ref null? i31)"),
+        };
         Ok(())
     }
 }

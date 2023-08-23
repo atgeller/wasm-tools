@@ -39,9 +39,9 @@
     ;; functions
     (export "a" (func))
     (export "a2" (func (type $local_type)))
-    (export "b" (func $foo))
+    (export "b" (func))
     (export "c" (func (@name "bar")))
-    (export "d" (func $foo (@name "bar")))
+    (export "d" (func (@name "bar")))
     (export "e" (func (type $t)))
     (export "f" (func (param "f" string)))
     (export "g" (func (param "g" s32) (result u32)))
@@ -155,17 +155,17 @@
       (export "b" (func (param i32)))
     ))
 
-    (export "a" (func))
-    (export "e" (func (type $empty)))
-    (export "f" (func (param "f" s32)))
+    (export "m" (func))
+    (export "n" (func (type $empty)))
+    (export "o" (func (param "f" s32)))
 
-    (export "g" (instance
+    (export "p" (instance
       (export "a" (func))
       (export "b" (func (type $empty)))
       (export "c" (func (param "c" s32)))
     ))
 
-    (export "h" (core module
+    (export "q" (core module
       (type $empty (func))
       (import "" "a" (func (type $empty)))
       (import "" "b" (func (param i32)))
@@ -180,7 +180,7 @@
     (type (instance
       (export "a" (func))
       (export "a" (func)))))
-  "export name `a` conflicts with previous export name `a`")
+  "export name `a` conflicts with previous name `a`")
 
 (assert_invalid
   (component

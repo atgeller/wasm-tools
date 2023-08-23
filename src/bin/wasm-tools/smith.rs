@@ -76,7 +76,7 @@ pub struct Opts {
     module_config: Config,
 
     #[clap(flatten)]
-    verbosity: wasm_tools::Verbosity,
+    general: wasm_tools::GeneralOpts,
 }
 
 #[derive(Default, Debug, Parser, Clone, serde::Deserialize)]
@@ -146,6 +146,9 @@ struct Config {
     #[clap(long = "reference-types")]
     #[serde(rename = "reference-types")]
     reference_types_enabled: Option<bool>,
+    #[clap(long = "tail-call")]
+    #[serde(rename = "tail-call")]
+    tail_call_enabled: Option<bool>,
     #[clap(long = "simd")]
     #[serde(rename = "simd")]
     simd_enabled: Option<bool>,
@@ -192,8 +195,11 @@ struct Config {
 }
 
 impl Opts {
+    pub fn general_opts(&self) -> &wasm_tools::GeneralOpts {
+        &self.general
+    }
+
     pub fn run(&self) -> Result<()> {
-        self.verbosity.init_logger();
         let seed = match &self.input {
             Some(f) => {
                 std::fs::read(f).with_context(|| format!("failed to read '{}'", f.display()))?
@@ -297,6 +303,7 @@ impl wasm_smith::Config for CliAndJsonConfig {
         (min_uleb_size, u8, 1),
         (bulk_memory_enabled, bool, true),
         (reference_types_enabled, bool, true),
+        (tail_call_enabled, bool, true),
         (simd_enabled, bool, true),
         (relaxed_simd_enabled, bool, false),
         (exceptions_enabled, bool, false),

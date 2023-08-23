@@ -14,8 +14,8 @@
  */
 
 use crate::{
-    BinaryReader, BinaryReaderError, ConstExpr, ExternalKind, FromReader, Result, SectionLimited,
-    ValType,
+    BinaryReader, BinaryReaderError, ConstExpr, ExternalKind, FromReader, RefType, Result,
+    SectionLimited,
 };
 use std::ops::Range;
 
@@ -27,7 +27,7 @@ pub struct Element<'a> {
     /// The initial elements of the element segment.
     pub items: ElementItems<'a>,
     /// The type of the elements.
-    pub ty: ValType,
+    pub ty: RefType,
     /// The range of the the element segment.
     pub range: Range<usize>,
 }
@@ -40,7 +40,7 @@ pub enum ElementKind<'a> {
     /// The element segment is active.
     Active {
         /// The index of the table being initialized.
-        table_index: u32,
+        table_index: Option<u32>,
         /// The initial expression of the element segment.
         offset_expr: ConstExpr<'a>,
     },
@@ -91,9 +91,9 @@ impl<'a> FromReader<'a> for Element<'a> {
             }
         } else {
             let table_index = if flags & 0b010 == 0 {
-                0
+                None
             } else {
-                reader.read_var_u32()?
+                Some(reader.read_var_u32()?)
             };
             let offset_expr = reader.read()?;
             ElementKind::Active {
@@ -107,7 +107,7 @@ impl<'a> FromReader<'a> for Element<'a> {
                 reader.read()?
             } else {
                 match reader.read()? {
-                    ExternalKind::Func => ValType::FuncRef,
+                    ExternalKind::Func => RefType::FUNCREF,
                     _ => {
                         return Err(BinaryReaderError::new(
                             "only the function external type is supported in elem segment",
@@ -117,7 +117,7 @@ impl<'a> FromReader<'a> for Element<'a> {
                 }
             }
         } else {
-            ValType::FuncRef
+            RefType::FUNCREF
         };
         // FIXME(#188) ideally wouldn't have to do skips here
         let data = reader.skip(|reader| {

@@ -38,6 +38,10 @@ pub struct Opts {
 }
 
 impl Opts {
+    pub fn general_opts(&self) -> &wasm_tools::GeneralOpts {
+        self.io.general_opts()
+    }
+
     pub fn run(&self) -> Result<()> {
         // Note that here we're copying the contents of
         // `Validator::validate_all`, but the end is followed up with a parallel
@@ -89,6 +93,7 @@ fn parse_features(arg: &str) -> Result<WasmFeatures> {
 
     const FEATURES: &[(&str, fn(&mut WasmFeatures) -> &mut bool)] = &[
         ("reference-types", |f| &mut f.reference_types),
+        ("function-references", |f| &mut f.function_references),
         ("simd", |f| &mut f.simd),
         ("threads", |f| &mut f.threads),
         ("bulk-memory", |f| &mut f.bulk_memory),
@@ -106,6 +111,7 @@ fn parse_features(arg: &str) -> Result<WasmFeatures> {
         ("sign-extension", |f| &mut f.sign_extension),
         ("mutable-global", |f| &mut f.mutable_global),
         ("relaxed-simd", |f| &mut f.relaxed_simd),
+        ("gc", |f| &mut f.gc),
     ];
 
     for part in arg.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {

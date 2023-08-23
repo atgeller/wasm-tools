@@ -1,17 +1,18 @@
 use crate::metadata::{Bindgen, ModuleMetadata};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use indexmap::{map::Entry, IndexMap, IndexSet};
+use wasmparser::names::{KebabName, KebabNameKind};
 use wasmparser::{
-    types::Types, Encoding, ExternalKind, FuncType, Parser, Payload, TypeRef, ValType,
-    ValidPayload, Validator,
+    types::Types, ComponentExternName, Encoding, ExternalKind, FuncType, Parser, Payload, TypeRef,
+    ValType, ValidPayload, Validator,
 };
 use wit_parser::{
     abi::{AbiVariant, WasmSignature, WasmType},
-    Document, InterfaceId, WorldId,
+    Function, InterfaceId, PackageName, Resolve, WorldId, WorldItem, WorldKey,
 };
 
 fn is_canonical_function(name: &str) -> bool {
-    name.starts_with("cabi_")
+    name.starts_with("cabi_") || name.starts_with("canonical_abi_")
 }
 
 fn wasm_sig_to_func_type(signature: WasmSignature) -> FuncType {
@@ -31,6 +32,13 @@ fn wasm_sig_to_func_type(signature: WasmSignature) -> FuncType {
 }
 
 pub const MAIN_MODULE_IMPORT_NAME: &str = "__main_module__";
+
+/// The module name used when a top-level function in a world is imported into a
+/// core wasm module. Note that this is not a valid WIT identifier to avoid
+/// clashes with valid WIT interfaces. This is also not empty because LLVM
+/// interprets an empty module import string as "not specified" which means it
+/// turns into `env`.
+pub const BARE_FUNC_MODULE_NAME: &str = "$root";
 
 /// Metadata about a validated module and what was found internally.
 ///
@@ -64,6 +72,9 @@ pub struct ValidatedModule<'a> {
     /// Whether or not this module exported a `cabi_realloc` function.
     pub realloc: Option<&'a str>,
 
+    /// Whether or not this module exported a `cabi_realloc_adapter` function.
+    pub adapter_realloc: Option<&'a str>,
+
     /// The original metadata specified for this module.
     pub metadata: &'a ModuleMetadata,
 }
@@ -82,6 +93,7 @@ pub struct ValidatedModule<'a> {
 pub fn validate_module<'a>(
     bytes: &'a [u8],
     metadata: &'a Bindgen,
+    exports: &IndexSet<WorldKey>,
     adapters: &IndexSet<&str>,
 ) -> Result<ValidatedModule<'a>> {
     let mut validator = Validator::new();
@@ -93,6 +105,7 @@ pub fn validate_module<'a>(
         adapters_required: Default::default(),
         has_memory: false,
         realloc: None,
+        adapter_realloc: None,
         metadata: &metadata.metadata,
     };
 
@@ -132,8 +145,13 @@ pub fn validate_module<'a>(
                             if is_canonical_function(export.name) {
                                 // TODO: validate that the cabi_realloc
                                 // function is [i32, i32, i32, i32] -> [i32]
-                                if export.name == "cabi_realloc" {
+                                if export.name == "cabi_realloc"
+                                    || export.name == "canonical_abi_realloc"
+                                {
                                     ret.realloc = Some(export.name);
+                                }
+                                if export.name == "cabi_realloc_adapter" {
+                                    ret.adapter_realloc = Some(export.name);
                                 }
                                 continue;
                             }
@@ -154,17 +172,24 @@ pub fn validate_module<'a>(
     }
 
     let types = types.unwrap();
-    let world = &metadata.doc.worlds[metadata.world];
+    let world = &metadata.resolve.worlds[metadata.world];
 
     for (name, funcs) in &import_funcs {
-        if name.is_empty() {
-            bail!("module imports from an empty module name");
+        // An empty module name is indicative of the top-level import namespace,
+        // so look for top-level functions here.
+        if *name == BARE_FUNC_MODULE_NAME {
+            validate_imports_top_level(&metadata.resolve, metadata.world, funcs, &types)?;
+            let funcs = funcs.keys().cloned().collect();
+            let prev = ret.required_imports.insert(BARE_FUNC_MODULE_NAME, funcs);
+            assert!(prev.is_none());
+            continue;
         }
 
-        match world.imports.get(*name) {
-            Some(interface) => {
-                validate_imported_interface(&metadata.doc, *interface, name, funcs, &types)?;
-                let funcs = funcs.into_iter().map(|(f, _ty)| *f).collect();
+        match world.imports.get(&world_key(&metadata.resolve, name)) {
+            Some(WorldItem::Interface(interface)) => {
+                let funcs =
+                    validate_imported_interface(&metadata.resolve, *interface, name, funcs, &types)
+                        .with_context(|| format!("failed to validate import interface `{name}`"))?;
                 let prev = ret.required_imports.insert(name, funcs);
                 assert!(prev.is_none());
             }
@@ -175,20 +200,20 @@ pub fn validate_module<'a>(
                     map.insert(func, ty.clone().into());
                 }
             }
-            None => bail!("module requires an import interface named `{}`", name),
+            None | Some(WorldItem::Function(_) | WorldItem::Type(_)) => {
+                bail!("module requires an import interface named `{}`", name)
+            }
         }
     }
 
-    if let Some(interface) = world.default {
-        validate_exported_interface(&metadata.doc, interface, None, &export_funcs, &types)?;
-    }
-
-    for (name, interface) in world.exports.iter() {
-        if name.is_empty() {
-            bail!("cannot export an interface with an empty name");
-        }
-
-        validate_exported_interface(&metadata.doc, *interface, Some(name), &export_funcs, &types)?;
+    for name in exports {
+        validate_exported_item(
+            &metadata.resolve,
+            &world.exports[name],
+            &metadata.resolve.name_world_key(name),
+            &export_funcs,
+            &types,
+        )?;
     }
 
     Ok(ret)
@@ -202,7 +227,7 @@ pub struct ValidatedAdapter<'a> {
     /// If specified this is the list of required imports from the original set
     /// of possible imports along with the set of functions required from each
     /// imported interface.
-    pub required_imports: IndexMap<&'a str, IndexSet<&'a str>>,
+    pub required_imports: IndexMap<String, IndexSet<&'a str>>,
 
     /// This is the module and field name of the memory import, if one is
     /// specified.
@@ -242,7 +267,7 @@ pub struct ValidatedAdapter<'a> {
 /// didn't accidentally break the wasm module.
 pub fn validate_adapter_module<'a>(
     bytes: &[u8],
-    doc: &'a Document,
+    resolve: &'a Resolve,
     world: WorldId,
     metadata: &'a ModuleMetadata,
     required: &IndexMap<String, FuncType>,
@@ -339,15 +364,53 @@ pub fn validate_adapter_module<'a>(
         if name == MAIN_MODULE_IMPORT_NAME {
             ret.needs_core_exports
                 .extend(funcs.iter().map(|(name, _ty)| name.to_string()));
-        } else {
-            let interface = *doc.worlds[world]
+            continue;
+        }
+
+        // An empty module name is indicative of the top-level import namespace,
+        // so look for top-level functions here.
+        if name == BARE_FUNC_MODULE_NAME {
+            validate_imports_top_level(&resolve, world, &funcs, &types)?;
+            let funcs = resolve.worlds[world]
                 .imports
-                .get(name)
-                .ok_or_else(|| anyhow!("adapter module imports unknown module `{name}`"))?;
-            let required_funcs = validate_imported_interface(doc, interface, name, &funcs, &types)?;
-            let iface_name = &doc.interfaces[interface].name;
-            assert_eq!(iface_name, name);
-            ret.required_imports.insert(iface_name, required_funcs);
+                .iter()
+                .filter_map(|(name, item)| {
+                    let name = match name {
+                        WorldKey::Name(name) => name,
+                        WorldKey::Interface(_) => return None,
+                    };
+                    match item {
+                        WorldItem::Function(_) if funcs.contains_key(name.as_str()) => {
+                            Some(name.as_str())
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            ret.required_imports
+                .insert(BARE_FUNC_MODULE_NAME.to_string(), funcs);
+            continue;
+        }
+
+        match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
+            Some(WorldItem::Interface(interface)) => {
+                validate_imported_interface(resolve, *interface, name, &funcs, &types)
+                    .with_context(|| format!("failed to validate import interface `{name}`"))?;
+                let funcs = resolve.interfaces[*interface]
+                    .functions
+                    .keys()
+                    .map(|s| s.as_str())
+                    .filter(|s| funcs.contains_key(s))
+                    .collect();
+                let prev = ret.required_imports.insert(name.to_string(), funcs);
+                assert!(prev.is_none());
+            }
+            None | Some(WorldItem::Function(_) | WorldItem::Type(_)) => {
+                bail!(
+                    "adapter module requires an import interface named `{}`",
+                    name
+                )
+            }
         }
     }
 
@@ -375,8 +438,59 @@ pub fn validate_adapter_module<'a>(
     Ok(ret)
 }
 
+fn world_key(resolve: &Resolve, name: &str) -> WorldKey {
+    let name = if name.contains('/') {
+        ComponentExternName::Interface(name)
+    } else {
+        ComponentExternName::Kebab(name)
+    };
+    let kebab_name = KebabName::new(name, 0);
+    let (pkgname, interface) = match kebab_name.as_ref().map(|k| k.kind()) {
+        Ok(KebabNameKind::Id {
+            namespace,
+            package,
+            version,
+            interface,
+        }) => (
+            PackageName {
+                namespace: namespace.as_str().to_string(),
+                name: package.as_str().to_string(),
+                version,
+            },
+            interface.as_str(),
+        ),
+        _ => return WorldKey::Name(name.as_str().to_string()),
+    };
+    match resolve
+        .package_names
+        .get(&pkgname)
+        .and_then(|p| resolve.packages[*p].interfaces.get(interface))
+    {
+        Some(id) => WorldKey::Interface(*id),
+        None => WorldKey::Name(name.as_str().to_string()),
+    }
+}
+
+fn validate_imports_top_level<'a>(
+    resolve: &Resolve,
+    world: WorldId,
+    funcs: &IndexMap<&'a str, u32>,
+    types: &Types,
+) -> Result<()> {
+    for (name, ty) in funcs {
+        let func = match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
+            Some(WorldItem::Function(func)) => func,
+            Some(_) => bail!("expected world top-level import `{name}` to be a function"),
+            None => bail!("no top-level imported function `{name}` specified"),
+        };
+        let ty = types.func_type_at(*ty).unwrap();
+        validate_func(resolve, ty, func, AbiVariant::GuestImport)?;
+    }
+    Ok(())
+}
+
 fn validate_imported_interface<'a>(
-    doc: &'a Document,
+    resolve: &'a Resolve,
     interface: InterfaceId,
     name: &str,
     imports: &IndexMap<&str, u32>,
@@ -384,31 +498,17 @@ fn validate_imported_interface<'a>(
 ) -> Result<IndexSet<&'a str>> {
     let mut funcs = IndexSet::new();
     for (func_name, ty) in imports {
-        let f = doc.interfaces[interface]
+        let f = resolve.interfaces[interface]
             .functions
-            .iter()
-            .find(|f| f.name == *func_name)
+            .get(*func_name)
             .ok_or_else(|| {
                 anyhow!(
-                    "import interface `{}` is missing function `{}` that is required by the module",
-                    name,
-                    func_name,
+                    "import interface `{name}` is missing function `{func_name}` that is required by the module",
                 )
             })?;
 
-        let expected = wasm_sig_to_func_type(doc.wasm_signature(AbiVariant::GuestImport, f));
-        let ty: FuncType = types.func_type_at(*ty).unwrap().clone().into();
-        if ty != expected {
-            bail!(
-                "type mismatch for function `{}` on imported interface `{}`: expected `{:?} -> {:?}` but found `{:?} -> {:?}`",
-                f.name,
-                name,
-                expected.params(),
-                expected.results(),
-                ty.params(),
-                ty.results()
-            );
-        }
+        let ty = types.func_type_at(*ty).unwrap();
+        validate_func(resolve, ty, f, AbiVariant::GuestImport)?;
 
         funcs.insert(f.name.as_str());
     }
@@ -416,53 +516,61 @@ fn validate_imported_interface<'a>(
     Ok(funcs)
 }
 
-fn validate_exported_interface(
-    doc: &Document,
-    interface: InterfaceId,
-    export_name: Option<&str>,
+fn validate_func(
+    resolve: &Resolve,
+    ty: &wasmparser::IndexedFuncType,
+    func: &Function,
+    abi: AbiVariant,
+) -> Result<()> {
+    let expected = wasm_sig_to_func_type(resolve.wasm_signature(abi, func));
+    let params: Vec<ValType> = ty.params().iter().map(|x| x.clone()).collect();
+    let results: Vec<ValType> = ty.results().iter().map(|x| x.clone()).collect();
+    let ty = FuncType::new(params, results);
+    if ty != expected {
+        bail!(
+            "type mismatch for function `{}`: expected `{:?} -> {:?}` but found `{:?} -> {:?}`",
+            func.name,
+            expected.params(),
+            expected.results(),
+            ty.params(),
+            ty.results()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_exported_item(
+    resolve: &Resolve,
+    item: &WorldItem,
+    export_name: &str,
     exports: &IndexMap<&str, u32>,
     types: &Types,
 ) -> Result<()> {
-    for f in &doc.interfaces[interface].functions {
-        let expected_export_name = f.core_export_name(export_name);
+    let validate = |func: &Function, name: Option<&str>| {
+        let expected_export_name = func.core_export_name(name);
         match exports.get(expected_export_name.as_ref()) {
             Some(func_index) => {
-                let expected_ty =
-                    wasm_sig_to_func_type(doc.wasm_signature(AbiVariant::GuestExport, f));
-                let ty: FuncType = types.function_at(*func_index).unwrap().clone().into();
-                if ty == expected_ty {
-                    continue;
-                }
-                match export_name {
-                    Some(name) => {
-                        bail!(
-                            "type mismatch for function `{}` from exported interface `{name}`: \
-                                 expected `{:?} -> {:?}` but found `{:?} -> {:?}`",
-                            f.name,
-                            expected_ty.params(),
-                            expected_ty.results(),
-                            ty.params(),
-                            ty.results()
-                        );
-                    }
-                    None => {
-                        bail!(
-                            "type mismatch for default interface function `{}`: \
-                             expected `{:?} -> {:?}` but found `{:?} -> {:?}`",
-                            f.name,
-                            expected_ty.params(),
-                            expected_ty.results(),
-                            ty.params(),
-                            ty.results()
-                        );
-                    }
-                }
+                let ty = types.function_at(*func_index).unwrap();
+                validate_func(resolve, ty, func, AbiVariant::GuestExport)
             }
             None => bail!(
                 "module does not export required function `{}`",
                 expected_export_name
             ),
         }
+    };
+    match item {
+        WorldItem::Function(func) => validate(func, None)?,
+        WorldItem::Interface(interface) => {
+            for (_, f) in &resolve.interfaces[*interface].functions {
+                validate(f, Some(export_name)).with_context(|| {
+                    format!("failed to validate exported interface `{export_name}`")
+                })?;
+            }
+        }
+        // not required to have anything exported in the core wasm module
+        WorldItem::Type(_) => {}
     }
 
     Ok(())

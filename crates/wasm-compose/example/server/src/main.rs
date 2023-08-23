@@ -8,7 +8,15 @@ use tide::{
     utils::After,
     Request, Response, StatusCode,
 };
+use wasi_host::wasi;
+use wasi_cap_std_sync::WasiCtxBuilder;
 use wasmtime::{component::*, Config, Engine, Store};
+
+wasmtime::component::bindgen!({
+    path: "../service.wit",
+    world: "service",
+    async: true
+});
 
 /// Represents state stored in the tide application context.
 ///
@@ -25,6 +33,7 @@ impl State {
         // Enable component model support in Wasmtime
         let mut config = Config::default();
         config.wasm_component_model(true);
+        config.async_support(true);
 
         // Load the component from the given path
         let engine = Engine::new(&config)?;
@@ -33,42 +42,10 @@ impl State {
     }
 }
 
-#[derive(ComponentType, Lower)]
-#[component(record)]
-struct ServiceRequest {
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
-    body: Vec<u8>,
-}
-
-impl ServiceRequest {
-    async fn new(mut req: Request<State>) -> tide::Result<Self> {
-        // Convert the tide request to a service request.
-        let headers = req
-            .iter()
-            .map(|(n, v)| {
-                (
-                    n.as_str().as_bytes().to_vec(),
-                    v.as_str().as_bytes().to_vec(),
-                )
-            })
-            .collect();
-        let body = req.take_body().into_bytes().await?;
-
-        Ok(Self { headers, body })
-    }
-}
-
-#[derive(ComponentType, Lift)]
-#[component(record)]
-struct ServiceResponse {
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
-    body: Vec<u8>,
-}
-
-impl TryFrom<ServiceResponse> for tide::Response {
+impl TryFrom<handler::Response> for tide::Response {
     type Error = tide::Error;
 
-    fn try_from(r: ServiceResponse) -> Result<Self, Self::Error> {
+    fn try_from(r: handler::Response) -> Result<Self, Self::Error> {
         // Convert the service response to a tide response
         let mut builder = tide::Response::builder(StatusCode::Ok);
         for (name, value) in r.headers {
@@ -82,24 +59,15 @@ impl TryFrom<ServiceResponse> for tide::Response {
     }
 }
 
-#[derive(ComponentType, Lift)]
-#[component(enum)]
-enum ServiceError {
-    #[component(name = "bad-request")]
-    BadRequest,
-}
-
-impl From<ServiceError> for tide::Error {
-    fn from(e: ServiceError) -> Self {
-        match e {
-            ServiceError::BadRequest => {
+impl handler::Error {
+    fn into_tide(self) -> tide::Error {
+        match self {
+            Self::BadRequest => {
                 tide::Error::from_str(StatusCode::BadRequest, "bad service request")
             }
         }
     }
 }
-
-type ServiceResult = Result<ServiceResponse, ServiceError>;
 
 /// WebAssembly component server.
 ///
@@ -144,24 +112,40 @@ impl ServerApp {
         app.listen(address).await.map_err(Into::into)
     }
 
-    async fn process_request(req: Request<State>) -> tide::Result {
-        let state = req.state();
+    async fn process_request(mut req: Request<State>) -> tide::Result {
+        let body = req.body_bytes().await?;
+        let headers = req
+            .iter()
+            .map(|(n, v)| (n.as_str().as_bytes(), v.as_str().as_bytes()))
+            .collect::<Vec<_>>();
 
         // Create a new store for the request
-        let mut store = Store::new(&state.engine, ());
-        let linker: Linker<()> = Linker::new(&state.engine);
+        let state = req.state();
+        let mut linker = Linker::new(&state.engine);
+        let wasi_ctx = WasiCtxBuilder::new()
+            .inherit_stdio()
+            .build();
+        
+        wasi::environment::add_to_linker(&mut linker, |x| x)?;
+        wasi::filesystem::add_to_linker(&mut linker, |x| x)?;
+        wasi::preopens::add_to_linker(&mut linker, |x| x)?;
+        wasi::streams::add_to_linker(&mut linker, |x| x)?;
+        wasi::exit::add_to_linker(&mut linker, |x| x)?;
 
-        // Instantiate the service component and get its `execute` export
-        let instance = linker.instantiate(&mut store, &state.component)?;
-        let execute = instance
-            .get_typed_func::<(ServiceRequest,), (ServiceResult,), _>(&mut store, "execute")?;
-
-        // Call the `execute` export with the request and translate the response
-        execute
-            .call(&mut store, (ServiceRequest::new(req).await?,))?
-            .0
-            .map_err(Into::into)
-            .and_then(TryInto::try_into)
+        let mut store = Store::new(&state.engine, wasi_ctx);
+        let (service, _) = Service::instantiate_async(&mut store, &state.component, &linker).await?;
+        service
+            .handler
+            .call_execute(
+                &mut store,
+                handler::Request {
+                    headers: &headers,
+                    body: &body,
+                },
+            )
+            .await?
+            .map(TryInto::try_into)
+            .map_err(handler::Error::into_tide)?
     }
 }
 

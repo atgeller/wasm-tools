@@ -1,8 +1,8 @@
 use crate::{Error, Result};
 use std::convert::TryFrom;
-use wasm_encoder::{BlockType, ValType};
+use wasm_encoder::{BlockType, HeapType, RefType, ValType};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum PrimitiveTypeInfo {
     I32,
     I64,
@@ -34,8 +34,17 @@ impl From<wasmparser::ValType> for PrimitiveTypeInfo {
             wasmparser::ValType::F32 => PrimitiveTypeInfo::F32,
             wasmparser::ValType::F64 => PrimitiveTypeInfo::F64,
             wasmparser::ValType::V128 => PrimitiveTypeInfo::V128,
-            wasmparser::ValType::FuncRef => PrimitiveTypeInfo::FuncRef,
-            wasmparser::ValType::ExternRef => PrimitiveTypeInfo::ExternRef,
+            wasmparser::ValType::Ref(t) => t.into(),
+        }
+    }
+}
+
+impl From<wasmparser::RefType> for PrimitiveTypeInfo {
+    fn from(value: wasmparser::RefType) -> Self {
+        match value {
+            wasmparser::RefType::FUNCREF => PrimitiveTypeInfo::FuncRef,
+            wasmparser::RefType::EXTERNREF => PrimitiveTypeInfo::ExternRef,
+            _ => unimplemented!(),
         }
     }
 }
@@ -57,6 +66,9 @@ impl TryFrom<wasmparser::Type> for TypeInfo {
                     .map(|&t| PrimitiveTypeInfo::from(t))
                     .collect(),
             })),
+            wasmparser::Type::Array(_) => {
+                unimplemented!("Array and struct types are not supported yet.")
+            }
         }
     }
 }
@@ -68,9 +80,27 @@ pub fn map_type(tpe: wasmparser::ValType) -> Result<ValType> {
         wasmparser::ValType::F32 => Ok(ValType::F32),
         wasmparser::ValType::F64 => Ok(ValType::F64),
         wasmparser::ValType::V128 => Ok(ValType::V128),
-        wasmparser::ValType::FuncRef => Ok(ValType::FuncRef),
-        wasmparser::ValType::ExternRef => Ok(ValType::ExternRef),
+        wasmparser::ValType::Ref(t) => Ok(ValType::Ref(map_ref_type(t)?)),
     }
+}
+
+pub fn map_ref_type(ref_ty: wasmparser::RefType) -> Result<RefType> {
+    Ok(RefType {
+        nullable: ref_ty.is_nullable(),
+        heap_type: match ref_ty.heap_type() {
+            wasmparser::HeapType::Func => HeapType::Func,
+            wasmparser::HeapType::Extern => HeapType::Extern,
+            wasmparser::HeapType::Any => HeapType::Any,
+            wasmparser::HeapType::None => HeapType::None,
+            wasmparser::HeapType::NoExtern => HeapType::NoExtern,
+            wasmparser::HeapType::NoFunc => HeapType::NoFunc,
+            wasmparser::HeapType::Eq => HeapType::Eq,
+            wasmparser::HeapType::Struct => HeapType::Struct,
+            wasmparser::HeapType::Array => HeapType::Array,
+            wasmparser::HeapType::I31 => HeapType::I31,
+            wasmparser::HeapType::Indexed(i) => HeapType::Indexed(i.into()),
+        },
+    })
 }
 
 pub fn map_block_type(ty: wasmparser::BlockType) -> Result<BlockType> {

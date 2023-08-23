@@ -132,6 +132,9 @@ fn smoke_test_imports_config() {
                     for ty in rdr {
                         match ty.unwrap() {
                             wasmparser::Type::Func(ft) => sig_types.push(ft),
+                            wasmparser::Type::Array(_) => {
+                                unimplemented!("Array and struct types are not supported yet.")
+                            }
                         }
                     }
                 } else if let wasmparser::Payload::ImportSection(rdr) = payload {
@@ -151,7 +154,7 @@ fn smoke_test_imports_config() {
                                 *seen = true
                             }
                             (Some((seen, I::Table(t))), TypeRef::Table(tt))
-                                if *t == tt.element_type =>
+                                if *t == ValType::Ref(tt.element_type) =>
                             {
                                 *seen = true
                             }
@@ -221,6 +224,7 @@ fn wasm_features() -> WasmFeatures {
         relaxed_simd: true,
         memory64: true,
         exceptions: true,
+        tail_call: true,
         ..WasmFeatures::default()
     }
 }
@@ -252,7 +256,7 @@ fn import_config(
             ("env", "pipo", Func(&[I32], &[I32])),
             ("env", "popo", Func(&[], &[I32, I32])),
             ("env", "mem", Memory),
-            ("env", "tbl", Table(FuncRef)),
+            ("env", "tbl", Table(ValType::FUNCREF)),
             ("vars", "g", Global(I64)),
             ("tags", "tag1", Tag(&[I32])),
         ]
@@ -293,13 +297,16 @@ fn parser_features_from_config(config: &impl Config) -> WasmFeatures {
         multi_memory: config.max_memories() > 1,
         exceptions: config.exceptions_enabled(),
         memory64: config.memory64_enabled(),
+        tail_call: config.tail_call_enabled(),
 
         threads: false,
-        tail_call: false,
         floats: true,
         extended_const: false,
         component_model: false,
         precheck: true,
+        function_references: false,
+        memory_control: false,
+        gc: false,
     }
 }
 

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::*;
 use crate::{encoding_size, CustomSection, Encode, ExportKind, NameMap, SectionId};
 
@@ -124,15 +126,19 @@ impl ComponentNameSection {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+
+    /// View the encoded section as a CustomSection.
+    pub fn as_custom<'a>(&'a self) -> CustomSection<'a> {
+        CustomSection {
+            name: "component-name".into(),
+            data: Cow::Borrowed(&self.bytes),
+        }
+    }
 }
 
 impl Encode for ComponentNameSection {
     fn encode(&self, sink: &mut Vec<u8>) {
-        CustomSection {
-            name: "component-name",
-            data: &self.bytes,
-        }
-        .encode(sink);
+        self.as_custom().encode(sink);
     }
 }
 

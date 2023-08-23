@@ -13,7 +13,7 @@ use std::{
     rc::Rc,
 };
 use wasm_encoder::{ComponentTypeRef, ComponentValType, PrimitiveValType, TypeBounds, ValType};
-use wasmparser::types::KebabString;
+use wasmparser::names::KebabString;
 
 mod encode;
 
@@ -637,12 +637,9 @@ impl ComponentBuilder {
             && (for_type_def || scope.types.len() < self.config.max_types())
         {
             choices.push(|me, u| {
-                Ok(ComponentTypeRef::Type(
-                    TypeBounds::Eq,
-                    u.int_in_range(
-                        0..=u32::try_from(me.current_type_scope().types.len() - 1).unwrap(),
-                    )?,
-                ))
+                Ok(ComponentTypeRef::Type(TypeBounds::Eq(u.int_in_range(
+                    0..=u32::try_from(me.current_type_scope().types.len() - 1).unwrap(),
+                )?)))
             });
         }
 
@@ -1114,6 +1111,11 @@ impl ComponentBuilder {
         // Export.
         if self.current_type_scope().can_ref_type() {
             choices.push(|me, exports, export_urls, u, _type_fuel| {
+                let ty = me.arbitrary_type_ref(u, false, true)?.unwrap();
+                if let ComponentTypeRef::Type(TypeBounds::Eq(idx)) = ty {
+                    let ty = me.current_type_scope().get(idx).clone();
+                    me.current_type_scope_mut().push(ty);
+                }
                 Ok(InstanceTypeDecl::Export {
                     name: crate::unique_kebab_string(100, exports, u)?,
                     url: if u.arbitrary()? {
@@ -1121,7 +1123,7 @@ impl ComponentBuilder {
                     } else {
                         None
                     },
-                    ty: me.arbitrary_type_ref(u, false, true)?.unwrap(),
+                    ty,
                 })
             });
         }
@@ -1550,9 +1552,12 @@ impl ComponentBuilder {
                 self.total_values += 1;
                 self.component_mut().values.push(ty);
             }
-            ComponentTypeRef::Type(TypeBounds::Eq, ty_index) => {
+            ComponentTypeRef::Type(TypeBounds::Eq(ty_index)) => {
                 let ty = self.current_type_scope().get(ty_index).clone();
                 self.current_type_scope_mut().push(ty);
+            }
+            ComponentTypeRef::Type(TypeBounds::SubResource) => {
+                unimplemented!()
             }
             ComponentTypeRef::Instance(ty_index) => {
                 let instance_ty = match self.current_type_scope().get(ty_index).as_ref() {
@@ -1863,7 +1868,7 @@ fn inverse_scalar_canonical_abi_for(
             .cloned(),
         ValType::F32 => Ok(ComponentValType::Primitive(PrimitiveValType::Float32)),
         ValType::F64 => Ok(ComponentValType::Primitive(PrimitiveValType::Float64)),
-        ValType::V128 | ValType::FuncRef | ValType::ExternRef => {
+        ValType::V128 | ValType::Ref(_) => {
             unreachable!("not used in canonical ABI")
         }
     };
@@ -2005,9 +2010,6 @@ enum InstanceExportAliasKind {
     Instance,
     Func,
     Value,
-    Table,
-    Memory,
-    Global,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

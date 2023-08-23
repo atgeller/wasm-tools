@@ -1,48 +1,103 @@
-use anyhow::Result;
+use crate::{Error, UnresolvedPackage};
+use anyhow::{bail, Context, Result};
 use lex::{Span, Token, Tokenizer};
+use semver::Version;
 use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 pub mod lex;
 
 pub use resolve::Resolver;
 mod resolve;
+pub mod toposort;
 
 pub use lex::validate_id;
 
 pub struct Ast<'a> {
-    pub items: Vec<AstItem<'a>>,
+    package_id: Option<PackageName<'a>>,
+    items: Vec<AstItem<'a>>,
 }
 
 impl<'a> Ast<'a> {
     pub fn parse(lexer: &mut Tokenizer<'a>) -> Result<Self> {
         let mut items = Vec::new();
+        let mut package_id = None;
+        if lexer.eat(Token::Package)? {
+            package_id = Some(PackageName::parse(lexer)?);
+        }
         while lexer.clone().next()?.is_some() {
             let docs = parse_docs(lexer)?;
             items.push(AstItem::parse(lexer, docs)?);
         }
-        Ok(Self { items })
+        Ok(Self { package_id, items })
     }
 
-    pub fn worlds(&self) -> impl Iterator<Item = &World<'a>> {
-        self.items.iter().filter_map(|item| match item {
-            AstItem::World(item) => Some(item),
-            AstItem::Interface(_) => None,
-        })
-    }
+    fn for_each_path<'b>(
+        &'b self,
+        mut f: impl FnMut(Option<&'b Id<'a>>, &'b UsePath<'a>, Option<&'b [UseName<'a>]>) -> Result<()>,
+    ) -> Result<()> {
+        for item in self.items.iter() {
+            match item {
+                AstItem::World(world) => {
+                    // Visit imports here first before exports to help preserve
+                    // round-tripping of documents because printing a world puts
+                    // imports first but textually they can be listed with
+                    // exports first.
+                    let mut imports = Vec::new();
+                    let mut exports = Vec::new();
+                    for item in world.items.iter() {
+                        match item {
+                            WorldItem::Use(u) => f(None, &u.from, Some(&u.names))?,
+                            WorldItem::Type(_) => {}
+                            WorldItem::Import(Import { kind, .. }) => imports.push(kind),
+                            WorldItem::Export(Export { kind, .. }) => exports.push(kind),
+                        }
+                    }
 
-    pub fn interfaces(&self) -> impl Iterator<Item = &Interface<'a>> {
-        self.items.iter().filter_map(|item| match item {
-            AstItem::Interface(item) => Some(item),
-            AstItem::World(_) => None,
-        })
+                    let mut visit_kind = |kind: &'b ExternKind<'a>| match kind {
+                        ExternKind::Interface(_, items) => {
+                            for item in items {
+                                match item {
+                                    InterfaceItem::Use(u) => f(None, &u.from, Some(&u.names))?,
+                                    _ => {}
+                                }
+                            }
+                            Ok(())
+                        }
+                        ExternKind::Path(path) => f(None, path, None),
+                        ExternKind::Func(..) => Ok(()),
+                    };
+
+                    for kind in imports {
+                        visit_kind(kind)?;
+                    }
+                    for kind in exports {
+                        visit_kind(kind)?;
+                    }
+                }
+                AstItem::Interface(i) => {
+                    for item in i.items.iter() {
+                        match item {
+                            InterfaceItem::Use(u) => f(Some(&i.name), &u.from, Some(&u.names))?,
+                            _ => {}
+                        }
+                    }
+                }
+                AstItem::Use(u) => {
+                    f(None, &u.item, None)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-pub enum AstItem<'a> {
+enum AstItem<'a> {
     Interface(Interface<'a>),
     World(World<'a>),
+    Use(ToplevelUse<'a>),
 }
 
 impl<'a> AstItem<'a> {
@@ -50,12 +105,68 @@ impl<'a> AstItem<'a> {
         match tokens.clone().next()? {
             Some((_span, Token::Interface)) => Interface::parse(tokens, docs).map(Self::Interface),
             Some((_span, Token::World)) => World::parse(tokens, docs).map(Self::World),
-            other => Err(err_expected(tokens, "`default`, `world` or `interface`", other).into()),
+            Some((_span, Token::Use)) => ToplevelUse::parse(tokens).map(Self::Use),
+            other => Err(err_expected(tokens, "`world`, `interface` or `use`", other).into()),
         }
     }
 }
 
-pub struct World<'a> {
+#[derive(Debug, Clone)]
+struct PackageName<'a> {
+    span: Span,
+    namespace: Id<'a>,
+    name: Id<'a>,
+    version: Option<(Span, Version)>,
+}
+
+impl<'a> PackageName<'a> {
+    fn parse(tokens: &mut Tokenizer<'a>) -> Result<Self> {
+        let namespace = parse_id(tokens)?;
+        tokens.expect(Token::Colon)?;
+        let name = parse_id(tokens)?;
+        let version = parse_opt_version(tokens)?;
+        Ok(PackageName {
+            span: Span {
+                start: namespace.span.start,
+                end: version
+                    .as_ref()
+                    .map(|(s, _)| s.end)
+                    .unwrap_or(name.span.end),
+            },
+            namespace,
+            name,
+            version,
+        })
+    }
+
+    fn package_name(&self) -> crate::PackageName {
+        crate::PackageName {
+            namespace: self.namespace.name.to_string(),
+            name: self.name.name.to_string(),
+            version: self.version.as_ref().map(|(_, v)| v.clone()),
+        }
+    }
+}
+
+struct ToplevelUse<'a> {
+    item: UsePath<'a>,
+    as_: Option<Id<'a>>,
+}
+
+impl<'a> ToplevelUse<'a> {
+    fn parse(tokens: &mut Tokenizer<'a>) -> Result<Self> {
+        tokens.expect(Token::Use)?;
+        let item = UsePath::parse(tokens)?;
+        let as_ = if tokens.eat(Token::As)? {
+            Some(parse_id(tokens)?)
+        } else {
+            None
+        };
+        Ok(ToplevelUse { item, as_ })
+    }
+}
+
+struct World<'a> {
     docs: Docs<'a>,
     name: Id<'a>,
     items: Vec<WorldItem<'a>>,
@@ -73,95 +184,124 @@ impl<'a> World<'a> {
         tokens.expect(Token::LeftBrace)?;
         let mut items = Vec::new();
         loop {
+            let docs = parse_docs(tokens)?;
             if tokens.eat(Token::RightBrace)? {
                 break;
             }
-            items.push(WorldItem::parse(tokens)?);
+            items.push(WorldItem::parse(tokens, docs)?);
         }
         Ok(items)
     }
 }
 
-pub enum WorldItem<'a> {
+enum WorldItem<'a> {
     Import(Import<'a>),
     Export(Export<'a>),
-    ExportDefault(ExternKind<'a>),
+    Use(Use<'a>),
+    Type(TypeDef<'a>),
 }
 
 impl<'a> WorldItem<'a> {
-    fn parse(tokens: &mut Tokenizer<'a>) -> Result<WorldItem<'a>> {
+    fn parse(tokens: &mut Tokenizer<'a>, docs: Docs<'a>) -> Result<WorldItem<'a>> {
         match tokens.clone().next()? {
-            Some((_span, Token::Import)) => Import::parse(tokens).map(WorldItem::Import),
-            Some((_span, Token::Export)) => Export::parse(tokens).map(WorldItem::Export),
-            Some((_span, Token::Default)) => {
-                tokens.expect(Token::Default)?;
-                tokens.expect(Token::Export)?;
-                ExternKind::parse(tokens).map(WorldItem::ExportDefault)
+            Some((_span, Token::Import)) => Import::parse(tokens, docs).map(WorldItem::Import),
+            Some((_span, Token::Export)) => Export::parse(tokens, docs).map(WorldItem::Export),
+            Some((_span, Token::Use)) => Use::parse(tokens).map(WorldItem::Use),
+            Some((_span, Token::Type)) => TypeDef::parse(tokens, docs).map(WorldItem::Type),
+            Some((_span, Token::Flags)) => TypeDef::parse_flags(tokens, docs).map(WorldItem::Type),
+            Some((_span, Token::Record)) => {
+                TypeDef::parse_record(tokens, docs).map(WorldItem::Type)
             }
-            other => Err(err_expected(tokens, "`import` or `export`", other).into()),
+            Some((_span, Token::Variant)) => {
+                TypeDef::parse_variant(tokens, docs).map(WorldItem::Type)
+            }
+            Some((_span, Token::Union)) => TypeDef::parse_union(tokens, docs).map(WorldItem::Type),
+            Some((_span, Token::Enum)) => TypeDef::parse_enum(tokens, docs).map(WorldItem::Type),
+            other => Err(err_expected(
+                tokens,
+                "`import`, `export`, `use`, or type definition",
+                other,
+            )
+            .into()),
         }
     }
 }
 
-pub struct Import<'a> {
-    name: Id<'a>,
+struct Import<'a> {
+    docs: Docs<'a>,
     kind: ExternKind<'a>,
 }
 
 impl<'a> Import<'a> {
-    fn parse(tokens: &mut Tokenizer<'a>) -> Result<Import<'a>> {
+    fn parse(tokens: &mut Tokenizer<'a>, docs: Docs<'a>) -> Result<Import<'a>> {
         tokens.expect(Token::Import)?;
-        let name = parse_id(tokens)?;
-        tokens.expect(Token::Colon)?;
         let kind = ExternKind::parse(tokens)?;
-        Ok(Import { name, kind })
+        Ok(Import { docs, kind })
     }
 }
 
-pub struct Export<'a> {
-    name: Id<'a>,
+struct Export<'a> {
+    docs: Docs<'a>,
     kind: ExternKind<'a>,
 }
 
 impl<'a> Export<'a> {
-    fn parse(tokens: &mut Tokenizer<'a>) -> Result<Export<'a>> {
+    fn parse(tokens: &mut Tokenizer<'a>, docs: Docs<'a>) -> Result<Export<'a>> {
         tokens.expect(Token::Export)?;
-        let name = parse_id(tokens)?;
-        tokens.expect(Token::Colon)?;
         let kind = ExternKind::parse(tokens)?;
-        Ok(Export { name, kind })
+        Ok(Export { docs, kind })
     }
 }
 
-pub enum ExternKind<'a> {
-    Interface(Span, Vec<InterfaceItem<'a>>),
-    Id(Id<'a>),
+enum ExternKind<'a> {
+    Interface(Id<'a>, Vec<InterfaceItem<'a>>),
+    Path(UsePath<'a>),
+    Func(Id<'a>, Func<'a>),
 }
 
 impl<'a> ExternKind<'a> {
     fn parse(tokens: &mut Tokenizer<'a>) -> Result<ExternKind<'a>> {
-        match tokens.clone().next()? {
-            Some((_span, Token::Id | Token::StrLit | Token::ExplicitId)) => {
-                parse_id(tokens).map(ExternKind::Id)
+        // Create a copy of the token stream to test out if this is a function
+        // or an interface import. In those situations the token stream gets
+        // reset to the state of the clone and we continue down those paths.
+        //
+        // If neither a function nor an interface appears here though then the
+        // clone is thrown away and the original token stream is parsed for an
+        // interface. This will redo the original ID parse and the original
+        // colon parse, but that shouldn't be too too bad perf-wise.
+        let mut clone = tokens.clone();
+        let id = parse_id(&mut clone)?;
+        if clone.eat(Token::Colon)? {
+            // import foo: func(...)
+            if clone.clone().eat(Token::Func)? {
+                *tokens = clone;
+                return Ok(ExternKind::Func(id, Func::parse(tokens)?));
             }
-            Some((_span, Token::Interface)) => {
-                let span = tokens.expect(Token::Interface)?;
-                let items = Interface::parse_items(tokens)?;
-                Ok(ExternKind::Interface(span, items))
+
+            // import foo: interface { ... }
+            if clone.eat(Token::Interface)? {
+                *tokens = clone;
+                return Ok(ExternKind::Interface(id, Interface::parse_items(tokens)?));
             }
-            other => Err(err_expected(tokens, "path, value, or interface", other).into()),
         }
+
+        // import foo
+        // import foo/bar
+        // import foo:bar/baz
+        Ok(ExternKind::Path(UsePath::parse(tokens)?))
     }
 
     fn span(&self) -> Span {
         match self {
-            ExternKind::Interface(span, _) => *span,
-            ExternKind::Id(id) => id.span,
+            ExternKind::Interface(id, _) => id.span,
+            ExternKind::Path(UsePath::Id(id)) => id.span,
+            ExternKind::Path(UsePath::Package { name, .. }) => name.span,
+            ExternKind::Func(id, _) => id.span,
         }
     }
 }
 
-pub struct Interface<'a> {
+struct Interface<'a> {
     docs: Docs<'a>,
     name: Id<'a>,
     items: Vec<InterfaceItem<'a>>,
@@ -189,27 +329,98 @@ impl<'a> Interface<'a> {
     }
 }
 
-pub enum InterfaceItem<'a> {
+enum InterfaceItem<'a> {
     TypeDef(TypeDef<'a>),
     Value(Value<'a>),
+    Use(Use<'a>),
 }
 
-pub struct Id<'a> {
-    pub name: Cow<'a, str>,
-    pub span: Span,
+struct Use<'a> {
+    from: UsePath<'a>,
+    names: Vec<UseName<'a>>,
 }
 
-impl<'a> From<&'a str> for Id<'a> {
-    fn from(s: &'a str) -> Id<'a> {
-        Id {
-            name: s.into(),
-            span: Span { start: 0, end: 0 },
+#[derive(Debug)]
+enum UsePath<'a> {
+    Id(Id<'a>),
+    Package { id: PackageName<'a>, name: Id<'a> },
+}
+
+impl<'a> UsePath<'a> {
+    fn parse(tokens: &mut Tokenizer<'a>) -> Result<Self> {
+        let id = parse_id(tokens)?;
+        if tokens.eat(Token::Colon)? {
+            // `foo:bar/baz@1.0`
+            let namespace = id;
+            let pkg_name = parse_id(tokens)?;
+            tokens.expect(Token::Slash)?;
+            let name = parse_id(tokens)?;
+            let version = parse_opt_version(tokens)?;
+            Ok(UsePath::Package {
+                id: PackageName {
+                    span: Span {
+                        start: namespace.span.start,
+                        end: pkg_name.span.end,
+                    },
+                    namespace,
+                    name: pkg_name,
+                    version,
+                },
+                name,
+            })
+        } else {
+            // `foo`
+            Ok(UsePath::Id(id))
+        }
+    }
+
+    fn name(&self) -> &Id<'a> {
+        match self {
+            UsePath::Id(id) => id,
+            UsePath::Package { name, .. } => name,
         }
     }
 }
 
-impl<'a> From<String> for Id<'a> {
-    fn from(s: String) -> Id<'a> {
+struct UseName<'a> {
+    name: Id<'a>,
+    as_: Option<Id<'a>>,
+}
+
+impl<'a> Use<'a> {
+    fn parse(tokens: &mut Tokenizer<'a>) -> Result<Self> {
+        tokens.expect(Token::Use)?;
+        let from = UsePath::parse(tokens)?;
+        tokens.expect(Token::Period)?;
+        tokens.expect(Token::LeftBrace)?;
+
+        let mut names = Vec::new();
+        while !tokens.eat(Token::RightBrace)? {
+            let mut name = UseName {
+                name: parse_id(tokens)?,
+                as_: None,
+            };
+            if tokens.eat(Token::As)? {
+                name.as_ = Some(parse_id(tokens)?);
+            }
+            names.push(name);
+            if !tokens.eat(Token::Comma)? {
+                tokens.expect(Token::RightBrace)?;
+                break;
+            }
+        }
+        Ok(Use { from, names })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Id<'a> {
+    name: &'a str,
+    span: Span,
+}
+
+impl<'a> From<&'a str> for Id<'a> {
+    fn from(s: &'a str) -> Id<'a> {
         Id {
             name: s.into(),
             span: Span { start: 0, end: 0 },
@@ -222,7 +433,7 @@ pub struct Docs<'a> {
     docs: Vec<Cow<'a, str>>,
 }
 
-pub struct TypeDef<'a> {
+struct TypeDef<'a> {
     docs: Docs<'a>,
     name: Id<'a>,
     ty: Type<'a>,
@@ -306,7 +517,7 @@ struct Stream<'a> {
     end: Option<Box<Type<'a>>>,
 }
 
-pub struct Value<'a> {
+struct Value<'a> {
     docs: Docs<'a>,
     name: Id<'a>,
     kind: ValueKind<'a>,
@@ -352,6 +563,7 @@ impl<'a> Func<'a> {
             })
         }
 
+        tokens.expect(Token::Func)?;
         let params = parse_params(tokens, true)?;
         let results = if tokens.eat(Token::RArrow)? {
             // If we eat a '(', parse the remainder of the named
@@ -372,7 +584,6 @@ impl<'a> Func<'a> {
 
 impl<'a> ValueKind<'a> {
     fn parse(tokens: &mut Tokenizer<'a>) -> Result<ValueKind<'a>> {
-        tokens.eat(Token::Func)?;
         Func::parse(tokens).map(ValueKind::Func)
     }
 }
@@ -399,6 +610,7 @@ impl<'a> InterfaceItem<'a> {
             Some((_span, Token::Id)) | Some((_span, Token::ExplicitId)) => {
                 Value::parse(tokens, docs).map(InterfaceItem::Value)
             }
+            Some((_span, Token::Use)) => Use::parse(tokens).map(InterfaceItem::Use),
             other => Err(err_expected(tokens, "`type` or `func`", other).into()),
         }
     }
@@ -522,19 +734,65 @@ impl<'a> Value<'a> {
 
 fn parse_id<'a>(tokens: &mut Tokenizer<'a>) -> Result<Id<'a>> {
     match tokens.next()? {
-        Some((span, Token::StrLit)) => Ok(Id {
-            name: tokens.parse_str(span)?.into(),
-            span,
-        }),
         Some((span, Token::Id)) => Ok(Id {
-            name: tokens.parse_id(span)?.into(),
+            name: tokens.parse_id(span)?,
             span,
         }),
         Some((span, Token::ExplicitId)) => Ok(Id {
-            name: tokens.parse_explicit_id(span)?.into(),
+            name: tokens.parse_explicit_id(span)?,
             span,
         }),
         other => Err(err_expected(tokens, "an identifier or string", other).into()),
+    }
+}
+
+fn parse_opt_version(tokens: &mut Tokenizer<'_>) -> Result<Option<(Span, Version)>> {
+    if !tokens.eat(Token::At)? {
+        return Ok(None);
+    }
+    let start = tokens.expect(Token::Integer)?.start;
+    tokens.expect(Token::Period)?;
+    tokens.expect(Token::Integer)?;
+    tokens.expect(Token::Period)?;
+    let end = tokens.expect(Token::Integer)?.end;
+    let mut span = Span { start, end };
+    eat_ids(tokens, Token::Minus, &mut span)?;
+    eat_ids(tokens, Token::Plus, &mut span)?;
+    let string = tokens.get_span(span);
+    let version = Version::parse(string).map_err(|e| Error {
+        span,
+        msg: e.to_string(),
+    })?;
+    return Ok(Some((span, version)));
+
+    fn eat_ids(tokens: &mut Tokenizer<'_>, prefix: Token, end: &mut Span) -> Result<()> {
+        if !tokens.eat(prefix)? {
+            return Ok(());
+        }
+        loop {
+            match tokens.next()? {
+                Some((span, Token::Id)) | Some((span, Token::Integer)) => end.end = span.end,
+                other => break Err(err_expected(tokens, "an id or integer", other).into()),
+            }
+
+            // If there's no trailing period, then this semver identifier is
+            // done.
+            let mut clone = tokens.clone();
+            if !clone.eat(Token::Period)? {
+                break Ok(());
+            }
+
+            // If there's more to the identifier, then eat the period for real
+            // and continue
+            if clone.eat(Token::Id)? || clone.eat(Token::Integer)? {
+                tokens.eat(Token::Period)?;
+                continue;
+            }
+
+            // Otherwise for something like `use foo:bar/baz@1.2.3+foo.{` stop
+            // the parsing here.
+            break Ok(());
+        }
     }
 }
 
@@ -729,79 +987,221 @@ fn err_expected(
     }
 }
 
-#[derive(Debug)]
-struct Error {
-    span: Span,
-    msg: String,
+/// A listing of source files which are used to get parsed into an
+/// [`UnresolvedPackage`].
+#[derive(Clone, Default)]
+pub struct SourceMap {
+    sources: Vec<Source>,
+    offset: u32,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.msg.fmt(f)
+#[derive(Clone)]
+struct Source {
+    offset: u32,
+    path: PathBuf,
+    contents: String,
+}
+
+impl SourceMap {
+    /// Creates a new empty source map.
+    pub fn new() -> SourceMap {
+        SourceMap::default()
     }
-}
 
-impl std::error::Error for Error {}
+    /// Reads the file `path` on the filesystem and appends its contents to this
+    /// [`SourceMap`].
+    pub fn push_file(&mut self, path: &Path) -> Result<()> {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read file {path:?}"))?;
+        self.push(path, contents);
+        Ok(())
+    }
 
-pub fn rewrite_error(err: &mut anyhow::Error, file: &str, contents: &str) {
-    let parse = match err.downcast_mut::<Error>() {
-        Some(err) => err,
-        None => return lex::rewrite_error(err, file, contents),
-    };
-    let msg = highlight_err(
-        parse.span.start as usize,
-        Some(parse.span.end as usize),
-        file,
-        contents,
-        &parse.msg,
-    );
-    *err = anyhow::anyhow!("{}", msg);
-}
+    /// Appends the given contents with the given path into this source map.
+    ///
+    /// The `path` provided is not read from the filesystem and is instead only
+    /// used during error messages. Each file added to a [`SourceMap`] is
+    /// used to create the final parsed package namely by unioning all the
+    /// interfaces and worlds defined together. Note that each file has its own
+    /// personal namespace, however, for top-level `use` and such.
+    pub fn push(&mut self, path: &Path, contents: impl Into<String>) {
+        let mut contents = contents.into();
+        if path.extension().and_then(|s| s.to_str()) == Some("md") {
+            log::debug!("automatically unwrapping markdown container");
+            contents = unwrap_md(&contents);
+        }
+        let new_offset = self.offset + u32::try_from(contents.len()).unwrap();
+        self.sources.push(Source {
+            offset: self.offset,
+            path: path.to_path_buf(),
+            contents,
+        });
+        self.offset = new_offset;
 
-fn highlight_err(
-    start: usize,
-    end: Option<usize>,
-    file: &str,
-    input: &str,
-    err: impl fmt::Display,
-) -> String {
-    let (line, col) = linecol_in(start, input);
-    let snippet = input.lines().nth(line).unwrap_or("");
-    let mut msg = format!(
-        "\
+        fn unwrap_md(contents: &str) -> String {
+            use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag};
+
+            let mut wit = String::new();
+            let mut last_pos = 0;
+            let mut in_wit_code_block = false;
+            Parser::new_ext(contents, Options::empty())
+                .into_offset_iter()
+                .for_each(|(event, range)| match (event, range) {
+                    (
+                        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(CowStr::Borrowed(
+                            "wit",
+                        )))),
+                        _,
+                    ) => {
+                        in_wit_code_block = true;
+                    }
+                    (Event::Text(text), range) if in_wit_code_block => {
+                        // Ensure that offsets are correct by inserting newlines to
+                        // cover the Markdown content outside of wit code blocks.
+                        for _ in contents[last_pos..range.start].lines() {
+                            wit.push('\n');
+                        }
+                        wit.push_str(&text);
+                        last_pos = range.end;
+                    }
+                    (
+                        Event::End(Tag::CodeBlock(CodeBlockKind::Fenced(CowStr::Borrowed("wit")))),
+                        _,
+                    ) => {
+                        in_wit_code_block = false;
+                    }
+                    _ => {}
+                });
+            wit
+        }
+    }
+
+    /// Parses the files added to this source map into an [`UnresolvedPackage`].
+    pub fn parse(self) -> Result<UnresolvedPackage> {
+        let mut doc = self.rewrite_error(|| {
+            let mut resolver = Resolver::default();
+            let mut srcs = self.sources.iter().collect::<Vec<_>>();
+            srcs.sort_by_key(|src| &src.path);
+            for src in srcs {
+                let mut tokens = Tokenizer::new(&src.contents, src.offset)
+                    .with_context(|| format!("failed to tokenize path: {}", src.path.display()))?;
+                let ast = Ast::parse(&mut tokens)?;
+                resolver.push(ast).with_context(|| {
+                    format!("failed to start resolving path: {}", src.path.display())
+                })?;
+            }
+            resolver.resolve()
+        })?;
+        doc.source_map = self;
+        Ok(doc)
+    }
+
+    pub(crate) fn rewrite_error<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let err = match f() {
+            Ok(t) => return Ok(t),
+            Err(e) => e,
+        };
+        if let Some(parse) = err.downcast_ref::<Error>() {
+            let msg = self.highlight_err(parse.span.start, Some(parse.span.end), parse);
+            bail!("{msg}")
+        }
+
+        if let Some(lex) = err.downcast_ref::<lex::Error>() {
+            let pos = match lex {
+                lex::Error::Unexpected(at, _)
+                | lex::Error::UnterminatedComment(at)
+                | lex::Error::Wanted { at, .. }
+                | lex::Error::InvalidCharInId(at, _)
+                | lex::Error::IdPartEmpty(at)
+                | lex::Error::InvalidEscape(at, _) => *at,
+            };
+            let msg = self.highlight_err(pos, None, lex);
+            bail!("{msg}")
+        }
+
+        if let Some(sort) = err.downcast_ref::<toposort::Error>() {
+            let span = match sort {
+                toposort::Error::NonexistentDep { span, .. }
+                | toposort::Error::Cycle { span, .. } => *span,
+            };
+            let msg = self.highlight_err(span.start, Some(span.end), sort);
+            bail!("{msg}")
+        }
+
+        Err(err)
+    }
+
+    fn highlight_err(&self, start: u32, end: Option<u32>, err: impl fmt::Display) -> String {
+        let i = match self.sources.binary_search_by_key(&start, |src| src.offset) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        let src = &self.sources[i];
+        let start = usize::try_from(start - src.offset).unwrap();
+        let end = end.map(|end| usize::try_from(end - src.offset).unwrap());
+        let (line, col) = linecol_in(start, &src.contents);
+        let snippet = src.contents.lines().nth(line).unwrap_or("");
+        let mut msg = format!(
+            "\
 {err}
      --> {file}:{line}:{col}
       |
  {line:4} | {snippet}
       | {marker:>0$}",
-        col + 1,
-        file = file,
-        line = line + 1,
-        col = col + 1,
-        err = err,
-        snippet = snippet,
-        marker = "^",
-    );
-    if let Some(end) = end {
-        if let Some(s) = input.get(start..end) {
-            for _ in s.chars().skip(1) {
-                msg.push('-');
+            col + 1,
+            file = src.path.display(),
+            line = line + 1,
+            col = col + 1,
+            marker = "^",
+        );
+        if let Some(end) = end {
+            if let Some(s) = src.contents.get(start..end) {
+                for _ in s.chars().skip(1) {
+                    msg.push('-');
+                }
             }
         }
-    }
-    return msg;
+        return msg;
 
-    fn linecol_in(pos: usize, text: &str) -> (usize, usize) {
-        let mut cur = 0;
-        // Use split_terminator instead of lines so that if there is a `\r`,
-        // it is included in the offset calculation. The `+1` values below
-        // account for the `\n`.
-        for (i, line) in text.split_terminator('\n').enumerate() {
-            if cur + line.len() + 1 > pos {
-                return (i, pos - cur);
+        fn linecol_in(pos: usize, text: &str) -> (usize, usize) {
+            let mut cur = 0;
+            // Use split_terminator instead of lines so that if there is a `\r`,
+            // it is included in the offset calculation. The `+1` values below
+            // account for the `\n`.
+            for (i, line) in text.split_terminator('\n').enumerate() {
+                if cur + line.len() + 1 > pos {
+                    return (i, pos - cur);
+                }
+                cur += line.len() + 1;
             }
-            cur += line.len() + 1;
+            (text.lines().count(), 0)
         }
-        (text.lines().count(), 0)
     }
+
+    /// Returns an iterator over all filenames added to this source map.
+    pub fn source_files(&self) -> impl Iterator<Item = &Path> {
+        self.sources.iter().map(|src| src.path.as_path())
+    }
+}
+
+pub(crate) enum AstUsePath {
+    Name(String),
+    Package(crate::PackageName, String),
+}
+
+pub(crate) fn parse_use_path(s: &str) -> Result<AstUsePath> {
+    let mut tokens = Tokenizer::new(s, 0)?;
+    let path = UsePath::parse(&mut tokens)?;
+    if tokens.next()?.is_some() {
+        bail!("trailing tokens in path specifier");
+    }
+    Ok(match path {
+        UsePath::Id(id) => AstUsePath::Name(id.name.to_string()),
+        UsePath::Package { id, name } => {
+            AstUsePath::Package(id.package_name(), name.name.to_string())
+        }
+    })
 }
