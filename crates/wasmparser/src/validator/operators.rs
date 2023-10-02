@@ -22,17 +22,15 @@
 // confusing it's recommended to read over that section to see how it maps to
 // the various methods here.
 
-use index_language::constraint;
-
 use std::ops::{Deref, DerefMut};
 use std::u32::MAX;
 
 use crate::{
-    limits::MAX_WASM_FUNCTION_LOCALS, BinaryReaderError, BlockType, BrTable, 
+    limits::MAX_WASM_FUNCTION_LOCALS,
     validator::solver::{ConstraintSolver, Z3},
-    BinOp, Constant, Constraint, HeapType, Ieee32,
-    Ieee64, IndexTerm, MemArg, RefType, RelOp, Result, TestOp, UnOp, ValType, VisitOperator, WasmFeatures, WasmFuncType,
-    WasmModuleResources, V128,
+    BinOp, BinaryReaderError, BlockType, BrTable, Constant, Constraint, HeapType, Ieee32, Ieee64,
+    IndexTerm, MemArg, RefType, RelOp, Result, TestOp, UnOp, ValType, VisitOperator, WasmFeatures,
+    WasmFuncType, WasmModuleResources, V128,
 };
 
 pub(crate) struct OperatorValidator {
@@ -278,7 +276,12 @@ impl OperatorValidator {
 
         ret.constraints.append(&mut initial_state);
 
-        let post_condition = Resolver::preliminary_resolve_after_block(&consumed, &ret.locals, functy.post_conditions().to_vec().clone(), offset)?;
+        let post_condition = Resolver::preliminary_resolve_after_block(
+            &consumed,
+            &ret.locals,
+            functy.post_conditions().to_vec().clone(),
+            offset,
+        )?;
 
         ret.control.push(Frame {
             kind: FrameKind::Block,
@@ -338,12 +341,21 @@ impl OperatorValidator {
                 ));
             }
             let local_alpha = index as u32;
+
             match ty {
                 ValType::I32 => {
-                    self.constraints.push(constraint!((= local_alpha (i32 0))));
+                    let constraint = Constraint::Eq(
+                        IndexTerm::Alpha(local_alpha),
+                        IndexTerm::IConstant(Constant::I32Const(0)),
+                    );
+                    self.constraints.push(constraint);
                 }
                 ValType::I64 => {
-                    self.constraints.push(constraint!((= local_alpha (i64 0))));
+                    let constraint = Constraint::Eq(
+                        IndexTerm::Alpha(local_alpha),
+                        IndexTerm::IConstant(Constant::I64Const(0)),
+                    );
+                    self.constraints.push(constraint);
                 }
                 _ => {}
             }
@@ -964,7 +976,13 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// or block itself. The `kind` of block is specified which indicates how
     /// breaks interact with this block's type. Additionally the type signature
     /// of the block is specified by `ty`.
-    fn push_ctrl(&mut self, kind: FrameKind, ty: BlockType, consumed: Vec<u32>, cond: Option<u32>) -> Result<()> {
+    fn push_ctrl(
+        &mut self,
+        kind: FrameKind,
+        ty: BlockType,
+        consumed: Vec<u32>,
+        cond: Option<u32>,
+    ) -> Result<()> {
         // Push a new frame which has a snapshot of the height of the current
         // operand stack.
         let height = self.operands.len();
@@ -986,8 +1004,12 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         // Resolve post condition against inital state for resulting state
         // which is stored in the frame
         let post = self.get_posts_from_block_type(ty)?;
-        let mut preliminary_post =
-            Resolver::preliminary_resolve_after_block(&consumed, &self.locals, post.clone(), self.offset)?;
+        let mut preliminary_post = Resolver::preliminary_resolve_after_block(
+            &consumed,
+            &self.locals,
+            post.clone(),
+            self.offset,
+        )?;
         let mut constraints_after_end = self.constraints.clone();
         constraints_after_end.append(&mut preliminary_post);
 
@@ -1008,7 +1030,12 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 self.offset,
             )?;
 
-            Resolver::preliminary_resolve_after_block(&new_indices, &self.locals, post, self.offset)?
+            Resolver::preliminary_resolve_after_block(
+                &new_indices,
+                &self.locals,
+                post,
+                self.offset,
+            )?
         } else {
             for (idx, ty) in self.params(ty)?.enumerate() {
                 let old_idx = consumed[idx];
@@ -1157,7 +1184,19 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 let (_, index) = self.pop_operand(Some(mem.index_type()))?;
                 let initial_size = (mem.initial * 65536) as i32;
                 let offset = (memarg.offset + size / 8) as i32;
-                let cond = constraint!(= (i32 1) (i32.lt_u (i32.add (i32 offset) index) (i32 initial_size)));
+                // constraint!(= (i32 1) (i32.lt_u (i32.add (i32 offset) index) (i32 initial_size)));
+                let cond = Constraint::Eq(
+                    IndexTerm::IConstant(Constant::I32Const(0)),
+                    IndexTerm::IRelOp(
+                        RelOp::I32LtU,
+                        Box::new(IndexTerm::IBinOp(
+                            BinOp::I32Add,
+                            Box::new(IndexTerm::IConstant(Constant::I32Const(offset))),
+                            Box::new(IndexTerm::Alpha(index)),
+                        )),
+                        Box::new(IndexTerm::IConstant(Constant::I32Const(initial_size))),
+                    ),
+                );
                 if !self.check_condition_is_satisfied(&vec![cond]) {
                     bail!(self.offset, "memory access pre-condition not satisfied")
                 }
@@ -1227,18 +1266,22 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(frame) => frame,
             None => return false,
         };
-        
+
         if control.unreachable {
             return true;
         }
 
-        let gamma = &self.indices.iter().map(|maybe_ty| {
-            if let Some(MaybeType::Type(ty)) = maybe_ty {
-                Some(ty.clone())
-            } else {
-                None
-            }
-        }).collect();
+        let gamma = &self
+            .indices
+            .iter()
+            .map(|maybe_ty| {
+                if let Some(MaybeType::Type(ty)) = maybe_ty {
+                    Some(ty.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         Z3::satisfies(gamma, &self.constraints, condition)
     }
@@ -1750,7 +1793,11 @@ where
             pres.push(idx);
         }
         self.push_ctrl(FrameKind::If, ty, pres, Some(cond))?;
-        self.constraints.push(constraint!(not (= cond (i32 0))));
+        let constraint = Constraint::Not(Box::new(Constraint::Eq(
+            IndexTerm::Alpha(cond),
+            IndexTerm::IConstant(Constant::I32Const(0)),
+        )));
+        self.constraints.push(constraint);
         Ok(())
     }
     fn visit_else(&mut self) -> Self::Output {
@@ -1763,7 +1810,11 @@ where
         self.constraints = constraints;
         self.locals = locals;
         self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new(), Some(cond))?;
-        self.constraints.push(constraint!(= cond (i32 0)));
+        let constraint = Constraint::Eq(
+            IndexTerm::Alpha(cond),
+            IndexTerm::IConstant(Constant::I32Const(0)),
+        );
+        self.constraints.push(constraint);
         Ok(())
     }
     fn visit_try(&mut self, _ty: BlockType) -> Self::Output {
@@ -1797,7 +1848,11 @@ where
             self.constraints = constraints;
             self.locals = locals;
             self.push_ctrl(FrameKind::Else, frame.block_type, Vec::new(), Some(cond))?;
-            self.constraints.push(constraint!(= cond (i32 0)));
+            let constraint = Constraint::Eq(
+                IndexTerm::Alpha(cond),
+                IndexTerm::IConstant(Constant::I32Const(0)),
+            );
+            self.constraints.push(constraint);
             frame = self.pop_ctrl()?;
         }
         let mut new_indices = Vec::new();
@@ -1852,13 +1907,20 @@ where
         } else {
             Resolver::resolve_after_block(&args, &self.locals, post, self.offset)?
         };
-        self.constraints.push(constraint!(not (= cond (i32 0))));
+
+        let no_br_constraint = Constraint::Eq(
+            IndexTerm::Alpha(cond),
+            IndexTerm::IConstant(Constant::I32Const(0)),
+        );
+        let br_constraint = Constraint::Not(Box::new(no_br_constraint.clone()));
+
+        self.constraints.push(no_br_constraint);
         if !self.check_condition_is_satisfied(&condition) {
             bail!(self.offset, "br_if - branching condition not met")
         }
         self.constraints.pop();
 
-        self.constraints.push(constraint!(= cond (i32 0)));
+        self.constraints.push(br_constraint);
 
         for (idx, ty) in types.clone().rev().enumerate() {
             let old_idx = args[idx];
@@ -1995,8 +2057,16 @@ where
             }
         };
         let x = self.push_operand(ty)?;
-        self.constraints
-            .push(constraint!(r#if (= a0 (i32 0)) (= x a1) (= x a2)));
+        // constraint!(r#if (= a0 (i32 0)) (= x a1) (= x a2))
+        let constraint = Constraint::If(
+            Box::new(Constraint::Eq(
+                IndexTerm::Alpha(a0),
+                IndexTerm::IConstant(Constant::I32Const(0)),
+            )),
+            Box::new(Constraint::Eq(IndexTerm::Alpha(x), IndexTerm::Alpha(a1))),
+            Box::new(Constraint::Eq(IndexTerm::Alpha(x), IndexTerm::Alpha(2))),
+        );
+        self.constraints.push(constraint);
         Ok(())
     }
     fn visit_typed_select(&mut self, ty: ValType) -> Self::Output {
@@ -2014,7 +2084,10 @@ where
             bail!(self.offset, "uninitialized local: {}", local_index);
         }
         let new = self.push_operand(ty)?;
-        self.constraints.push(constraint!(= l_idx new));
+        self.constraints.push(Constraint::Eq(
+            IndexTerm::Alpha(l_idx),
+            IndexTerm::Alpha(new),
+        ));
         Ok(())
     }
     fn visit_local_set(&mut self, local_index: u32) -> Self::Output {
@@ -2036,7 +2109,10 @@ where
         }
         self.replace_local(local_index, new_local)?;
         let new_stack = self.push_operand(ty)?;
-        self.constraints.push(constraint!(= new_local new_stack));
+        self.constraints.push(Constraint::Eq(
+            IndexTerm::Alpha(new_local),
+            IndexTerm::Alpha(new_stack),
+        ));
         Ok(())
     }
     fn visit_global_get(&mut self, global_index: u32) -> Self::Output {
@@ -2312,12 +2388,18 @@ where
     }
     fn visit_i32_const(&mut self, _value: i32) -> Self::Output {
         let index = self.push_operand(ValType::I32)?;
-        self.constraints.push(constraint!(= index (i32 _value)));
+        self.constraints.push(Constraint::Eq(
+            IndexTerm::Alpha(index),
+            IndexTerm::IConstant(Constant::I32Const(_value)),
+        ));
         Ok(())
     }
     fn visit_i64_const(&mut self, _value: i64) -> Self::Output {
         let index = self.push_operand(ValType::I64)?;
-        self.constraints.push(constraint!(= index (i64 _value)));
+        self.constraints.push(Constraint::Eq(
+            IndexTerm::Alpha(index),
+            IndexTerm::IConstant(Constant::I64Const(_value)),
+        ));
         Ok(())
     }
     fn visit_f32_const(&mut self, _value: Ieee32) -> Self::Output {
@@ -2333,7 +2415,10 @@ where
     fn visit_i32_eqz(&mut self) -> Self::Output {
         let (_, old) = self.pop_operand(Some(ValType::I32))?;
         let new = self.push_operand(ValType::I32)?;
-        self.constraints.push(constraint!(= new (i32.eqz old)));
+        self.constraints.push(Constraint::Eq(
+            IndexTerm::Alpha(new),
+            IndexTerm::ITestOp(TestOp::I32Eqz, Box::new(IndexTerm::Alpha(old))),
+        ));
         Ok(())
     }
     visit_op!(CmpOpI32: visit_i32_eq, RelOp::I32Eq);
@@ -2349,7 +2434,10 @@ where
     fn visit_i64_eqz(&mut self) -> Self::Output {
         let (_, old) = self.pop_operand(Some(ValType::I64))?;
         let new = self.push_operand(ValType::I32)?;
-        self.constraints.push(constraint!(= new (i64.eqz old)));
+        self.constraints.push(Constraint::Eq(
+            IndexTerm::Alpha(new),
+            IndexTerm::ITestOp(TestOp::I64Eqz, Box::new(IndexTerm::Alpha(old))),
+        ));
         Ok(())
     }
     visit_op!(CmpOpI64: visit_i64_eq, RelOp::I64Eq);
@@ -2861,10 +2949,7 @@ where
         Ok(())
     }
     fn visit_br_on_null(&mut self, relative_depth: u32) -> Self::Output {
-        bail!(
-            self.offset,
-            "unsupported instruction: br_on_non_null",
-        );
+        bail!(self.offset, "unsupported instruction: br_on_non_null",);
         /*
         let ty = match self.pop_ref()? {
             None => MaybeType::HeapBot,
@@ -2882,10 +2967,7 @@ where
         */
     }
     fn visit_br_on_non_null(&mut self, relative_depth: u32) -> Self::Output {
-        bail!(
-            self.offset,
-            "unsupported instruction: visit_br_on_non_null",
-        );
+        bail!(self.offset, "unsupported instruction: visit_br_on_non_null",);
         /*
         let ty = self.pop_ref()?;
         let (ft, kind, cond) = self.jump(relative_depth)?;

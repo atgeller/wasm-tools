@@ -60,7 +60,8 @@ fn precheck_annotations() -> anyhow::Result<()> {
     //wat::parse_str(r#"(module (func (param i32 i32) (result $b i32) (post (eq (i32 1) (i32.gt_s $b (i32 0))))))"#)?;
     //wat::parse_str(r#"(module (func (param (@name "foo") i32)))"#)?;
 
-    let wasm = wat::parse_str(r#"(module
+    let wasm = wat::parse_str(
+        r#"(module
         (func
             (param $a i32)
             (result $b i32)
@@ -75,7 +76,8 @@ fn precheck_annotations() -> anyhow::Result<()> {
             (i32.const 42)
             (call 0)
         )
-    )"#)?;
+    )"#,
+    )?;
 
     wasmparser::validate(&wasm.as_slice())?;
     Ok(())
@@ -117,7 +119,8 @@ fn precheck_block_annotations() -> anyhow::Result<()> {
 #[test]
 fn precheck_instructions() -> anyhow::Result<()> {
     //let wasm = wat::parse_str(r#"(module (func (local i32) (local i32) (local.get 0) (local.get 1) (local.get 1) (i32.const 1) select i32.div_s drop))"#)?;
-    let wasm = wat::parse_str(r#"(module (memory 1) (func (i32.const 65504) i32.load_prechk drop))"#)?;
+    let wasm =
+        wat::parse_str(r#"(module (memory 1) (func (i32.const 65504) i32.load_prechk drop))"#)?;
     wasmparser::validate(&wasm.as_slice())?;
     Ok(())
 }

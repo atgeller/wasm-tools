@@ -1,7 +1,7 @@
 use crate::limits::*;
 use crate::{
     BinaryReader, ComponentAlias, ComponentExternName, ComponentImport, ComponentTypeRef,
-    FromReader, IndexedFuncType, Import, Result, SectionLimited, Type, TypeRef, ValType,
+    FromReader, Import, IndexedFuncType, Result, SectionLimited, Type, TypeRef, ValType,
 };
 use std::fmt;
 

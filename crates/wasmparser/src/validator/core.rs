@@ -8,9 +8,9 @@ use super::{
 use crate::limits::*;
 use crate::validator::core::arc::MaybeOwned;
 use crate::{
-    BinaryReaderError, ConstExpr, Data, DataKind, Element, ElementKind, ExternalKind, IndexedFuncType,
-    Global, GlobalType, HeapType, MemoryType, RefType, Result, StorageType, Table, TableInit,
-    TableType, TagType, TypeRef, ValType, VisitOperator, WasmFeatures, WasmFuncType,
+    BinaryReaderError, ConstExpr, Data, DataKind, Element, ElementKind, ExternalKind, Global,
+    GlobalType, HeapType, IndexedFuncType, MemoryType, RefType, Result, StorageType, Table,
+    TableInit, TableType, TagType, TypeRef, ValType, VisitOperator, WasmFeatures, WasmFuncType,
     WasmModuleResources,
 };
 use indexmap::IndexMap;

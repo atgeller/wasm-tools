@@ -13,7 +13,10 @@
  * limitations under the License.
  */
 
-use crate::{GlobalType, MemoryType, TableType, ValType, WasmFeatures, BinaryReaderError, IndexedFuncType, Constraint, RefType, HeapType};
+use crate::{
+    BinaryReaderError, Constraint, GlobalType, HeapType, IndexedFuncType, MemoryType, RefType,
+    TableType, ValType, WasmFeatures,
+};
 use std::ops::Range;
 
 /// Types that qualify as Wasm function types for validation purposes.
@@ -352,7 +355,6 @@ where
     fn type_index_of_function(&self, func_idx: u32) -> Option<u32> {
         T::type_index_of_function(self, func_idx)
     }
-
 
     fn type_of_function(&self, func_idx: u32) -> Option<&Self::IndexedFuncType> {
         T::type_of_function(self, func_idx)

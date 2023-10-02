@@ -52,7 +52,7 @@ macro_rules! parenthesize {
         $stream.append(Ident::new("new", Span::call_site()));
         parenthesize!($first).to_tokens(&mut $stream);
     }
-}
+}*/
 
 mod kw {
     syn::custom_keyword!(i32);
@@ -249,6 +249,47 @@ impl Parse for BinOp {
         };
 
         Ok(binop)
+    }
+}
+
+impl BinOp {
+    fn generate_rust_code(&self) -> proc_macro::TokenStream {
+        let variant = match self {
+            BinOp::I32Add => syn::Ident::new("I32Add", proc_macro::Span::call_site()),
+            BinOp::I32Sub => Ident::new("I32Sub", Span::call_site()),
+            BinOp::I32Mul => Ident::new("I32Mul", Span::call_site()),
+            BinOp::I32DivS => Ident::new("I32DivS", Span::call_site()),
+            BinOp::I32DivU => Ident::new("I32DivU", Span::call_site()),
+            BinOp::I32RemS => Ident::new("I32RemS", Span::call_site()),
+            BinOp::I32RemU => Ident::new("I32RemU", Span::call_site()),
+            BinOp::I32And => Ident::new("I32And", Span::call_site()),
+            BinOp::I32Or => Ident::new("I32Or", Span::call_site()),
+            BinOp::I32Xor => Ident::new("I32Xor", Span::call_site()),
+            BinOp::I32Shl => Ident::new("I32Shl", Span::call_site()),
+            BinOp::I32ShrS => Ident::new("I32ShrS", Span::call_site()),
+            BinOp::I32ShrU => Ident::new("I32ShrU", Span::call_site()),
+            BinOp::I32Rotl => Ident::new("I32Rotl", Span::call_site()),
+            BinOp::I32Rotr => Ident::new("I32Rotr", Span::call_site()),
+            BinOp::I64Add => Ident::new("I64Add", Span::call_site()),
+            BinOp::I64Sub => Ident::new("I64Sub", Span::call_site()),
+            BinOp::I64Mul => Ident::new("I64Mul", Span::call_site()),
+            BinOp::I64DivS => Ident::new("I64DivS", Span::call_site()),
+            BinOp::I64DivU => Ident::new("I64DivU", Span::call_site()),
+            BinOp::I64RemS => Ident::new("I64RemS", Span::call_site()),
+            BinOp::I64RemU => Ident::new("I64RemU", Span::call_site()),
+            BinOp::I64And => Ident::new("I64And", Span::call_site()),
+            BinOp::I64Or => Ident::new("I64Or", Span::call_site()),
+            BinOp::I64Xor => Ident::new("I64Xor", Span::call_site()),
+            BinOp::I64Shl => Ident::new("I64Shl", Span::call_site()),
+            BinOp::I64ShrS => Ident::new("I64ShrS", Span::call_site()),
+            BinOp::I64ShrU => Ident::new("I64ShrU", Span::call_site()),
+            BinOp::I64Rotl => Ident::new("I64Rotl", Span::call_site()),
+            BinOp::I64Rotr => Ident::new("I64Rotr", Span::call_site()),
+        };
+
+        quote! {
+            BinOp::#variant
+        }.into()
     }
 }
 

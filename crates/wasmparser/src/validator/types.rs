@@ -6,8 +6,8 @@ use super::{
 };
 use crate::validator::names::KebabString;
 use crate::{
-    ArrayType, BinaryReaderError, Export, ExternalKind, IndexedFuncType, GlobalType, Import, MemoryType,
-    PrimitiveValType, RefType, Result, TableType, TypeRef, ValType,
+    ArrayType, BinaryReaderError, Export, ExternalKind, GlobalType, Import, IndexedFuncType,
+    MemoryType, PrimitiveValType, RefType, Result, TableType, TypeRef, ValType,
 };
 use indexmap::{IndexMap, IndexSet};
 use std::collections::HashMap;

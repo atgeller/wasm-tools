@@ -17,7 +17,7 @@ use crate::{
         SubtypeCx, TupleType, UnionType, VariantType,
     },
     BinaryReaderError, CanonicalOption, ComponentExternName, ComponentExternalKind,
-    ComponentOuterAliasKind, ComponentTypeRef, ExternalKind, IndexedFuncType, GlobalType,
+    ComponentOuterAliasKind, ComponentTypeRef, ExternalKind, GlobalType, IndexedFuncType,
     InstantiationArgKind, MemoryType, Result, TableType, TypeBounds, ValType, WasmFeatures,
 };
 use indexmap::{map::Entry, IndexMap, IndexSet};
