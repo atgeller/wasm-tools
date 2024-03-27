@@ -1,4 +1,4 @@
-package foo:dep
+package foo:dep;
 
 interface foo {
   enum a {
@@ -6,5 +6,6 @@ interface foo {
   }
 
   record ty {
+    f: u8,
   }
 }

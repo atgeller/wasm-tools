@@ -56,7 +56,7 @@ pub struct Printer {
 
 #[derive(Default)]
 struct CoreState {
-    types: Vec<Option<Type>>,
+    types: Vec<Option<SubType>>,
     funcs: u32,
     memories: u32,
     tags: u32,
@@ -640,12 +640,22 @@ impl Printer {
             states.last().unwrap().core.types.len() as u32,
         )?;
         let ty = match ty {
-            CoreType::Func(ty) => {
+            CoreType::Sub(ty) => {
+                let ty = match &ty.composite_type {
+                    CompositeType::Func(f) => f,
+                    CompositeType::Array(_) | CompositeType::Struct(_) => {
+                        unreachable!("Wasm GC types cannot appear in components yet")
+                    }
+                };
                 self.result.push(' ');
                 self.start_group("func");
                 self.print_func_type(states.last().unwrap(), &ty, None)?;
                 self.end_group();
-                Some(Type::Func(ty))
+                Some(SubType {
+                    is_final: true,
+                    supertype_idx: None,
+                    composite_type: CompositeType::Func(ty.clone()),
+                })
             }
             CoreType::Module(decls) => {
                 self.print_module_type(states, decls.into_vec())?;
@@ -658,27 +668,71 @@ impl Printer {
         Ok(())
     }
 
-    fn print_type(&mut self, state: &mut State, ty: wasmparser::Type) -> Result<()> {
+    fn print_rec(
+        &mut self,
+        state: &mut State,
+        offset: usize,
+        types: impl Iterator<Item = SubType>,
+    ) -> Result<()> {
+        self.start_group("rec");
+        for ty in types {
+            self.newline(offset + 2);
+            self.print_type(state, ty)?;
+        }
+        self.end_group(); // `rec`
+        Ok(())
+    }
+
+    fn print_type(&mut self, state: &mut State, ty: SubType) -> Result<()> {
         self.start_group("type ");
         self.print_name(&state.core.type_names, state.core.types.len() as u32)?;
         self.result.push(' ');
-        let ty = match ty {
-            Type::Func(ty) => {
-                self.start_group("func");
-                self.print_func_type(state, &ty, None)?;
-                self.end_group();
-                Type::Func(ty)
-            }
-            Type::Array(ty) => {
-                self.start_group("array");
-                self.print_array_type(&ty)?;
-                self.end_group();
-                Type::Array(ty)
-            }
-        };
-        self.end_group(); // `type` itself
+        self.print_sub(state, &ty, None)?;
+        self.end_group(); // `type`
         state.core.types.push(Some(ty));
         Ok(())
+    }
+
+    fn print_sub(&mut self, state: &State, ty: &SubType, names_for: Option<u32>) -> Result<u32> {
+        let r = if !ty.is_final || !ty.supertype_idx.is_none() {
+            self.start_group("sub");
+            self.print_sub_type(state, ty)?;
+            let r = self.print_composite(state, &ty.composite_type, names_for)?;
+            self.end_group(); // `sub`
+            r
+        } else {
+            self.print_composite(state, &ty.composite_type, names_for)?
+        };
+        Ok(r)
+    }
+
+    fn print_composite(
+        &mut self,
+        state: &State,
+        ty: &CompositeType,
+        names_for: Option<u32>,
+    ) -> Result<u32> {
+        let r = match &ty {
+            CompositeType::Func(ty) => {
+                self.start_group("func");
+                let r = self.print_func_type(state, ty, names_for)?;
+                self.end_group(); // `func`
+                r
+            }
+            CompositeType::Array(ty) => {
+                self.start_group("array");
+                let r = self.print_array_type(ty)?;
+                self.end_group(); // `array`
+                r
+            }
+            CompositeType::Struct(ty) => {
+                self.start_group("struct");
+                let r = self.print_struct_type(ty)?;
+                self.end_group(); // `struct`
+                r
+            }
+        };
+        Ok(r)
     }
 
     fn print_core_types(
@@ -697,9 +751,15 @@ impl Printer {
 
     fn print_types(&mut self, state: &mut State, parser: TypeSectionReader<'_>) -> Result<()> {
         for ty in parser.into_iter_with_offsets() {
-            let (offset, ty) = ty?;
+            let (offset, rec_group) = ty?;
             self.newline(offset);
-            self.print_type(state, ty)?;
+            if rec_group.is_explicit_rec_group() {
+                self.print_rec(state, offset, rec_group.into_types())?
+            } else {
+                assert_eq!(rec_group.types().len(), 1);
+                let ty = rec_group.into_types().next().unwrap();
+                self.print_type(state, ty)?;
+            }
         }
 
         Ok(())
@@ -714,9 +774,11 @@ impl Printer {
         self.print_core_type_ref(state, idx)?;
 
         match state.core.types.get(idx as usize) {
-            Some(Some(Type::Func(ty))) => self.print_func_type(state, ty, names_for).map(Some),
-            Some(Some(Type::Array(ty))) => self.print_array_type(ty).map(Some),
-            Some(None) | None => Ok(None),
+            Some(Some(SubType {
+                composite_type: CompositeType::Func(ty),
+                ..
+            })) => self.print_func_type(state, ty, names_for).map(Some),
+            Some(Some(_)) | Some(None) | None => Ok(None),
         }
     }
 
@@ -754,7 +816,7 @@ impl Printer {
         Ok(ty.params().len() as u32)
     }
 
-    fn print_array_type(&mut self, ty: &ArrayType) -> Result<u32> {
+    fn print_field_type(&mut self, ty: &FieldType) -> Result<u32> {
         self.result.push(' ');
         if ty.mutable {
             self.result.push_str("(mut ");
@@ -762,6 +824,31 @@ impl Printer {
         self.print_storage_type(ty.element_type)?;
         if ty.mutable {
             self.result.push_str(")");
+        }
+        Ok(0)
+    }
+
+    fn print_array_type(&mut self, ty: &ArrayType) -> Result<u32> {
+        self.print_field_type(&ty.0)
+    }
+
+    fn print_struct_type(&mut self, ty: &StructType) -> Result<u32> {
+        for field in ty.fields.iter() {
+            self.result.push_str(" (field");
+            self.print_field_type(field)?;
+            self.result.push(')');
+        }
+        Ok(0)
+    }
+
+    fn print_sub_type(&mut self, state: &State, ty: &SubType) -> Result<u32> {
+        self.result.push(' ');
+        if ty.is_final {
+            self.result.push_str("final ");
+        }
+        for idx in &ty.supertype_idx {
+            self.print_name(&state.core.type_names, idx.as_module_index().unwrap())?;
+            self.result.push(' ');
         }
         Ok(0)
     }
@@ -826,7 +913,9 @@ impl Printer {
             HeapType::Struct => self.result.push_str("struct"),
             HeapType::Array => self.result.push_str("array"),
             HeapType::I31 => self.result.push_str("i31"),
-            HeapType::Indexed(i) => self.result.push_str(&format!("{}", u32::from(i))),
+            HeapType::Concrete(i) => self
+                .result
+                .push_str(&format!("{}", i.as_module_index().unwrap())),
         }
         Ok(())
     }
@@ -1277,8 +1366,8 @@ impl Printer {
                             self.print_idx(&state.core.func_names, idx?)?
                         }
                     }
-                    ElementItems::Expressions(reader) => {
-                        self.print_reftype(elem.ty)?;
+                    ElementItems::Expressions(ty, reader) => {
+                        self.print_reftype(ty)?;
                         for expr in reader {
                             self.result.push(' ');
                             self.print_const_expr_sugar(state, &expr?, "item")?
@@ -1464,13 +1553,8 @@ impl Printer {
         Ok(())
     }
 
-    fn print_tuple_or_union_type(
-        &mut self,
-        ty: &str,
-        state: &State,
-        tys: &[ComponentValType],
-    ) -> Result<()> {
-        self.start_group(ty);
+    fn print_tuple_type(&mut self, state: &State, tys: &[ComponentValType]) -> Result<()> {
+        self.start_group("tuple");
         for ty in tys {
             self.result.push(' ');
             self.print_component_val_type(state, ty)?;
@@ -1527,14 +1611,9 @@ impl Printer {
             ComponentDefinedType::Record(fields) => self.print_record_type(state, fields)?,
             ComponentDefinedType::Variant(cases) => self.print_variant_type(state, cases)?,
             ComponentDefinedType::List(ty) => self.print_list_type(state, ty)?,
-            ComponentDefinedType::Tuple(tys) => {
-                self.print_tuple_or_union_type("tuple", state, tys)?
-            }
+            ComponentDefinedType::Tuple(tys) => self.print_tuple_type(state, tys)?,
             ComponentDefinedType::Flags(names) => self.print_flag_or_enum_type("flags", names)?,
             ComponentDefinedType::Enum(cases) => self.print_flag_or_enum_type("enum", cases)?,
-            ComponentDefinedType::Union(tys) => {
-                self.print_tuple_or_union_type("union", state, tys)?
-            }
             ComponentDefinedType::Option(ty) => self.print_option_type(state, ty)?,
             ComponentDefinedType::Result { ok, err } => self.print_result_type(state, *ok, *err)?,
             ComponentDefinedType::Own(idx) => {
@@ -1616,7 +1695,7 @@ impl Printer {
                 ComponentTypeDeclaration::Export { name, ty } => {
                     self.start_group("export ");
                     self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
-                    self.print_component_import_name(name.into())?;
+                    self.print_str(name.0)?;
                     self.result.push(' ');
                     self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
                     self.end_group();
@@ -1650,7 +1729,7 @@ impl Printer {
                 InstanceTypeDeclaration::Export { name, ty } => {
                     self.start_group("export ");
                     self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
-                    self.print_component_import_name(name.into())?;
+                    self.print_str(name.0)?;
                     self.result.push(' ');
                     self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
                     self.end_group();
@@ -1765,7 +1844,7 @@ impl Printer {
                 self.print_valtype(rep)?;
                 self.result.push_str(")");
                 if let Some(dtor) = dtor {
-                    self.result.push_str("(dtor (func ");
+                    self.result.push_str(" (dtor (func ");
                     self.print_idx(&states.last().unwrap().core.func_names, dtor)?;
                     self.result.push_str("))");
                 }
@@ -1814,23 +1893,11 @@ impl Printer {
         index: bool,
     ) -> Result<()> {
         self.start_group("import ");
-        self.print_component_import_name(import.name)?;
+        self.print_str(import.name.0)?;
         self.result.push(' ');
         self.print_component_import_ty(state, &import.ty, index)?;
         self.end_group();
         Ok(())
-    }
-
-    fn print_component_import_name(&mut self, name: ComponentExternName<'_>) -> Result<()> {
-        match name {
-            ComponentExternName::Kebab(s) => self.print_str(s),
-            ComponentExternName::Interface(s) => {
-                self.start_group("interface ");
-                self.print_str(s)?;
-                self.end_group();
-                Ok(())
-            }
-        }
     }
 
     fn print_component_import_ty(
@@ -1941,7 +2008,7 @@ impl Printer {
         if named {
             self.print_component_kind_name(state, export.kind)?;
         }
-        self.print_component_import_name(export.name.into())?;
+        self.print_str(export.name.0)?;
         self.result.push(' ');
         self.print_component_external_kind(state, export.kind, export.index)?;
         if let Some(ty) = &export.ty {
@@ -2112,12 +2179,12 @@ impl Printer {
                     self.end_group();
                     state.core.funcs += 1;
                 }
-                CanonicalFunction::ResourceDrop { ty } => {
+                CanonicalFunction::ResourceDrop { resource } => {
                     self.start_group("core func ");
                     self.print_name(&state.core.func_names, state.core.funcs)?;
                     self.result.push(' ');
                     self.start_group("canon resource.drop ");
-                    self.print_component_val_type(state, &ty)?;
+                    self.print_idx(&state.component.type_names, resource)?;
                     self.end_group();
                     self.end_group();
                     state.core.funcs += 1;
@@ -2495,6 +2562,13 @@ impl Printer {
                     section.data_offset(),
                 )?)
             }
+            "dylink.0" => {
+                self.newline(section.range().start);
+                self.print_dylink0_section(Dylink0SectionReader::new(
+                    section.data(),
+                    section.data_offset(),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -2515,6 +2589,97 @@ impl Printer {
             }
         }
         self.end_group();
+        Ok(())
+    }
+
+    fn print_dylink0_section(&mut self, mut section: Dylink0SectionReader<'_>) -> Result<()> {
+        self.start_group("@dylink.0");
+        loop {
+            let start = section.original_position();
+            let next = match section.next() {
+                Some(Ok(next)) => next,
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            };
+            match next {
+                Dylink0Subsection::MemInfo(info) => {
+                    self.newline(start);
+                    self.start_group("mem-info");
+                    if info.memory_size > 0 || info.memory_alignment > 0 {
+                        write!(
+                            self.result,
+                            " (memory {} {})",
+                            info.memory_size, info.memory_alignment
+                        )?;
+                    }
+                    if info.table_size > 0 || info.table_alignment > 0 {
+                        write!(
+                            self.result,
+                            " (table {} {})",
+                            info.table_size, info.table_alignment
+                        )?;
+                    }
+                    self.end_group();
+                }
+                Dylink0Subsection::Needed(needed) => {
+                    self.newline(start);
+                    self.start_group("needed");
+                    for s in needed {
+                        self.result.push_str(" ");
+                        self.print_str(s)?;
+                    }
+                    self.end_group();
+                }
+                Dylink0Subsection::ExportInfo(info) => {
+                    for info in info {
+                        self.newline(start);
+                        self.start_group("export-info ");
+                        self.print_str(info.name)?;
+                        self.print_dylink0_flags(info.flags)?;
+                        self.end_group();
+                    }
+                }
+                Dylink0Subsection::ImportInfo(info) => {
+                    for info in info {
+                        self.newline(start);
+                        self.start_group("import-info ");
+                        self.print_str(info.module)?;
+                        self.result.push_str(" ");
+                        self.print_str(info.field)?;
+                        self.print_dylink0_flags(info.flags)?;
+                        self.end_group();
+                    }
+                }
+                Dylink0Subsection::Unknown { ty, .. } => {
+                    bail!("don't know how to print dylink.0 subsection id {ty}");
+                }
+            }
+        }
+        self.end_group();
+        Ok(())
+    }
+
+    fn print_dylink0_flags(&mut self, mut flags: u32) -> Result<()> {
+        macro_rules! print_flag {
+            ($($name:ident = $text:tt)*) => ({$(
+                if flags & wasmparser::$name != 0 {
+                    flags &= !wasmparser::$name;
+                    self.result.push_str(concat!(" ", $text));
+                }
+            )*})
+        }
+        print_flag! {
+            WASM_SYM_BINDING_WEAK = "binding-weak"
+            WASM_SYM_BINDING_LOCAL = "binding-local"
+            WASM_SYM_VISIBILITY_HIDDEN = "visibility-hidden"
+            WASM_SYM_UNDEFINED = "undefined"
+            WASM_SYM_EXPORTED = "exported"
+            WASM_SYM_EXPLICIT_NAME = "explicit-name"
+            WASM_SYM_NO_STRIP = "no-strip"
+        }
+        if flags != 0 {
+            write!(self.result, " {:#x}", flags)?;
+        }
         Ok(())
     }
 }

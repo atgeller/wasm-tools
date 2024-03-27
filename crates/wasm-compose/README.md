@@ -34,7 +34,7 @@ has implementation efforts underway to support it.__
 
 ## Usage
 
-To composed a component, run the `compose` command:
+To compose a component, run the `compose` command:
 
 ```sh
 wasm-tools compose -o composed.wasm component.wasm
@@ -75,7 +75,7 @@ of composing WebAssembly components together.
 ## License
 
 This project is licensed under the Apache 2.0 license with the LLVM exception.
-See [LICENSE](LICENSE) for more details.
+See [LICENSE](../../LICENSE) for more details.
 
 ### Contribution
 

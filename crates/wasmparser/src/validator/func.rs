@@ -248,7 +248,8 @@ impl<T: WasmModuleResources> FuncValidator<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WasmFuncType;
+    use crate::types::CoreTypeId;
+    use crate::{HeapType, WasmFuncType};
 
     struct EmptyResources;
 
@@ -270,25 +271,19 @@ mod tests {
         fn func_type_at(&self, _type_idx: u32) -> Option<&Self::IndexedFuncType> {
             Some(&EmptyFuncType)
         }
-
-        fn type_index_of_function(&self, _at: u32) -> Option<u32> {
+        fn type_id_of_function(&self, _at: u32) -> Option<CoreTypeId> {
             todo!()
         }
         fn type_of_function(&self, _func_idx: u32) -> Option<&Self::IndexedFuncType> {
             todo!()
         }
-        fn check_value_type(
-            &self,
-            _t: ValType,
-            _features: &WasmFeatures,
-            _offset: usize,
-        ) -> Result<()> {
+        fn check_heap_type(&self, _t: &mut HeapType, _offset: usize) -> Result<()> {
             Ok(())
         }
         fn element_type_at(&self, _at: u32) -> Option<crate::RefType> {
             todo!()
         }
-        fn matches(&self, _t1: ValType, _t2: ValType) -> bool {
+        fn is_subtype(&self, _t1: ValType, _t2: ValType) -> bool {
             todo!()
         }
         fn element_count(&self) -> u32 {
@@ -302,6 +297,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct EmptyFuncType;
 
     impl WasmFuncType for EmptyFuncType {

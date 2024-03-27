@@ -5,12 +5,16 @@ use indexmap::{IndexMap, IndexSet};
 use petgraph::{algo::toposort, graphmap::DiGraphMap, EdgeDirection};
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::{hash_map::Entry, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 use wasmparser::{
-    types::{ComponentEntityType, TypeId, Types, TypesRef},
+    types::{
+        ComponentAnyTypeId, ComponentEntityType, ComponentInstanceTypeId, Remap, Remapping,
+        ResourceId, SubtypeCx, Types, TypesRef,
+    },
     Chunk, ComponentExternalKind, ComponentTypeRef, Encoding, Parser, Payload, ValidPayload,
     Validator, WasmFeatures,
 };
@@ -122,24 +126,14 @@ impl<'a> Component<'a> {
                                 Payload::ComponentImportSection(s) => {
                                     for import in s {
                                         let import = import?;
-                                        let name = match import.name {
-                                            wasmparser::ComponentExternName::Kebab(s)
-                                            | wasmparser::ComponentExternName::Interface(s) => {
-                                                s.to_string()
-                                            }
-                                        };
+                                        let name = import.name.0.to_string();
                                         imports.insert(name, import.ty);
                                     }
                                 }
                                 Payload::ComponentExportSection(s) => {
                                     for export in s {
                                         let export = export?;
-                                        let name = match export.name {
-                                            wasmparser::ComponentExternName::Kebab(s)
-                                            | wasmparser::ComponentExternName::Interface(s) => {
-                                                s.to_string()
-                                            }
-                                        };
+                                        let name = export.name.0.to_string();
                                         exports.insert(name, (export.kind, export.index));
                                     }
                                 }
@@ -247,9 +241,10 @@ impl<'a> Component<'a> {
     }
 
     pub(crate) fn ty(&self) -> wasm_encoder::ComponentType {
-        let encoder = TypeEncoder::new(&self.types);
+        let encoder = TypeEncoder::new(self);
 
         encoder.component(
+            &mut Default::default(),
             self.imports()
                 .map(|(i, ..)| self.import_entity_type(i).unwrap()),
             self.exports()
@@ -276,8 +271,10 @@ impl<'a> Component<'a> {
     /// Finds a compatible instance export on the component for the given instance type.
     pub(crate) fn find_compatible_export(
         &self,
-        ty: TypeId,
+        ty: ComponentInstanceTypeId,
         types: TypesRef,
+        export_component_id: ComponentId,
+        graph: &CompositionGraph,
     ) -> Option<ExportIndex> {
         self.exports
             .iter()
@@ -285,12 +282,12 @@ impl<'a> Component<'a> {
                 if *kind != ComponentExternalKind::Instance {
                     return false;
                 }
-                ComponentEntityType::is_subtype_of(
-                    &ComponentEntityType::Instance(
-                        self.types.component_instance_at(*index).unwrap(),
-                    ),
-                    self.types.as_ref(),
-                    &ComponentEntityType::Instance(ty),
+
+                graph.try_connection(
+                    export_component_id,
+                    ComponentEntityType::Instance(self.types.component_instance_at(*index)),
+                    self.types(),
+                    ComponentEntityType::Instance(ty),
                     types,
                 )
             })
@@ -299,20 +296,18 @@ impl<'a> Component<'a> {
 
     /// Checks to see if an instance of this component would be a
     /// subtype of the given instance type.
-    pub(crate) fn is_instance_subtype_of(&self, ty: TypeId, types: TypesRef) -> bool {
-        let exports = types
-            .type_from_id(ty)
-            .unwrap()
-            .as_component_instance_type()
-            .unwrap()
-            .exports
-            .iter();
+    pub(crate) fn is_instance_subtype_of(
+        &self,
+        ty: ComponentInstanceTypeId,
+        types: TypesRef,
+    ) -> bool {
+        let exports = types[ty].exports.iter();
 
         for (k, b) in exports {
             match self.exports.get_full(k.as_str()) {
                 Some((ai, _, _)) => {
                     let (_, a) = self.export_entity_type(ExportIndex(ai)).unwrap();
-                    if !ComponentEntityType::is_subtype_of(&a, self.types.as_ref(), b, types) {
+                    if !ComponentEntityType::is_subtype_of(&a, self.types(), b, types) {
                         return false;
                     }
                 }
@@ -451,6 +446,85 @@ pub struct EncodeOptions {
     pub validate: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ResourceMapping {
+    map: im_rc::HashMap<ResourceId, (ComponentId, ResourceId)>,
+}
+
+impl ResourceMapping {
+    fn add_pairs(
+        mut self,
+        export_component: ComponentId,
+        export_type: ComponentEntityType,
+        export_types: TypesRef,
+        import_type: ComponentEntityType,
+        import_types: TypesRef,
+    ) -> Option<Self> {
+        if let (
+            ComponentEntityType::Instance(export_type),
+            ComponentEntityType::Instance(import_type),
+        ) = (export_type, import_type)
+        {
+            let mut exports = HashMap::new();
+            for (export_name, ty) in &export_types[export_type].exports {
+                // TODO: support nested instances
+                if let ComponentEntityType::Type {
+                    referenced: ComponentAnyTypeId::Resource(resource_id),
+                    ..
+                } = ty
+                {
+                    exports.insert(export_name, (export_component, resource_id.resource()));
+                }
+            }
+
+            for (export_name, ty) in &import_types[import_type].exports {
+                // TODO: support nested instances
+                if let ComponentEntityType::Type {
+                    referenced: ComponentAnyTypeId::Resource(resource_id),
+                    ..
+                } = ty
+                {
+                    let import_resource = resource_id.resource();
+                    if let Some((export_component, export_resource)) =
+                        exports.get(&export_name).copied()
+                    {
+                        let value = self
+                            .map
+                            .get(&export_resource)
+                            .copied()
+                            .or_else(|| self.map.get(&import_resource).copied())
+                            .unwrap_or((export_component, export_resource));
+
+                        if value.1 == export_resource {
+                            self.map.insert(export_resource, value);
+                            self.map.insert(import_resource, value);
+                        } else {
+                            // Can't set two different exports equal to each other -- give up.
+                            return None;
+                        }
+                    } else {
+                        // Couldn't find an export with a name that matches this
+                        // import -- give up.
+                        return None;
+                    }
+                }
+            }
+        }
+
+        Some(self)
+    }
+
+    pub(crate) fn remapping(&self) -> Remapping {
+        let mut remapping = Remapping::default();
+        for (old, (_, new)) in &self.map {
+            if old != new {
+                remapping.add(*old, *new)
+            }
+        }
+        remapping
+    }
+}
+
 /// Represents a composition graph used to compose a new component
 /// from other components.
 #[derive(Debug, Default)]
@@ -462,12 +536,137 @@ pub struct CompositionGraph<'a> {
     // An edge between nodes stores a map of target import index to source export index.
     // A source export index of `None` means that the source instance itself is being used.
     pub(crate) graph: DiGraphMap<InstanceId, IndexMap<ImportIndex, Option<ExportIndex>>>,
+    pub(crate) resource_mapping: RefCell<ResourceMapping>,
 }
 
 impl<'a> CompositionGraph<'a> {
     /// Constructs a new composition graph.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Gather any remaining resource imports which have not already been
+    /// connected to exports, group them by name, and update the resource
+    /// mapping to make all resources within each group equivalent.
+    ///
+    /// This should be the last step prior to encoding, after all
+    /// inter-component connections have been made.  It ensures that each set of
+    /// identical imports composed component can be merged into a single import
+    /// in the output component.
+    pub(crate) fn unify_imported_resources(&self) {
+        let mut resource_mapping = self.resource_mapping.borrow_mut();
+
+        let mut resource_imports = HashMap::<_, Vec<_>>::new();
+        for (component_id, component) in &self.components {
+            let component = &component.component;
+            for import_name in component.imports.keys() {
+                let ty = component
+                    .types
+                    .component_entity_type_of_import(import_name)
+                    .unwrap();
+
+                if let ComponentEntityType::Instance(instance_id) = ty {
+                    for (export_name, ty) in &component.types[instance_id].exports {
+                        // TODO: support nested instances
+                        if let ComponentEntityType::Type {
+                            referenced: ComponentAnyTypeId::Resource(resource_id),
+                            ..
+                        } = ty
+                        {
+                            if !resource_mapping.map.contains_key(&resource_id.resource()) {
+                                resource_imports
+                                    .entry(vec![import_name.to_string(), export_name.to_string()])
+                                    .or_default()
+                                    .push((*component_id, resource_id.resource()))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for resources in resource_imports.values() {
+            match &resources[..] {
+                [] => unreachable!(),
+                [_] => {}
+                [first, rest @ ..] => {
+                    resource_mapping.map.insert(first.1, *first);
+                    for resource in rest {
+                        resource_mapping.map.insert(resource.1, *first);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Attempt to connect the specified import to the specified export.
+    ///
+    /// This will attempt to match up any resource types by name by name and
+    /// optimistically produce a remapping that sets identically-named pairs
+    /// equal to each other, provided that remapping does not contradict any
+    /// previous remappings.  If the import is not a subtype of the export
+    /// (either because a consistent remapping could not be created or because
+    /// the instances were incompatible for other reasons), we discard the
+    /// remapping changes and return `false`.  Otherwise, we store the remapping
+    /// changes and return `true`.
+    ///
+    /// Note that although this method takes a shared reference, it uses
+    /// internal mutability to update the remapping.
+    pub(crate) fn try_connection(
+        &self,
+        export_component: ComponentId,
+        mut export_type: ComponentEntityType,
+        export_types: TypesRef,
+        mut import_type: ComponentEntityType,
+        import_types: TypesRef,
+    ) -> bool {
+        let resource_mapping = self.resource_mapping.borrow().clone();
+
+        if let Some(resource_mapping) = resource_mapping.add_pairs(
+            export_component,
+            export_type,
+            export_types,
+            import_type,
+            import_types,
+        ) {
+            let remapping = &mut resource_mapping.remapping();
+            let mut context = SubtypeCx::new_with_refs(export_types, import_types);
+
+            context
+                .a
+                .remap_component_entity(&mut export_type, remapping);
+            remapping.reset_type_cache();
+
+            context
+                .b
+                .remap_component_entity(&mut import_type, remapping);
+            remapping.reset_type_cache();
+
+            if context
+                .component_entity_type(&export_type, &import_type, 0)
+                .is_ok()
+            {
+                *self.resource_mapping.borrow_mut() = resource_mapping;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn remapping_map<'b>(
+        &'b self,
+    ) -> HashMap<ResourceId, (&'b Component<'a>, ResourceId)> {
+        let mut map = HashMap::new();
+        for (old, (component, new)) in &self.resource_mapping.borrow().map {
+            if old != new {
+                let component = &self.components.get(component).unwrap().component;
+                map.insert(*old, (component, *new));
+            }
+        }
+        map
     }
 
     /// Adds a new component to the graph.
@@ -750,14 +949,16 @@ impl<'a> CompositionGraph<'a> {
                 .export_entity_type(export_index)
                 .ok_or_else(|| anyhow!("the source export index is invalid"))?;
 
-            if !ComponentEntityType::is_subtype_of(
-                &export_ty,
-                source_component.types.as_ref(),
-                &import_ty,
-                target_component.types.as_ref(),
+            if !self.try_connection(
+                source_instance.component,
+                export_ty,
+                source_component.types(),
+                import_ty,
+                target_component.types(),
             ) {
                 bail!(
-                    "source {export_ty} export `{export_name}` is not compatible with target {import_ty} import `{import_name}`",
+                    "source {export_ty} export `{export_name}` is not compatible with target \
+                         {import_ty} import `{import_name}`",
                     export_ty = type_desc(export_ty),
                     import_ty = type_desc(import_ty),
                 );
@@ -771,7 +972,7 @@ impl<'a> CompositionGraph<'a> {
                 ),
             };
 
-            if !source_component.is_instance_subtype_of(ty, target_component.types.as_ref()) {
+            if !source_component.is_instance_subtype_of(ty, target_component.types()) {
                 bail!(
                     "source instance is not compatible with target {import_ty} import `{import_name}`",
                     import_ty = type_desc(import_ty)
@@ -1123,7 +1324,7 @@ mod test {
             validate: true,
         })?;
 
-        let wat = wasmprinter::print_bytes(&encoded)?;
+        let wat = wasmprinter::print_bytes(encoded)?;
         assert_eq!(r#"(component)"#, wat);
 
         Ok(())
@@ -1143,7 +1344,7 @@ mod test {
             validate: true,
         })?;
 
-        let wat = wasmprinter::print_bytes(&encoded)?.replace("\r\n", "\n");
+        let wat = wasmprinter::print_bytes(encoded)?.replace("\r\n", "\n");
         assert_eq!(
             r#"(component
   (type (;0;)
@@ -1172,7 +1373,7 @@ mod test {
             validate: true,
         })?;
 
-        let wat = wasmprinter::print_bytes(&encoded)?.replace("\r\n", "\n");
+        let wat = wasmprinter::print_bytes(encoded)?.replace("\r\n", "\n");
         assert_eq!(
             r#"(component
   (component (;0;))
@@ -1235,7 +1436,7 @@ mod test {
             validate: true,
         })?;
 
-        let wat = wasmprinter::print_bytes(&encoded)?.replace("\r\n", "\n");
+        let wat = wasmprinter::print_bytes(encoded)?.replace("\r\n", "\n");
         assert_eq!(
             r#"(component
   (type (;0;)

@@ -1,7 +1,7 @@
 // parse-fail
 
-package foo:foo
+package foo:foo;
 
 interface foo {
-  x: func() -> nonexistent
+  x: func() -> nonexistent;
 }

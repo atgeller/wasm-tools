@@ -90,7 +90,7 @@ impl<'a> IndexResolver<'a> {
                     }
 
                     // .. followed by locals themselves
-                    for local in locals {
+                    for local in locals.iter_mut() {
                         scope.register(local.id, "local")?;
                     }
 

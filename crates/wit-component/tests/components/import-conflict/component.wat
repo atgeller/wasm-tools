@@ -5,7 +5,7 @@
       (export (;0;) "a" (func (type 0)))
     )
   )
-  (import (interface "foo:foo/bar") (instance (;0;) (type 0)))
+  (import "foo:foo/bar" (instance (;0;) (type 0)))
   (type (;1;)
     (instance
       (type (;0;) (list u8))
@@ -13,14 +13,14 @@
       (export (;0;) "baz" (func (type 1)))
     )
   )
-  (import (interface "foo:foo/baz") (instance (;1;) (type 1)))
+  (import "foo:foo/baz" (instance (;1;) (type 1)))
   (type (;2;)
     (instance
       (type (;0;) (func))
       (export (;0;) "a" (func (type 0)))
     )
   )
-  (import (interface "foo:foo/foo") (instance (;2;) (type 2)))
+  (import "foo:foo/foo" (instance (;2;) (type 2)))
   (core module (;0;)
     (type (;0;) (func))
     (type (;1;) (func (param i64 i32 i32)))
@@ -103,9 +103,6 @@
   (core func (;4;) (canon lower (func 1) (memory 0) string-encoding=utf8))
   (alias export 1 "baz" (func (;2;)))
   (core func (;5;) (canon lower (func 2) (memory 0) (realloc 3)))
-  (@producers
-    (processed-by "wit-component" "$CARGO_PKG_VERSION")
-  )
   (core instance (;5;)
     (export "$imports" (table 0))
     (export "0" (func 4))
@@ -114,5 +111,8 @@
   (core instance (;6;) (instantiate 2
       (with "" (instance 5))
     )
+  )
+  (@producers
+    (processed-by "wit-component" "$CARGO_PKG_VERSION")
   )
 )

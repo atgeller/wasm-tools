@@ -7,8 +7,13 @@
           (export (;1;) "the-enum" (type (eq 0)))
         )
       )
-      (export (;0;) (interface "foo:foo/shared") (instance (type 0)))
-      (type (;1;)
+      (export (;0;) "foo:foo/shared-items" (instance (type 0)))
+    )
+  )
+  (export (;1;) "shared-items" (type 0))
+  (type (;2;)
+    (component
+      (type (;0;)
         (component
           (type (;0;)
             (instance
@@ -16,7 +21,7 @@
               (export (;1;) "the-enum" (type (eq 0)))
             )
           )
-          (import (interface "foo:foo/shared") (instance (;0;) (type 0)))
+          (import "foo:foo/shared-items" (instance (;0;) (type 0)))
           (alias export 0 "the-enum" (type (;1;)))
           (type (;2;)
             (instance
@@ -34,8 +39,13 @@
           (import "bar" (instance (;2;) (type 3)))
         )
       )
-      (export (;0;) (interface "foo:foo/w1") (component (type 1)))
-      (type (;2;)
+      (export (;0;) "foo:foo/w1" (component (type 0)))
+    )
+  )
+  (export (;3;) "w1" (type 2))
+  (type (;4;)
+    (component
+      (type (;0;)
         (component
           (type (;0;)
             (instance
@@ -43,7 +53,7 @@
               (export (;1;) "the-enum" (type (eq 0)))
             )
           )
-          (import (interface "foo:foo/shared") (instance (;0;) (type 0)))
+          (import "foo:foo/shared-items" (instance (;0;) (type 0)))
           (alias export 0 "the-enum" (type (;1;)))
           (type (;2;)
             (instance
@@ -61,8 +71,13 @@
           (export (;2;) "bar" (instance (type 3)))
         )
       )
-      (export (;1;) (interface "foo:foo/w2") (component (type 2)))
-      (type (;3;)
+      (export (;0;) "foo:foo/w2" (component (type 0)))
+    )
+  )
+  (export (;5;) "w2" (type 4))
+  (type (;6;)
+    (component
+      (type (;0;)
         (component
           (type (;0;)
             (instance
@@ -70,7 +85,7 @@
               (export (;1;) "the-enum" (type (eq 0)))
             )
           )
-          (import (interface "foo:foo/shared") (instance (;0;) (type 0)))
+          (import "foo:foo/shared-items" (instance (;0;) (type 0)))
           (alias export 0 "the-enum" (type (;1;)))
           (type (;2;)
             (instance
@@ -81,11 +96,11 @@
           (export (;1;) "bar" (instance (type 2)))
         )
       )
-      (export (;2;) (interface "foo:foo/w3") (component (type 3)))
+      (export (;0;) "foo:foo/w3" (component (type 0)))
     )
   )
+  (export (;7;) "w3" (type 6))
   (@producers
     (processed-by "wit-component" "$CARGO_PKG_VERSION")
   )
-  (export (;1;) (interface "foo:foo/wit") (type 0))
 )

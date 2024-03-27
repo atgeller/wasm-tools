@@ -5,7 +5,7 @@
       (export (;0;) "foo" (func (type 0)))
     )
   )
-  (import (interface "foo:foo/adapter-imports") (instance (;0;) (type 0)))
+  (import "foo:foo/adapter-imports" (instance (;0;) (type 0)))
   (type (;1;) (func (param "x" string)))
   (import "foo" (func (;0;) (type 1)))
   (core module (;0;)
@@ -108,8 +108,8 @@
   (export (;3;) "bar" (func 2))
   (alias core export 4 "adapter-bar" (core func (;6;)))
   (func (;4;) (type 1) (canon lift (core func 6) (memory 0) (realloc 2) string-encoding=utf8))
+  (export (;5;) "adapter-bar" (func 4))
   (@producers
     (processed-by "wit-component" "$CARGO_PKG_VERSION")
   )
-  (export (;5;) "adapter-bar" (func 4))
 )

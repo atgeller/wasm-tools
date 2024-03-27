@@ -7,7 +7,7 @@ use std::{
     mem,
     ops::Deref,
 };
-use wasm_encoder::{Encode, EntityType, Instruction};
+use wasm_encoder::{Encode, EntityType, Instruction, RawCustomSection};
 use wasmparser::*;
 
 const PAGE_SIZE: i32 = 64 * 1024;
@@ -17,9 +17,9 @@ const PAGE_SIZE: i32 = 64 * 1024;
 ///
 /// This internally performs a "gc" pass after removing exports to ensure that
 /// the resulting module imports the minimal set of functions necessary.
-pub fn run(
+pub fn run<T>(
     wasm: &[u8],
-    required: &IndexMap<String, FuncType>,
+    required: &IndexMap<String, T>,
     main_module_realloc: Option<&str>,
 ) -> Result<Vec<u8>> {
     assert!(!required.is_empty());
@@ -118,10 +118,10 @@ fn realloc_via_memory_grow() -> wasm_encoder::Function {
 
 #[repr(i32)]
 #[non_exhaustive]
-enum AllocationState {
-    StackUnallocated,
-    StackAllocating,
-    StackAllocated,
+enum StackAllocationState {
+    Unallocated,
+    Allocating,
+    Allocated,
 }
 
 fn allocate_stack_via_realloc(
@@ -136,10 +136,10 @@ fn allocate_stack_via_realloc(
     if let Some(allocation_state) = allocation_state {
         // This means we're lazily allocating the stack, keeping track of state via `$allocation_state`
         func.instruction(&GlobalGet(allocation_state));
-        func.instruction(&I32Const(AllocationState::StackUnallocated as _));
+        func.instruction(&I32Const(StackAllocationState::Unallocated as _));
         func.instruction(&I32Eq);
         func.instruction(&If(wasm_encoder::BlockType::Empty));
-        func.instruction(&I32Const(AllocationState::StackAllocating as _));
+        func.instruction(&I32Const(StackAllocationState::Allocating as _));
         func.instruction(&GlobalSet(allocation_state));
         // We could also set `sp` to zero here to ensure the yet-to-be-allocated stack is empty.  However, we
         // assume it defaults to zero anyway, in which case setting it would be redundant.
@@ -155,7 +155,7 @@ fn allocate_stack_via_realloc(
     func.instruction(&GlobalSet(sp));
 
     if let Some(allocation_state) = allocation_state {
-        func.instruction(&I32Const(AllocationState::StackAllocated as _));
+        func.instruction(&I32Const(StackAllocationState::Allocated as _));
         func.instruction(&GlobalSet(allocation_state));
         func.instruction(&End);
     }
@@ -178,7 +178,7 @@ type WorklistFunc<'a> = fn(&mut Module<'a>, u32) -> Result<()>;
 #[derive(Default)]
 struct Module<'a> {
     // Definitions found when parsing a module
-    types: Vec<wasmparser::Type>,
+    types: Vec<FuncType>,
     tables: Vec<Table<'a>>,
     globals: Vec<Global<'a>>,
     memories: Vec<Memory<'a>>,
@@ -245,8 +245,8 @@ impl<'a> Module<'a> {
                 }
                 Payload::End(_) => {}
                 Payload::TypeSection(s) => {
-                    for ty in s {
-                        self.types.push(ty?);
+                    for ty in s.into_iter_err_on_gc_types() {
+                        self.types.push(ty?.into());
                     }
                 }
                 Payload::ImportSection(s) => {
@@ -392,8 +392,8 @@ impl<'a> Module<'a> {
     }
 
     fn parse_producers_section(&mut self, section: &CustomSectionReader<'a>) -> Result<()> {
-        let section = ProducersSectionReader::new(section.data(), section.data_offset())?;
-        let producers = wasm_metadata::Producers::from_reader(section)?;
+        let producers =
+            wasm_metadata::Producers::from_bytes(section.data(), section.data_offset())?;
         self.producers = Some(producers);
         Ok(())
     }
@@ -480,13 +480,6 @@ impl<'a> Module<'a> {
         }
     }
 
-    fn storagety(&mut self, ty: StorageType) {
-        match ty {
-            StorageType::I8 | StorageType::I16 => {}
-            StorageType::Val(ty) => self.valty(ty),
-        }
-    }
-
     fn heapty(&mut self, ty: HeapType) {
         match ty {
             HeapType::Func
@@ -499,7 +492,7 @@ impl<'a> Module<'a> {
             | HeapType::Struct
             | HeapType::Array
             | HeapType::I31 => {}
-            HeapType::Indexed(i) => self.ty(i.into()),
+            HeapType::Concrete(i) => self.ty(i.as_module_index().unwrap()),
         }
     }
 
@@ -508,16 +501,10 @@ impl<'a> Module<'a> {
             return;
         }
         self.worklist.push((ty, |me, ty| {
-            match me.types[ty as usize].clone() {
-                Type::Func(ty) => {
-                    for param in ty.params().iter().chain(ty.results()) {
-                        me.valty(*param);
-                    }
-                }
-                Type::Array(ty) => {
-                    me.storagety(ty.element_type);
-                }
-            };
+            let ty = me.types[ty as usize].clone();
+            for param in ty.params().iter().chain(ty.results()) {
+                me.valty(*param);
+            }
             Ok(())
         }));
     }
@@ -529,7 +516,7 @@ impl<'a> Module<'a> {
         Ok(())
     }
 
-    fn live_types(&self) -> impl Iterator<Item = (u32, &wasmparser::Type)> + '_ {
+    fn live_types(&self) -> impl Iterator<Item = (u32, &FuncType)> + '_ {
         live_iter(&self.live_types, self.types.iter())
     }
 
@@ -569,23 +556,17 @@ impl<'a> Module<'a> {
         let mut empty_type = None;
         for (i, ty) in self.live_types() {
             map.types.push(i);
-            match ty {
-                Type::Func(ty) => {
-                    types.function(
-                        ty.params().iter().copied().map(|t| map.valty(t)),
-                        ty.results().iter().copied().map(|t| map.valty(t)),
-                    );
 
-                    // Keep track of the "empty type" to see if we can reuse an
-                    // existing one or one needs to be injected if a `start`
-                    // function is calculated at the end.
-                    if ty.params().is_empty() && ty.results().is_empty() {
-                        empty_type = Some(map.types.remap(i));
-                    }
-                }
-                Type::Array(ty) => {
-                    types.array(map.storagety(ty.element_type), ty.mutable);
-                }
+            types.function(
+                ty.params().iter().map(|t| map.valty(*t)),
+                ty.results().iter().map(|t| map.valty(*t)),
+            );
+
+            // Keep track of the "empty type" to see if we can reuse an
+            // existing one or one needs to be injected if a `start`
+            // function is calculated at the end.
+            if ty.params().is_empty() && ty.results().is_empty() {
+                empty_type = Some(map.types.remap(i));
             }
         }
 
@@ -966,7 +947,7 @@ impl<'a> Module<'a> {
             });
         }
         if let Some(producers) = &self.producers {
-            ret.section(&producers.section());
+            ret.section(&RawCustomSection(&producers.raw_custom_section()));
         }
 
         Ok(ret.finish())
@@ -1114,14 +1095,6 @@ impl Encoder {
         }
     }
 
-    fn storagety(&self, ty: StorageType) -> wasm_encoder::StorageType {
-        match ty {
-            StorageType::I8 => wasm_encoder::StorageType::I8,
-            StorageType::I16 => wasm_encoder::StorageType::I16,
-            StorageType::Val(ty) => wasm_encoder::StorageType::Val(self.valty(ty)),
-        }
-    }
-
     fn refty(&self, rt: wasmparser::RefType) -> wasm_encoder::RefType {
         wasm_encoder::RefType {
             nullable: rt.is_nullable(),
@@ -1141,8 +1114,8 @@ impl Encoder {
             HeapType::Struct => wasm_encoder::HeapType::Struct,
             HeapType::Array => wasm_encoder::HeapType::Array,
             HeapType::I31 => wasm_encoder::HeapType::I31,
-            HeapType::Indexed(idx) => {
-                wasm_encoder::HeapType::Indexed(self.types.remap(idx.into()).try_into().unwrap())
+            HeapType::Concrete(idx) => {
+                wasm_encoder::HeapType::Concrete(self.types.remap(idx.as_module_index().unwrap()))
             }
         }
     }

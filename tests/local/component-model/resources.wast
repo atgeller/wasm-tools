@@ -7,15 +7,13 @@
 
   (core func (canon resource.new $x))
   (core func (canon resource.rep $x))
-  (core func (canon resource.drop (own $x)))
-  (core func (canon resource.drop (borrow $x)))
+  (core func (canon resource.drop $x))
 )
 
 (component
   (import "x" (type $x (sub resource)))
 
-  (core func (canon resource.drop (own $x)))
-  (core func (canon resource.drop (borrow $x)))
+  (core func (canon resource.drop $x))
 )
 
 (component
@@ -31,14 +29,12 @@
   (type $x (resource (rep i32)))
   (core func $f1 (canon resource.new $x))
   (core func $f2 (canon resource.rep $x))
-  (core func $f3 (canon resource.drop (own $x)))
-  (core func $f4 (canon resource.drop (borrow $x)))
+  (core func $f3 (canon resource.drop $x))
 
   (core module $m
     (import "" "f1" (func (param i32) (result i32)))
     (import "" "f2" (func (param i32) (result i32)))
     (import "" "f3" (func (param i32)))
-    (import "" "f4" (func (param i32)))
   )
 
   (core instance (instantiate $m
@@ -46,7 +42,6 @@
       (export "f1" (func $f1))
       (export "f2" (func $f2))
       (export "f3" (func $f3))
-      (export "f4" (func $f4))
     ))
   ))
 )
@@ -99,16 +94,10 @@
 
 (assert_invalid
   (component
-    (core func (canon resource.drop u8))
-  )
-  "must be an own or borrow type")
-
-(assert_invalid
-  (component
-    (type $t (record))
+    (type $t (tuple u32))
     (core func (canon resource.drop $t))
   )
-  "must be an own or borrow type")
+  "not a resource type")
 
 (assert_invalid
   (component
@@ -121,7 +110,7 @@
     (type (component))
     (core func (canon resource.drop 0))
   )
-  "not a defined type")
+  "not a resource type")
 
 (assert_invalid
   (component
@@ -365,8 +354,7 @@
   )
   (instance $c (instantiate $C))
   (alias export $c "R" (type $R))
-  (core func (canon resource.drop (own $R)))
-  (core func (canon resource.drop (borrow $R)))
+  (core func (canon resource.drop $R))
 )
 
 (component
@@ -402,7 +390,7 @@
     (type $X' (resource (rep i32)))
     (export $X "X" (type $X'))
 
-    (core func $f (canon resource.drop (own $X)))
+    (core func $f (canon resource.drop $X))
     (func (export "f") (param "X" (own $X)) (canon lift (core func $f)))
   )
   (instance $c1 (instantiate $C1))
@@ -423,7 +411,7 @@
       (type $X' (resource (rep i32)))
       (export $X "X" (type $X'))
 
-      (core func $f (canon resource.drop (own $X)))
+      (core func $f (canon resource.drop $X))
       (func (export "f") (param "X" (own $X)) (canon lift (core func $f)))
     )
     (instance $c1 (instantiate $C1))
@@ -446,7 +434,7 @@
     (export $X1 "X1" (type $X))
     (export $X2 "X2" (type $X))
 
-    (core func $f (canon resource.drop (own $X)))
+    (core func $f (canon resource.drop $X))
     (func (export "f1") (param "X" (own $X1)) (canon lift (core func $f)))
     (func (export "f2") (param "X" (own $X2)) (canon lift (core func $f)))
   )
@@ -472,7 +460,7 @@
     (export $X1 "X1" (type $X))
     (export $X2 "X2" (type $X))
 
-    (core func $f (canon resource.drop (own $X)))
+    (core func $f (canon resource.drop $X))
     (func (export "f1") (param "X" (own $X1)) (canon lift (core func $f)))
     (func (export "f2") (param "X" (own $X2)) (canon lift (core func $f)))
   )
@@ -500,7 +488,7 @@
     (type $x u32)
     (instance (instantiate $c (with "x" (type $x))))
   )
-  "expected resource, found type")
+  "expected resource, found defined type")
 
 (assert_invalid
   (component
@@ -511,7 +499,7 @@
     (type $x (resource (rep i32)))
     (instance (instantiate $c (with "x" (type $x))))
   )
-  "expected type, found resource")
+  "expected defined type, found resource")
 
 (assert_invalid
   (component
@@ -561,7 +549,7 @@
   (component
     (type $r (resource (rep i32)))
 
-    (core func $f (canon resource.drop (own $r)))
+    (core func $f (canon resource.drop $r))
     (func (export "f") (param "x" (own $r))
       (canon lift (core func $f)))
   )
@@ -572,7 +560,7 @@
   (type $r' (resource (rep i32)))
   (export $r "r" (type $r'))
 
-  (core func $f (canon resource.drop (own $r)))
+  (core func $f (canon resource.drop $r))
   (func (export "f") (param "x" (own $r))
     (canon lift (core func $f)))
 )
@@ -586,7 +574,7 @@
   (export $i "i" (instance $i'))
   (alias export $i "r" (type $r))
 
-  (core func $f (canon resource.drop (own $r)))
+  (core func $f (canon resource.drop $r))
   (func (export "f") (param "x" (own $r))
     (canon lift (core func $f)))
 )
@@ -604,7 +592,7 @@
   (alias export $i2 "i" (instance $i))
   (alias export $i "r" (type $r))
 
-  (core func $f (canon resource.drop (own $r)))
+  (core func $f (canon resource.drop $r))
   (func (export "f") (param "x" (own $r))
     (canon lift (core func $f)))
 )
@@ -620,7 +608,7 @@
   (export $c "c" (instance $c'))
   (alias export $c "y" (type $r))
 
-  (core func $f (canon resource.drop (own $r)))
+  (core func $f (canon resource.drop $r))
   (func (export "f") (param "x" (own $r))
     (canon lift (core func $f)))
 )
@@ -651,7 +639,7 @@
   ))
   (export $r "x" (type $c2 "y"))
 
-  (core func $f (canon resource.drop (own $r)))
+  (core func $f (canon resource.drop $r))
   (func (export "f") (param "x" (own $r))
     (canon lift (core func $f)))
 )
@@ -673,7 +661,7 @@
   (alias export $c "y" (instance $y))
   (alias export $y "t" (type $r))
 
-  (core func $f (canon resource.drop (own $r)))
+  (core func $f (canon resource.drop $r))
   (func (export "f") (param "x" (own $r))
     (canon lift (core func $f)))
 )
@@ -1112,3 +1100,54 @@
     ))
   )
   "resource types are not the same")
+
+(component
+  (type (export "x") (component
+    (type $t' (instance
+      (export "r" (type (sub resource)))
+    ))
+    (export $t "t" (instance (type $t')))
+    (alias export $t "r" (type $r))
+    (type $t2' (instance
+      (export "r2" (type (eq $r)))
+      (export "r" (type (sub resource)))
+    ))
+    (export "t2" (instance (type $t2')))
+  ))
+)
+
+(component
+  (type (component
+    (type (instance
+      (export "bar" (type (sub resource)))
+      (export "[static]bar.a" (func))
+    ))
+    (export "x" (instance (type 0)))
+  ))
+)
+
+(assert_invalid
+  (component
+    (type $r (resource (rep i32)))
+    (type (func (result (borrow $r))))
+  )
+  "function result cannot contain a `borrow` type")
+(assert_invalid
+  (component
+    (type $r (resource (rep i32)))
+    (type (func (result (list (borrow $r)))))
+  )
+  "function result cannot contain a `borrow` type")
+(assert_invalid
+  (component
+    (type $r (resource (rep i32)))
+    (type (func (result (option (borrow $r)))))
+  )
+  "function result cannot contain a `borrow` type")
+(assert_invalid
+  (component
+    (type $r (resource (rep i32)))
+    (type $t (record (field "f" (borrow $r))))
+    (type (func (result (option (list $t)))))
+  )
+  "function result cannot contain a `borrow` type")

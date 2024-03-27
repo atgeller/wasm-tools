@@ -9,7 +9,7 @@
       (export (;0;) "a" (func (type 4)))
     )
   )
-  (import (interface "foo:foo/foo") (instance (;0;) (type 0)))
+  (import "foo:foo/foo" (instance (;0;) (type 0)))
   (core module (;0;)
     (type (;0;) (func (param i32)))
     (type (;1;) (func (param i32 i32 i32 i32) (result i32)))
@@ -43,8 +43,8 @@
   (type (;1;) (func (param "b" u8)))
   (alias core export 1 "a" (core func (;2;)))
   (func (;1;) (type 1) (canon lift (core func 2)))
+  (export (;2;) "a" (func 1))
   (@producers
     (processed-by "wit-component" "$CARGO_PKG_VERSION")
   )
-  (export (;2;) "a" (func 1))
 )

@@ -26,10 +26,8 @@ use std::ops::{Deref, DerefMut};
 use std::u32::MAX;
 
 use crate::{
-    limits::MAX_WASM_FUNCTION_LOCALS,
-    validator::solver::{ConstraintSolver, Z3},
-    BinOp, BinaryReaderError, BlockType, BrTable, Constant, Constraint, HeapType, Ieee32, Ieee64,
-    IndexTerm, MemArg, RefType, RelOp, Result, TestOp, UnOp, ValType, VisitOperator, WasmFeatures,
+    limits::MAX_WASM_FUNCTION_LOCALS, validator::solver::{ConstraintSolver, Z3}, BinOp, BinaryReaderError, BlockType, BrTable, Constant, Constraint, HeapType, Ieee32,
+    Ieee64, IndexTerm, MemArg, RefType, RelOp, Result, TestOp, UnOp, UnpackedIndex, ValType, VisitOperator, WasmFeatures,
     WasmFuncType, WasmModuleResources, V128,
 };
 
@@ -323,10 +321,10 @@ impl OperatorValidator {
         &mut self,
         offset: usize,
         count: u32,
-        ty: ValType,
+        mut ty: ValType,
         resources: &impl WasmModuleResources,
     ) -> Result<()> {
-        resources.check_value_type(ty, &self.features, offset)?;
+        resources.check_value_type(&mut ty, &self.features, offset)?;
         if count == 0 {
             return Ok(());
         }
@@ -786,6 +784,23 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         T: Into<MaybeType>,
     {
         let maybe_ty = ty.into();
+
+        if cfg!(debug_assertions) {
+            match maybe_ty {
+                MaybeType::Type(ValType::Ref(r)) => match r.heap_type() {
+                    HeapType::Concrete(index) => {
+                        debug_assert!(
+                            matches!(index, UnpackedIndex::Id(_)),
+                            "only ref types referencing `CoreTypeId`s can \
+                             be pushed to the operand stack"
+                        );
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
         let index = self.indices.len() as u32;
         self.indices.push(Some(maybe_ty));
         self.operands.push((maybe_ty, index));
@@ -859,7 +874,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             if self.operands.len() == control.height {
                 let desc = match expected {
                     Some(ty) => ty_to_str(ty),
-                    None => "a type",
+                    None => "a type".into(),
                 };
                 bail!(
                     self.offset,
@@ -878,10 +893,10 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 // but not any integer types.
                 | (MaybeType::HeapBot, ValType::Ref(_)) => {}
 
-                // Use the `matches` predicate to test if a found type matches
+                // Use the `is_subtype` predicate to test if a found type matches
                 // the expectation.
                 (MaybeType::Type(actual), expected) => {
-                    if !self.resources.matches(actual, expected) {
+                    if !self.resources.is_subtype(actual, expected) {
                         bail!(
                             self.offset,
                             "type mismatch: expected {}, found {}",
@@ -1186,7 +1201,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 let offset = (memarg.offset + size / 8) as i32;
                 // constraint!(= (i32 1) (i32.lt_u (i32.add (i32 offset) index) (i32 initial_size)));
                 let cond = Constraint::Eq(
-                    IndexTerm::IConstant(Constant::I32Const(0)),
+                    IndexTerm::IConstant(Constant::I32Const(1)),
                     IndexTerm::IRelOp(
                         RelOp::I32LtU,
                         Box::new(IndexTerm::IBinOp(
@@ -1287,7 +1302,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     }
 
     /// Validates a block type, primarily with various in-flight proposals.
-    fn check_block_type(&self, ty: BlockType) -> Result<()> {
+    fn check_block_type(&self, ty: &mut BlockType) -> Result<()> {
         match ty {
             BlockType::Empty => Ok(()),
             BlockType::Type(t) => self
@@ -1301,7 +1316,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                          when multi-value is not enabled",
                     );
                 }
-                self.func_type_at(idx)?;
+                self.func_type_at(*idx)?;
                 Ok(())
             }
         }
@@ -1310,7 +1325,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
     /// Validates a `call` instruction, ensuring that the function index is
     /// in-bounds and the right types are on the stack to call the function.
     fn check_call(&mut self, function_index: u32) -> Result<()> {
-        let ty = match self.resources.type_index_of_function(function_index) {
+        let ty = match self.resources.type_of_function(function_index) {
             Some(i) => i,
             None => {
                 bail!(
@@ -1322,7 +1337,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         self.check_call_ty(ty)
     }
 
-    fn check_call_ty(&mut self, type_index: u32) -> Result<()> {
+    fn check_call_type_index(&mut self, type_index: u32) -> Result<()> {
         let ty = match self.resources.func_type_at(type_index) {
             Some(i) => i,
             None => {
@@ -1332,15 +1347,20 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
                 );
             }
         };
+        self.check_call_ty(ty)
+    }
 
+    fn check_call_ty(&mut self, ty: &R::IndexedFuncType) -> Result<()> {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         for ty in ty.inputs().rev() {
+            debug_assert_type_indices_are_ids(ty);
             let (_, idx) = self.pop_operand(Some(ty))?;
             inputs.push(idx);
         }
         inputs.reverse();
         for ty in ty.outputs() {
+            debug_assert_type_indices_are_ids(ty);
             outputs.push(self.push_operand(ty)?);
         }
 
@@ -1371,7 +1391,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
             Some(tab) => {
                 if !self
                     .resources
-                    .matches(ValType::Ref(tab.element_type), ValType::FUNCREF)
+                    .is_subtype(ValType::Ref(tab.element_type), ValType::FUNCREF)
                 {
                     bail!(
                         self.offset,
@@ -1382,7 +1402,7 @@ impl<'resources, R: WasmModuleResources> OperatorValidatorTemp<'_, 'resources, R
         }
         let ty = self.func_type_at(index)?;
         self.pop_operand(Some(ValType::I32))?;
-        for ty in ty.inputs().rev() {
+        for ty in ty.clone().inputs().rev() {
             self.pop_operand(Some(ty))?;
         }
         for ty in ty.outputs() {
@@ -1750,6 +1770,21 @@ where
     for_each_operator!(validate_proposal);
 }
 
+#[track_caller]
+#[inline]
+fn debug_assert_type_indices_are_ids(ty: ValType) {
+    if cfg!(debug_assertions) {
+        if let ValType::Ref(r) = ty {
+            if let HeapType::Concrete(idx) = r.heap_type() {
+                debug_assert!(
+                    matches!(idx, UnpackedIndex::Id(_)),
+                    "type reference should be a `CoreTypeId`, found {idx:?}"
+                );
+            }
+        }
+    }
+}
+
 impl<'a, T> VisitOperator<'a> for OperatorValidatorTemp<'_, '_, T>
 where
     T: WasmModuleResources,
@@ -1763,8 +1798,8 @@ where
         self.unreachable()?;
         Ok(())
     }
-    fn visit_block(&mut self, ty: BlockType) -> Self::Output {
-        self.check_block_type(ty)?;
+    fn visit_block(&mut self, mut ty: BlockType) -> Self::Output {
+        self.check_block_type(&mut ty)?;
         let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
             let (_, idx) = self.pop_operand(Some(ty))?;
@@ -1774,8 +1809,8 @@ where
 
         Ok(())
     }
-    fn visit_loop(&mut self, ty: BlockType) -> Self::Output {
-        self.check_block_type(ty)?;
+    fn visit_loop(&mut self, mut ty: BlockType) -> Self::Output {
+        self.check_block_type(&mut ty)?;
         let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
             let (_, idx) = self.pop_operand(Some(ty))?;
@@ -1784,8 +1819,8 @@ where
         self.push_ctrl(FrameKind::Loop, ty, pres, None)?;
         Ok(())
     }
-    fn visit_if(&mut self, ty: BlockType) -> Self::Output {
-        self.check_block_type(ty)?;
+    fn visit_if(&mut self, mut ty: BlockType) -> Self::Output {
+        self.check_block_type(&mut  ty)?;
         let (_, cond) = self.pop_operand(Some(ValType::I32))?;
         let mut pres = Vec::new();
         for ty in self.params(ty)?.rev() {
@@ -1817,14 +1852,33 @@ where
         self.constraints.push(constraint);
         Ok(())
     }
-    fn visit_try(&mut self, _ty: BlockType) -> Self::Output {
+    fn visit_try(&mut self, mut ty: BlockType) -> Self::Output {
         bail!(self.offset, "unsupported instrunction - try");
+        /*self.check_block_type(&mut ty)?;
+        for ty in self.params(ty)?.rev() {
+            self.pop_operand(Some(ty))?;
+        }
+        self.push_ctrl(FrameKind::Try, ty)?;
+        Ok(())*/
     }
     fn visit_catch(&mut self, _index: u32) -> Self::Output {
         bail!(self.offset, "unsupported instrunction - catch");
     }
-    fn visit_throw(&mut self, _index: u32) -> Self::Output {
+    fn visit_throw(&mut self, index: u32) -> Self::Output {
         bail!(self.offset, "unsupported instrunction - throw");
+        // Check values associated with the exception.
+        /*let ty = self.tag_at(index)?;
+        for ty in ty.clone().inputs().rev() {
+            self.pop_operand(Some(ty))?;
+        }
+        if ty.outputs().len() > 0 {
+            bail!(
+                self.offset,
+                "result type expected to be empty for exception"
+            );
+        }
+        self.unreachable()?;
+        Ok(())*/
     }
     fn visit_rethrow(&mut self, _relative_depth: u32) -> Self::Output {
         bail!(self.offset, "unsupported instrunction - rethrow");
@@ -1914,13 +1968,13 @@ where
         );
         let br_constraint = Constraint::Not(Box::new(no_br_constraint.clone()));
 
-        self.constraints.push(no_br_constraint);
+        self.constraints.push(br_constraint);
         if !self.check_condition_is_satisfied(&condition) {
             bail!(self.offset, "br_if - branching condition not met")
         }
         self.constraints.pop();
 
-        self.constraints.push(br_constraint);
+        self.constraints.push(no_br_constraint);
 
         for (idx, ty) in types.clone().rev().enumerate() {
             let old_idx = args[idx];
@@ -1974,25 +2028,22 @@ where
         Ok(())
     }
     fn visit_call_ref(&mut self, type_index: u32) -> Self::Output {
-        let hty = HeapType::Indexed(type_index);
-        self.resources
-            .check_heap_type(hty, &self.features, self.offset)?;
+        let unpacked_index = UnpackedIndex::Module(type_index);
+        let mut hty = HeapType::Concrete(unpacked_index);
+        self.resources.check_heap_type(&mut hty, self.offset)?;
         // If `None` is popped then that means a "bottom" type was popped which
         // is always considered equivalent to the `hty` tag.
         if let Some(rt) = self.pop_ref()? {
-            let expected = RefType::indexed_func(true, type_index)
-                .expect("existing heap types should be within our limits");
-            if !self
-                .resources
-                .matches(ValType::Ref(rt), ValType::Ref(expected))
-            {
+            let expected = RefType::new(true, hty).expect("hty should be previously validated");
+            let expected = ValType::Ref(expected);
+            if !self.resources.is_subtype(ValType::Ref(rt), expected) {
                 bail!(
                     self.offset,
                     "type mismatch: funcref on stack does not match specified type",
                 );
             }
         }
-        self.check_call_ty(type_index)
+        self.check_call_type_index(type_index)
     }
     fn visit_return_call_ref(&mut self, type_index: u32) -> Self::Output {
         self.visit_call_ref(type_index)?;
@@ -2064,14 +2115,14 @@ where
                 IndexTerm::IConstant(Constant::I32Const(0)),
             )),
             Box::new(Constraint::Eq(IndexTerm::Alpha(x), IndexTerm::Alpha(a1))),
-            Box::new(Constraint::Eq(IndexTerm::Alpha(x), IndexTerm::Alpha(2))),
+            Box::new(Constraint::Eq(IndexTerm::Alpha(x), IndexTerm::Alpha(a2))),
         );
         self.constraints.push(constraint);
         Ok(())
     }
-    fn visit_typed_select(&mut self, ty: ValType) -> Self::Output {
+    fn visit_typed_select(&mut self, mut ty: ValType) -> Self::Output {
         self.resources
-            .check_value_type(ty, &self.features, self.offset)?;
+            .check_value_type(&mut ty, &self.features, self.offset)?;
         self.pop_operand(Some(ValType::I32))?;
         self.pop_operand(Some(ty))?;
         self.pop_operand(Some(ty))?;
@@ -2080,6 +2131,7 @@ where
     }
     fn visit_local_get(&mut self, local_index: u32) -> Self::Output {
         let (ty, l_idx) = self.local(local_index)?;
+        debug_assert_type_indices_are_ids(ty);
         if !self.local_inits[local_index as usize] {
             bail!(self.offset, "uninitialized local: {}", local_index);
         }
@@ -2117,7 +2169,9 @@ where
     }
     fn visit_global_get(&mut self, global_index: u32) -> Self::Output {
         if let Some(ty) = self.resources.global_at(global_index) {
-            self.push_operand(ty.content_type)?;
+            let ty = ty.content_type;
+            debug_assert_type_indices_are_ids(ty);
+            self.push_operand(ty)?;
         } else {
             bail!(self.offset, "unknown global: global index out of bounds");
         };
@@ -2931,12 +2985,18 @@ where
     fn visit_atomic_fence(&mut self) -> Self::Output {
         Ok(())
     }
-    fn visit_ref_null(&mut self, heap_type: HeapType) -> Self::Output {
+    fn visit_ref_null(&mut self, mut heap_type: HeapType) -> Self::Output {
+        if let Some(ty) = RefType::new(true, heap_type) {
+            self.features
+                .check_ref_type(ty)
+                .map_err(|e| BinaryReaderError::new(e, self.offset))?;
+        }
         self.resources
-            .check_heap_type(heap_type, &self.features, self.offset)?;
-        self.push_operand(ValType::Ref(
+            .check_heap_type(&mut heap_type, self.offset)?;
+        let ty = ValType::Ref(
             RefType::new(true, heap_type).expect("existing heap types should be within our limits"),
-        ))?;
+        );
+        self.push_operand(ty)?;
         Ok(())
     }
 
@@ -2983,7 +3043,7 @@ where
                 // perform the match because if the branch is taken it's a
                 // non-null value.
                 let ty = rt0.as_non_null();
-                if !self.resources.matches(ty.into(), rt1) {
+                if !self.resources.is_subtype(ty.into(), rt1) {
                     bail!(
                         self.offset,
                         "type mismatch: expected {} but found {}",
@@ -3013,8 +3073,8 @@ where
         Ok(())
     }
     fn visit_ref_func(&mut self, function_index: u32) -> Self::Output {
-        let type_index = match self.resources.type_index_of_function(function_index) {
-            Some(idx) => idx,
+        let type_id = match self.resources.type_id_of_function(function_index) {
+            Some(id) => id,
             None => bail!(
                 self.offset,
                 "unknown function {}: function index out of bounds",
@@ -3025,16 +3085,13 @@ where
             bail!(self.offset, "undeclared function reference");
         }
 
-        // FIXME(#924) this should not be conditional based on enabled
-        // proposals.
-        if self.features.function_references {
-            self.push_operand(
-                RefType::indexed_func(false, type_index)
-                    .expect("our limits on number of types should fit into ref type"),
-            )?;
-        } else {
-            self.push_operand(ValType::FUNCREF)?;
-        }
+        let index = UnpackedIndex::Id(type_id);
+        let ty = ValType::Ref(
+            RefType::new(false, HeapType::Concrete(index)).ok_or_else(|| {
+                BinaryReaderError::new("implementation limit: type index too large", self.offset)
+            })?,
+        );
+        self.push_operand(ty)?;
         Ok(())
     }
     fn visit_v128_load(&mut self, memarg: MemArg) -> Self::Output {
@@ -3989,7 +4046,10 @@ where
                 segment
             ),
         };
-        if segment_ty != table.element_type {
+        if !self
+            .resources
+            .is_subtype(ValType::Ref(segment_ty), ValType::Ref(table.element_type))
+        {
             bail!(self.offset, "type mismatch");
         }
         self.pop_operand(Some(ValType::I32))?;
@@ -4016,7 +4076,7 @@ where
             (Some(a), Some(b)) => (a, b),
             _ => bail!(self.offset, "table index out of bounds"),
         };
-        if !self.resources.matches(
+        if !self.resources.is_subtype(
             ValType::Ref(src.element_type),
             ValType::Ref(dst.element_type),
         ) {
@@ -4032,26 +4092,30 @@ where
             Some(ty) => ty.element_type,
             None => bail!(self.offset, "table index out of bounds"),
         };
+        let ty = ValType::Ref(ty);
+        debug_assert_type_indices_are_ids(ty);
         self.pop_operand(Some(ValType::I32))?;
-        self.push_operand(ValType::Ref(ty))?;
+        self.push_operand(ty)?;
         Ok(())
     }
     fn visit_table_set(&mut self, table: u32) -> Self::Output {
         let ty = match self.resources.table_at(table) {
-            Some(ty) => ty.element_type,
+            Some(ty) => ValType::Ref(ty.element_type),
             None => bail!(self.offset, "table index out of bounds"),
         };
-        self.pop_operand(Some(ValType::Ref(ty)))?;
+        debug_assert_type_indices_are_ids(ty);
+        self.pop_operand(Some(ty))?;
         self.pop_operand(Some(ValType::I32))?;
         Ok(())
     }
     fn visit_table_grow(&mut self, table: u32) -> Self::Output {
         let ty = match self.resources.table_at(table) {
-            Some(ty) => ty.element_type,
+            Some(ty) => ValType::Ref(ty.element_type),
             None => bail!(self.offset, "table index out of bounds"),
         };
+        debug_assert_type_indices_are_ids(ty);
         self.pop_operand(Some(ValType::I32))?;
-        self.pop_operand(Some(ValType::Ref(ty)))?;
+        self.pop_operand(Some(ty))?;
         self.push_operand(ValType::I32)?;
         Ok(())
     }
@@ -4064,15 +4128,16 @@ where
     }
     fn visit_table_fill(&mut self, table: u32) -> Self::Output {
         let ty = match self.resources.table_at(table) {
-            Some(ty) => ty.element_type,
+            Some(ty) => ValType::Ref(ty.element_type),
             None => bail!(self.offset, "table index out of bounds"),
         };
+        debug_assert_type_indices_are_ids(ty);
         self.pop_operand(Some(ValType::I32))?;
-        self.pop_operand(Some(ValType::Ref(ty)))?;
+        self.pop_operand(Some(ty))?;
         self.pop_operand(Some(ValType::I32))?;
         Ok(())
     }
-    fn visit_i31_new(&mut self) -> Self::Output {
+    fn visit_ref_i31(&mut self) -> Self::Output {
         self.pop_operand(Some(ValType::I32))?;
         self.push_operand(ValType::Ref(RefType::I31))?;
         Ok(())

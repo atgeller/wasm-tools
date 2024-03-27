@@ -24,11 +24,19 @@ pub fn smith(config: &Config, u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
         let unresolved = pkg.sources.parse().unwrap();
         let id = match resolve.push(unresolved) {
             Ok(id) => id,
-            Err(e) => panic!("bad wit parse: {e:?}"),
+            Err(e) => {
+                if e.to_string().contains(
+                    "interface transitively depends on an interface in \
+                     incompatible ways",
+                ) {
+                    return Err(arbitrary::Error::IncorrectFormat);
+                }
+                panic!("bad wit parse: {e:?}")
+            }
         };
         last = Some(id);
     }
     let pkg = last.unwrap();
 
-    Ok(wit_component::encode(&resolve, pkg).expect("failed to encode WIT document"))
+    Ok(wit_component::encode(Some(true), &resolve, pkg).expect("failed to encode WIT document"))
 }

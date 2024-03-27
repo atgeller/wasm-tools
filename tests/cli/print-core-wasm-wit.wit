@@ -1,11 +1,11 @@
 // RUN: component embed --dummy % | component wit
 
-package foo:foo
+package foo:foo;
 
 interface my-interface {
-  foo: func()
+  foo: func();
 }
 
 world my-world {
-  import my-interface
+  import my-interface;
 }

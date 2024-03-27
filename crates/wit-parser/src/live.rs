@@ -58,6 +58,11 @@ impl LiveTypes {
             | TypeDefKind::List(t)
             | TypeDefKind::Option(t)
             | TypeDefKind::Future(Some(t)) => self.add_type(resolve, t),
+            TypeDefKind::Handle(handle) => match handle {
+                crate::Handle::Own(ty) => self.add_type_id(resolve, *ty),
+                crate::Handle::Borrow(ty) => self.add_type_id(resolve, *ty),
+            },
+            TypeDefKind::Resource => {}
             TypeDefKind::Record(r) => {
                 for field in r.fields.iter() {
                     self.add_type(resolve, &field.ty);
@@ -73,11 +78,6 @@ impl LiveTypes {
                     if let Some(ty) = &case.ty {
                         self.add_type(resolve, ty);
                     }
-                }
-            }
-            TypeDefKind::Union(u) => {
-                for case in u.cases.iter() {
-                    self.add_type(resolve, &case.ty);
                 }
             }
             TypeDefKind::Result(r) => {

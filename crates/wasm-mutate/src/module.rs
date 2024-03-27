@@ -1,5 +1,4 @@
-use crate::{Error, Result};
-use std::convert::TryFrom;
+use crate::Result;
 use wasm_encoder::{BlockType, HeapType, RefType, ValType};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -49,27 +48,37 @@ impl From<wasmparser::RefType> for PrimitiveTypeInfo {
     }
 }
 
-impl TryFrom<wasmparser::Type> for TypeInfo {
-    type Error = Error;
+impl From<wasmparser::FuncType> for TypeInfo {
+    fn from(ft: wasmparser::FuncType) -> Self {
+        TypeInfo::Func(FuncInfo {
+            params: ft
+                .params()
+                .iter()
+                .map(|&t| PrimitiveTypeInfo::from(t))
+                .collect(),
+            returns: ft
+                .results()
+                .iter()
+                .map(|&t| PrimitiveTypeInfo::from(t))
+                .collect(),
+        })
+    }
+}
 
-    fn try_from(value: wasmparser::Type) -> Result<Self> {
-        match value {
-            wasmparser::Type::Func(ft) => Ok(TypeInfo::Func(FuncInfo {
-                params: ft
-                    .params()
-                    .iter()
-                    .map(|&t| PrimitiveTypeInfo::from(t))
-                    .collect(),
-                returns: ft
-                    .results()
-                    .iter()
-                    .map(|&t| PrimitiveTypeInfo::from(t))
-                    .collect(),
-            })),
-            wasmparser::Type::Array(_) => {
-                unimplemented!("Array and struct types are not supported yet.")
-            }
-        }
+impl From<wasmparser::IndexedFuncType> for TypeInfo {
+    fn from(ft: wasmparser::IndexedFuncType) -> Self {
+        TypeInfo::Func(FuncInfo {
+            params: ft
+                .params()
+                .iter()
+                .map(|&t| PrimitiveTypeInfo::from(t))
+                .collect(),
+            returns: ft
+                .results()
+                .iter()
+                .map(|&t| PrimitiveTypeInfo::from(t))
+                .collect(),
+        })
     }
 }
 
@@ -98,7 +107,7 @@ pub fn map_ref_type(ref_ty: wasmparser::RefType) -> Result<RefType> {
             wasmparser::HeapType::Struct => HeapType::Struct,
             wasmparser::HeapType::Array => HeapType::Array,
             wasmparser::HeapType::I31 => HeapType::I31,
-            wasmparser::HeapType::Indexed(i) => HeapType::Indexed(i.into()),
+            wasmparser::HeapType::Concrete(i) => HeapType::Concrete(i.as_module_index().unwrap()),
         },
     })
 }

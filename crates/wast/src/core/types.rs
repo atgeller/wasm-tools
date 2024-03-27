@@ -20,22 +20,22 @@ pub enum ValType<'a> {
 impl<'a> Parse<'a> for ValType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
-        if l.peek::<kw::i32>() {
+        if l.peek::<kw::i32>()? {
             parser.parse::<kw::i32>()?;
             Ok(ValType::I32)
-        } else if l.peek::<kw::i64>() {
+        } else if l.peek::<kw::i64>()? {
             parser.parse::<kw::i64>()?;
             Ok(ValType::I64)
-        } else if l.peek::<kw::f32>() {
+        } else if l.peek::<kw::f32>()? {
             parser.parse::<kw::f32>()?;
             Ok(ValType::F32)
-        } else if l.peek::<kw::f64>() {
+        } else if l.peek::<kw::f64>()? {
             parser.parse::<kw::f64>()?;
             Ok(ValType::F64)
-        } else if l.peek::<kw::v128>() {
+        } else if l.peek::<kw::v128>()? {
             parser.parse::<kw::v128>()?;
             Ok(ValType::V128)
-        } else if l.peek::<RefType>() {
+        } else if l.peek::<RefType>()? {
             Ok(ValType::Ref(parser.parse()?))
         } else {
             Err(l.error())
@@ -44,13 +44,13 @@ impl<'a> Parse<'a> for ValType<'a> {
 }
 
 impl<'a> Peek for ValType<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        kw::i32::peek(cursor)
-            || kw::i64::peek(cursor)
-            || kw::f32::peek(cursor)
-            || kw::f64::peek(cursor)
-            || kw::v128::peek(cursor)
-            || RefType::peek(cursor)
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        Ok(kw::i32::peek(cursor)?
+            || kw::i64::peek(cursor)?
+            || kw::f32::peek(cursor)?
+            || kw::f64::peek(cursor)?
+            || kw::v128::peek(cursor)?
+            || RefType::peek(cursor)?)
     }
     fn display() -> &'static str {
         "valtype"
@@ -76,12 +76,12 @@ impl<'a> Parse<'a> for IndexedType<'a> {
 }
 
 impl<'a> Peek for IndexedType<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        if let Some(next) = cursor.lparen() {
-            return ValType::peek(next) && Id::peek2(next)
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        if let Some(next) = cursor.lparen()? {
+            return Ok(ValType::peek(next)? && Id::peek2(next)?)
         }
 
-        false
+        Ok(false)
     }
 
     fn display() -> &'static str {
@@ -116,7 +116,7 @@ macro_rules! index_expr {
                     }
                 )*
                 let parse_remainder = parser.step(|c| {
-                    let (kw, rest) = match c.keyword() {
+                    let (kw, rest) = match c.keyword()? {
                         Some(pair) => pair,
                         None => return Err(c.error(stringify!(expected an $enum))),
                     };
@@ -130,10 +130,10 @@ macro_rules! index_expr {
         }
 
         impl Peek for $enum {
-            fn peek(cursor: Cursor<'_>) -> bool {
-                match cursor.keyword() {
-                    $(Some(($instr, _)) => true,)*
-                    _ => false,
+            fn peek(cursor: Cursor<'_>) -> Result<bool> {
+                match cursor.keyword()? {
+                    $(Some(($instr, _)) => Ok(true),)*
+                    _ => Ok(false),
                 }
             }
 
@@ -311,26 +311,26 @@ impl<'a> Parse<'a> for IndexTerm<'a> {
             Ok(IndexTerm::OldLocal(_parser.parse()?))
         }
 
-        if parser.peek::<Id>() {
+        if parser.peek::<Id>()? {
             return Alpha(parser);
         }
 
         parser.parens(|inner| {
             //let cursor = inner.cursor();
 
-            if inner.peek::<BinOp>() {
+            if inner.peek::<BinOp>()? {
                 return IBinOp(inner);
-            } else if inner.peek::<RelOp>() {
+            } else if inner.peek::<RelOp>()? {
                 return IRelOp(inner);
-            } else if inner.peek::<UnOp>() {
+            } else if inner.peek::<UnOp>()? {
                 return IUnOp(inner);
-            } else if inner.peek::<TestOp>() {
+            } else if inner.peek::<TestOp>()? {
                 return ITestOp(inner);
-            } else if parser.peek::<Constant>() { // This looks blatantly incorrect but works somehow???
+            } else if parser.peek::<Constant>()? { // This looks blatantly incorrect but works somehow???
                 return Constant(parser);
-            } else if inner.peek::<kw::local>() {
+            } else if inner.peek::<kw::local>()? {
                 return Local(inner);
-            } else if inner.peek::<kw::old_local>() {
+            } else if inner.peek::<kw::old_local>()? {
                 return OldLocal(inner);
             }
 
@@ -341,26 +341,26 @@ impl<'a> Parse<'a> for IndexTerm<'a> {
 
 impl<'a> Peek for IndexTerm<'a> {
     #[allow(non_snake_case)]
-    fn peek(cursor: Cursor<'_>) -> bool {
-        if let Some(_) = cursor.id() {
-            return true
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        if let Some(_) = cursor.id()? {
+            return Ok(true)
         }
 
-        if let Some(next) = cursor.lparen() {
-            if let Some(("local", _)) = next.keyword() {
-                return true
+        if let Some(next) = cursor.lparen()? {
+            if let Some(("local", _)) = next.keyword()? {
+                return Ok(true)
             };
 
-            if let Some(("old_local", _)) = next.keyword() {
-                return true
+            if let Some(("old_local", _)) = next.keyword()? {
+                return Ok(true)
             };
 
-            return BinOp::peek(next) || RelOp::peek(next)
-            || TestOp::peek(next) || UnOp::peek(next)
-            || ValType::peek(next);
+            return Ok(BinOp::peek(next)? || RelOp::peek(next)?
+            || TestOp::peek(next)? || UnOp::peek(next)?
+            || ValType::peek(next)?);
         }
 
-        false
+        Ok(false)
     }
 
     fn display() -> &'static str {
@@ -383,26 +383,26 @@ impl<'a> Parse<'a> for Constraint<'a> {
     fn parse(parser: Parser<'a>) -> Result<Constraint<'a>> {
         parser.parens(|inner| {
             let mut l = parser.lookahead1();
-            if l.peek::<kw::eq>() {
+            if l.peek::<kw::eq>()? {
                 parser.parse::<kw::eq>()?;
                 let x = parser.parse::<IndexTerm>()?;
                 let y = parser.parse::<IndexTerm>()?;
                 return Ok(Constraint::Eq(x, y));
-            } else if l.peek::<kw::and>() {
+            } else if l.peek::<kw::and>()? {
                 parser.parse::<kw::and>()?;
                 let x = parser.parse::<Constraint>()?;
                 let y = parser.parse::<Constraint>()?;
                 return Ok(Constraint::And(Box::new(x), Box::new(y)));
-            } else if l.peek::<kw::or>() {
+            } else if l.peek::<kw::or>()? {
                 parser.parse::<kw::or>()?;
                 let x = parser.parse::<Constraint>()?;
                 let y = parser.parse::<Constraint>()?;
                 return Ok(Constraint::Or(Box::new(x), Box::new(y)));
-            } else if l.peek::<kw::not>() {
+            } else if l.peek::<kw::not>()? {
                 parser.parse::<kw::not>()?;
                 let x = parser.parse::<Constraint>()?;
                 return Ok(Constraint::Not(Box::new(x)));
-            } else if l.peek::<kw::r#if>() {
+            } else if l.peek::<kw::r#if>()? {
                 parser.parse::<kw::r#if>()?;
                 let i = parser.parse::<Constraint>()?;
                 let t = parser.parse::<Constraint>()?;
@@ -417,20 +417,20 @@ impl<'a> Parse<'a> for Constraint<'a> {
 
 impl<'a> Peek for Constraint<'a> {
     #[allow(non_snake_case)]
-    fn peek(cursor: Cursor<'_>) -> bool {
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
 
-        if let Some(next) = cursor.lparen() {
-            return match next.keyword() {
-                Some(("eq",_)) => true,
-                Some(("if",_)) => true,
-                Some(("and",_)) => true,
-                Some(("or",_)) => true,
-                Some(("not",_)) => true,
-                _ => false,
+        if let Some(next) = cursor.lparen()? {
+            return match next.keyword()? {
+                Some(("eq",_)) => Ok(true),
+                Some(("if",_)) => Ok(true),
+                Some(("and",_)) => Ok(true),
+                Some(("or",_)) => Ok(true),
+                Some(("not",_)) => Ok(true),
+                _ => Ok(false),
             };
         }
 
-        false
+        Ok(false)
     }
 
     fn display() -> &'static str {
@@ -448,6 +448,8 @@ pub enum HeapType<'a> {
     /// A reference to any host value: externref. This is part of the reference
     /// types proposal.
     Extern,
+    /// A reference to a wasm exception. This is part of the exceptions proposal.
+    Exn,
     /// A reference to any reference value: anyref. This is part of the GC
     /// proposal.
     Any,
@@ -466,46 +468,49 @@ pub enum HeapType<'a> {
     NoExtern,
     /// The bottom type of the anyref hierarchy. Part of the GC proposal.
     None,
-    /// A reference to a function, struct, or array: ref T. This is part of the
-    /// GC proposal.
-    Index(Index<'a>),
+    /// A reference to a concrete function, struct, or array type defined by
+    /// Wasm: `ref T`. This is part of the function references and GC proposals.
+    Concrete(Index<'a>),
 }
 
 impl<'a> Parse<'a> for HeapType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
-        if l.peek::<kw::func>() {
+        if l.peek::<kw::func>()? {
             parser.parse::<kw::func>()?;
             Ok(HeapType::Func)
-        } else if l.peek::<kw::r#extern>() {
+        } else if l.peek::<kw::r#extern>()? {
             parser.parse::<kw::r#extern>()?;
             Ok(HeapType::Extern)
-        } else if l.peek::<kw::r#any>() {
+        } else if l.peek::<kw::exn>()? {
+            parser.parse::<kw::exn>()?;
+            Ok(HeapType::Exn)
+        } else if l.peek::<kw::r#any>()? {
             parser.parse::<kw::r#any>()?;
             Ok(HeapType::Any)
-        } else if l.peek::<kw::eq>() {
+        } else if l.peek::<kw::eq>()? {
             parser.parse::<kw::eq>()?;
             Ok(HeapType::Eq)
-        } else if l.peek::<kw::r#struct>() {
+        } else if l.peek::<kw::r#struct>()? {
             parser.parse::<kw::r#struct>()?;
             Ok(HeapType::Struct)
-        } else if l.peek::<kw::array>() {
+        } else if l.peek::<kw::array>()? {
             parser.parse::<kw::array>()?;
             Ok(HeapType::Array)
-        } else if l.peek::<kw::i31>() {
+        } else if l.peek::<kw::i31>()? {
             parser.parse::<kw::i31>()?;
             Ok(HeapType::I31)
-        } else if l.peek::<kw::nofunc>() {
+        } else if l.peek::<kw::nofunc>()? {
             parser.parse::<kw::nofunc>()?;
             Ok(HeapType::NoFunc)
-        } else if l.peek::<kw::noextern>() {
+        } else if l.peek::<kw::noextern>()? {
             parser.parse::<kw::noextern>()?;
             Ok(HeapType::NoExtern)
-        } else if l.peek::<kw::none>() {
+        } else if l.peek::<kw::none>()? {
             parser.parse::<kw::none>()?;
             Ok(HeapType::None)
-        } else if l.peek::<Index>() {
-            Ok(HeapType::Index(parser.parse()?))
+        } else if l.peek::<Index>()? {
+            Ok(HeapType::Concrete(parser.parse()?))
         } else {
             Err(l.error())
         }
@@ -513,18 +518,19 @@ impl<'a> Parse<'a> for HeapType<'a> {
 }
 
 impl<'a> Peek for HeapType<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        kw::func::peek(cursor)
-            || kw::r#extern::peek(cursor)
-            || kw::any::peek(cursor)
-            || kw::eq::peek(cursor)
-            || kw::r#struct::peek(cursor)
-            || kw::array::peek(cursor)
-            || kw::i31::peek(cursor)
-            || kw::nofunc::peek(cursor)
-            || kw::noextern::peek(cursor)
-            || kw::none::peek(cursor)
-            || (LParen::peek(cursor) && kw::r#type::peek2(cursor))
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        Ok(kw::func::peek(cursor)?
+            || kw::r#extern::peek(cursor)?
+            || kw::exn::peek(cursor)?
+            || kw::any::peek(cursor)?
+            || kw::eq::peek(cursor)?
+            || kw::r#struct::peek(cursor)?
+            || kw::array::peek(cursor)?
+            || kw::i31::peek(cursor)?
+            || kw::nofunc::peek(cursor)?
+            || kw::noextern::peek(cursor)?
+            || kw::none::peek(cursor)?
+            || (LParen::peek(cursor)? && kw::r#type::peek2(cursor)?))
     }
     fn display() -> &'static str {
         "heaptype"
@@ -553,6 +559,14 @@ impl<'a> RefType<'a> {
         RefType {
             nullable: true,
             heap: HeapType::Extern,
+        }
+    }
+
+    /// An `exnrefr` as an abbreviation for `(ref null exn)`.
+    pub fn exn() -> Self {
+        RefType {
+            nullable: true,
+            heap: HeapType::Exn,
         }
     }
 
@@ -624,47 +638,50 @@ impl<'a> RefType<'a> {
 impl<'a> Parse<'a> for RefType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
-        if l.peek::<kw::funcref>() {
+        if l.peek::<kw::funcref>()? {
             parser.parse::<kw::funcref>()?;
             Ok(RefType::func())
-        } else if l.peek::<kw::anyfunc>() {
+        } else if l.peek::<kw::anyfunc>()? {
             parser.parse::<kw::anyfunc>()?;
             Ok(RefType::func())
-        } else if l.peek::<kw::externref>() {
+        } else if l.peek::<kw::externref>()? {
             parser.parse::<kw::externref>()?;
             Ok(RefType::r#extern())
-        } else if l.peek::<kw::anyref>() {
+        } else if l.peek::<kw::exnref>()? {
+            parser.parse::<kw::exnref>()?;
+            Ok(RefType::exn())
+        } else if l.peek::<kw::anyref>()? {
             parser.parse::<kw::anyref>()?;
             Ok(RefType::any())
-        } else if l.peek::<kw::eqref>() {
+        } else if l.peek::<kw::eqref>()? {
             parser.parse::<kw::eqref>()?;
             Ok(RefType::eq())
-        } else if l.peek::<kw::structref>() {
+        } else if l.peek::<kw::structref>()? {
             parser.parse::<kw::structref>()?;
             Ok(RefType::r#struct())
-        } else if l.peek::<kw::arrayref>() {
+        } else if l.peek::<kw::arrayref>()? {
             parser.parse::<kw::arrayref>()?;
             Ok(RefType::array())
-        } else if l.peek::<kw::i31ref>() {
+        } else if l.peek::<kw::i31ref>()? {
             parser.parse::<kw::i31ref>()?;
             Ok(RefType::i31())
-        } else if l.peek::<kw::nullfuncref>() {
+        } else if l.peek::<kw::nullfuncref>()? {
             parser.parse::<kw::nullfuncref>()?;
             Ok(RefType::nullfuncref())
-        } else if l.peek::<kw::nullexternref>() {
+        } else if l.peek::<kw::nullexternref>()? {
             parser.parse::<kw::nullexternref>()?;
             Ok(RefType::nullexternref())
-        } else if l.peek::<kw::nullref>() {
+        } else if l.peek::<kw::nullref>()? {
             parser.parse::<kw::nullref>()?;
             Ok(RefType::nullref())
-        } else if l.peek::<LParen>() {
+        } else if l.peek::<LParen>()? {
             parser.parens(|p| {
                 let mut l = parser.lookahead1();
-                if l.peek::<kw::r#ref>() {
+                if l.peek::<kw::r#ref>()? {
                     p.parse::<kw::r#ref>()?;
 
                     let mut nullable = false;
-                    if parser.peek::<kw::null>() {
+                    if parser.peek::<kw::null>()? {
                         parser.parse::<kw::null>()?;
                         nullable = true;
                     }
@@ -684,19 +701,20 @@ impl<'a> Parse<'a> for RefType<'a> {
 }
 
 impl<'a> Peek for RefType<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        kw::funcref::peek(cursor)
-            || /* legacy */ kw::anyfunc::peek(cursor)
-            || kw::externref::peek(cursor)
-            || kw::anyref::peek(cursor)
-            || kw::eqref::peek(cursor)
-            || kw::structref::peek(cursor)
-            || kw::arrayref::peek(cursor)
-            || kw::i31ref::peek(cursor)
-            || kw::nullfuncref::peek(cursor)
-            || kw::nullexternref::peek(cursor)
-            || kw::nullref::peek(cursor)
-            || (LParen::peek(cursor) && kw::r#ref::peek2(cursor))
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        Ok(kw::funcref::peek(cursor)?
+            || /* legacy */ kw::anyfunc::peek(cursor)?
+            || kw::externref::peek(cursor)?
+            || kw::exnref::peek(cursor)?
+            || kw::anyref::peek(cursor)?
+            || kw::eqref::peek(cursor)?
+            || kw::structref::peek(cursor)?
+            || kw::arrayref::peek(cursor)?
+            || kw::i31ref::peek(cursor)?
+            || kw::nullfuncref::peek(cursor)?
+            || kw::nullexternref::peek(cursor)?
+            || kw::nullref::peek(cursor)?
+            || (LParen::peek(cursor)? && kw::r#ref::peek2(cursor)?))
     }
     fn display() -> &'static str {
         "reftype"
@@ -715,13 +733,13 @@ pub enum StorageType<'a> {
 impl<'a> Parse<'a> for StorageType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
-        if l.peek::<kw::i8>() {
+        if l.peek::<kw::i8>()? {
             parser.parse::<kw::i8>()?;
             Ok(StorageType::I8)
-        } else if l.peek::<kw::i16>() {
+        } else if l.peek::<kw::i16>()? {
             parser.parse::<kw::i16>()?;
             Ok(StorageType::I16)
-        } else if l.peek::<ValType>() {
+        } else if l.peek::<ValType>()? {
             Ok(StorageType::Val(parser.parse()?))
         } else {
             Err(l.error())
@@ -740,7 +758,7 @@ pub struct GlobalType<'a> {
 
 impl<'a> Parse<'a> for GlobalType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
-        if parser.peek2::<kw::r#mut>() {
+        if parser.peek2::<kw::r#mut>()? {
             parser.parens(|p| {
                 p.parse::<kw::r#mut>()?;
                 Ok(GlobalType {
@@ -769,7 +787,7 @@ pub struct Limits {
 impl<'a> Parse<'a> for Limits {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let min = parser.parse()?;
-        let max = if parser.peek::<u32>() {
+        let max = if parser.peek::<u32>()? {
             Some(parser.parse()?)
         } else {
             None
@@ -790,7 +808,7 @@ pub struct Limits64 {
 impl<'a> Parse<'a> for Limits64 {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let min = parser.parse()?;
-        let max = if parser.peek::<u64>() {
+        let max = if parser.peek::<u64>()? {
             Some(parser.parse()?)
         } else {
             None
@@ -838,7 +856,7 @@ pub enum MemoryType {
 
 impl<'a> Parse<'a> for MemoryType {
     fn parse(parser: Parser<'a>) -> Result<Self> {
-        if parser.peek::<kw::i64>() {
+        if parser.peek::<kw::i64>()? {
             parser.parse::<kw::i64>()?;
             let limits = parser.parse()?;
             let shared = parser.parse::<Option<kw::shared>>()?.is_some();
@@ -874,11 +892,11 @@ impl<'a> IndexedFunctionType<'a> {
         let mut results = Vec::from(mem::take(&mut self.results));
         let mut post_constraints: Vec<Constraint> = Vec::from(mem::take(&mut self.post_constraints));
     
-        while parser.peek2::<kw::pre>() || parser.peek2::<kw::post>() || parser.peek2::<kw::param>() || parser.peek2::<kw::result>() {
+        while parser.peek2::<kw::pre>()? || parser.peek2::<kw::post>()? || parser.peek2::<kw::param>()? || parser.peek2::<kw::result>()? {
             parser.parens(|p| {
                 let mut l = p.lookahead1();
 
-                if l.peek::<kw::param>() {
+                if l.peek::<kw::param>()? {
                     if results.len() > 0 {
                         return Err(p.error(
                             "result before parameter (or unexpected token): \
@@ -897,7 +915,7 @@ impl<'a> IndexedFunctionType<'a> {
                     while parse_more && !p.is_empty() {
                         params.push((None, None, p.parse()?));
                     }
-                } else if l.peek::<kw::result>() {
+                } else if l.peek::<kw::result>()? {
                     p.parse::<kw::result>()?;
                     if p.is_empty() {
                         return Ok(());
@@ -910,7 +928,7 @@ impl<'a> IndexedFunctionType<'a> {
                     while parse_more && !p.is_empty() {
                         results.push((None, None, p.parse()?));
                     }
-                } else if l.peek::<kw::pre>() {
+                } else if l.peek::<kw::pre>()? {
                     p.parse::<kw::pre>()?;
                     /*p.parens(|inner| {
                         while let Ok(it) = inner.parse::<IndexedType>() {
@@ -921,7 +939,7 @@ impl<'a> IndexedFunctionType<'a> {
                     while !p.is_empty() {
                         pre_constraints.push(p.parse()?);
                     }
-                } else if l.peek::<kw::post>() {
+                } else if l.peek::<kw::post>()? {
                     p.parse::<kw::post>()?;
                     /*p.parens(|inner| {
                         while !inner.is_empty() {
@@ -960,19 +978,52 @@ impl<'a> Parse<'a> for IndexedFunctionType<'a> {
 }
 
 impl<'a> Peek for IndexedFunctionType<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
-        if let Some(next) = cursor.lparen() {
-            match next.keyword() {
-                Some(("pre", _)) | Some(("post", _)) | Some(("param", _)) | Some(("result", _)) => return true,
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        if let Some(next) = cursor.lparen()? {
+            match next.keyword()? {
+                Some(("pre", _)) | Some(("post", _)) | Some(("param", _)) | Some(("result", _)) => return Ok(true),
                 _ => {}
             }
         }
 
-        false
+        Ok(false)
     }
 
     fn display() -> &'static str {
         "indexed function type"
+    }
+}
+
+/// A function type with parameters and results.
+#[derive(Clone, Debug, Default)]
+pub struct FunctionTypeNoNames<'a>(pub IndexedFunctionType<'a>);
+
+impl<'a> Parse<'a> for FunctionTypeNoNames<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        let mut ret = IndexedFunctionType {
+            params: Box::new([]),
+            results: Box::new([]),
+            pre_constraints: Box::new([]),
+            post_constraints: Box::new([]),
+        };
+        ret.finish_parse(parser)?;
+        Ok(FunctionTypeNoNames(ret))
+    }
+}
+
+impl<'a> Peek for FunctionTypeNoNames<'a> {
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
+        IndexedFunctionType::peek(cursor)
+    }
+
+    fn display() -> &'static str {
+        IndexedFunctionType::display()
+    }
+}
+
+impl<'a> From<FunctionTypeNoNames<'a>> for IndexedFunctionType<'a> {
+    fn from(ty: FunctionTypeNoNames<'a>) -> IndexedFunctionType<'a> {
+        ty.0
     }
 }
 
@@ -987,15 +1038,19 @@ impl<'a> Parse<'a> for StructType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut ret = StructType { fields: Vec::new() };
         while !parser.is_empty() {
-            let field = if parser.peek2::<kw::field>() {
-                parser.parens(|parser| {
-                    parser.parse::<kw::field>()?;
-                    StructField::parse(parser, true)
-                })
-            } else {
-                StructField::parse(parser, false)
-            };
-            ret.fields.push(field?);
+            parser.parens(|parser| {
+                parser.parse::<kw::field>()?;
+                if parser.peek::<Id>()? {
+                    let field = StructField::parse(parser, true);
+                    ret.fields.push(field?);
+                } else {
+                    while !parser.is_empty() {
+                        let field = StructField::parse(parser, false);
+                        ret.fields.push(field?);
+                    }
+                }
+                Ok(())
+            })?;
         }
         Ok(ret)
     }
@@ -1015,7 +1070,7 @@ pub struct StructField<'a> {
 impl<'a> StructField<'a> {
     fn parse(parser: Parser<'a>, with_id: bool) -> Result<Self> {
         let id = if with_id { parser.parse()? } else { None };
-        let (ty, mutable) = if parser.peek2::<kw::r#mut>() {
+        let (ty, mutable) = if parser.peek2::<kw::r#mut>()? {
             let ty = parser.parens(|parser| {
                 parser.parse::<kw::r#mut>()?;
                 parser.parse()
@@ -1039,7 +1094,7 @@ pub struct ArrayType<'a> {
 
 impl<'a> Parse<'a> for ArrayType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
-        let (ty, mutable) = if parser.peek2::<kw::r#mut>() {
+        let (ty, mutable) = if parser.peek2::<kw::r#mut>()? {
             let ty = parser.parens(|parser| {
                 parser.parse::<kw::r#mut>()?;
                 parser.parse()
@@ -1086,14 +1141,15 @@ pub enum TypeDef<'a> {
 impl<'a> Parse<'a> for TypeDef<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let mut l = parser.lookahead1();
-        if l.peek::<kw::func>() {
+        if l.peek::<kw::func>()? {
             parser.parse::<kw::func>()?;
-            let ift = parser.parse::<IndexedFunctionType>()?;
-            Ok(TypeDef::Func(ift.into()))
-        } else if l.peek::<kw::r#struct>() {
+            // let ift = parser.parse::<IndexedFunctionType>()?;
+            // Ok(TypeDef::Func(ift.into()))
+            Ok(TypeDef::Func(parser.parse()?))
+        } else if l.peek::<kw::r#struct>()? {
             parser.parse::<kw::r#struct>()?;
             Ok(TypeDef::Struct(parser.parse()?))
-        } else if l.peek::<kw::array>() {
+        } else if l.peek::<kw::array>()? {
             parser.parse::<kw::array>()?;
             Ok(TypeDef::Array(parser.parse()?))
         } else {
@@ -1121,7 +1177,7 @@ pub struct Type<'a> {
 }
 
 impl<'a> Peek for Type<'a> {
-    fn peek(cursor: Cursor<'_>) -> bool {
+    fn peek(cursor: Cursor<'_>) -> Result<bool> {
         kw::r#type::peek(cursor)
     }
     fn display() -> &'static str {
@@ -1135,19 +1191,18 @@ impl<'a> Parse<'a> for Type<'a> {
         let id = parser.parse()?;
         let name = parser.parse()?;
 
-        let (parent, def, final_type) = if parser.peek2::<kw::sub>() {
+        let (parent, def, final_type) = if parser.peek2::<kw::sub>()? {
             parser.parens(|parser| {
                 parser.parse::<kw::sub>()?;
 
-                let final_type: Option<bool> =
-                if parser.peek::<kw::r#final>() {
+                let final_type: Option<bool> = if parser.peek::<kw::r#final>()? {
                     parser.parse::<kw::r#final>()?;
                     Some(true)
                 } else {
                     Some(false)
                 };
 
-                let parent = if parser.peek::<Index<'a>>() {
+                let parent = if parser.peek::<Index<'a>>()? {
                     parser.parse()?
                 } else {
                     None
@@ -1183,7 +1238,7 @@ impl<'a> Parse<'a> for Rec<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let span = parser.parse::<kw::r#rec>()?.0;
         let mut types = Vec::new();
-        while parser.peek2::<Type<'a>>() {
+        while parser.peek2::<Type<'a>>()? {
             types.push(parser.parens(|p| p.parse())?);
         }
         Ok(Rec { span, types })
@@ -1212,7 +1267,7 @@ impl<'a, T> TypeUse<'a, T> {
 
 impl<'a, T: Peek + Parse<'a>> Parse<'a> for TypeUse<'a, T> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
-        let index = if parser.peek2::<kw::r#type>() {
+        let index = if parser.peek2::<kw::r#type>()? {
             Some(parser.parens(|p| {
                 p.parse::<kw::r#type>()?;
                 p.parse()

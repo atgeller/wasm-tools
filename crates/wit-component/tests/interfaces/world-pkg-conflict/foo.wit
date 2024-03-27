@@ -1,9 +1,9 @@
-package foo:foo
+package foo:foo;
 
 world c {
 
 }
 
 interface foo {
-  use a.{t}
+  use a.{t};
 }

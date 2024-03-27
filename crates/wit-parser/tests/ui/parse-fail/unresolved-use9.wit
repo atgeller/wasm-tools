@@ -1,9 +1,9 @@
 // parse-fail
 
-package foo:foo
+package foo:foo;
 
 world foo {
   import foo: interface {
-    use bar.{i32}
+    use bar.{i32};
   }
 }

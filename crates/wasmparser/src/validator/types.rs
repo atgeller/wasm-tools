@@ -4,15 +4,16 @@ use super::{
     component::{ComponentState, ExternKind},
     core::Module,
 };
-use crate::validator::names::KebabString;
+use crate::{validator::names::KebabString, HeapType};
 use crate::{
-    ArrayType, BinaryReaderError, Export, ExternalKind, GlobalType, Import, IndexedFuncType,
-    MemoryType, PrimitiveValType, RefType, Result, TableType, TypeRef, ValType,
+    BinaryReaderError, CompositeType, Export, ExternalKind, IndexedFuncType, GlobalType, Import, Matches,
+    MemoryType, PackedIndex, PrimitiveValType, RecGroup, RefType, Result, SubType, TableType,
+    TypeRef, UnpackedIndex, ValType, WithRecGroup,
 };
 use indexmap::{IndexMap, IndexSet};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ops::Index;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::ops::{Index, Range};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     borrow::Borrow,
@@ -141,154 +142,633 @@ fn push_primitive_wasm_types(ty: &PrimitiveValType, lowered_types: &mut LoweredT
     }
 }
 
-/// Represents a unique identifier for a type known to a [`crate::Validator`].
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[repr(C)] // use fixed field layout to ensure minimal size
-pub struct TypeId {
-    /// The index into the global list of types.
-    pub(crate) index: usize,
-    /// The effective type size for the type.
-    ///
-    /// This is stored as part of the ID to avoid having to recurse through
-    /// the global type list when calculating type sizes.
-    pub(crate) type_size: u32,
-    /// A unique integer assigned to this type.
-    ///
-    /// The purpose of this field is to ensure that two different `TypeId`
-    /// representations can be handed out for two different aliased types within
-    /// a component that actually point to the same underlying type (as pointed
-    /// to by the `index` field).
-    unique_id: u32,
+/// A trait shared by all type identifiers.
+///
+/// Any id that can be used to get a type from a `Types`.
+//
+// Or, internally, from a `TypeList`.
+pub trait TypeIdentifier: std::fmt::Debug + Copy + Eq + Sized + 'static {
+    /// The data pointed to by this type of id.
+    type Data: TypeData<Id = Self>;
+
+    /// Create a type id from an index.
+    #[doc(hidden)]
+    fn from_index(index: u32) -> Self;
+
+    /// Get a shared reference to the list where this id's type data is stored
+    /// within.
+    #[doc(hidden)]
+    fn list(types: &TypeList) -> &SnapshotList<Self::Data>;
+
+    /// Get an exclusive reference to the list where this id's type data is
+    /// stored within.
+    #[doc(hidden)]
+    fn list_mut(types: &mut TypeList) -> &mut SnapshotList<Self::Data>;
+
+    /// The raw index of this id.
+    #[doc(hidden)]
+    fn index(&self) -> usize;
 }
 
-// The size of `TypeId` was seen to have a large-ish impact in #844, so this
-// assert ensures that it stays relatively small.
+/// A trait shared by all types within a `Types`.
+///
+/// This is the data that can be retreived by indexing with the associated
+/// [`TypeIdentifier`].
+pub trait TypeData: std::fmt::Debug {
+    /// The identifier for this type data.
+    type Id: TypeIdentifier<Data = Self>;
+
+    /// Get the info for this type.
+    #[doc(hidden)]
+    fn type_info(&self, types: &TypeList) -> TypeInfo;
+}
+
+/// A type that can be aliased in the component model.
+pub trait Aliasable {
+    #[doc(hidden)]
+    fn alias_id(&self) -> u32;
+
+    #[doc(hidden)]
+    fn set_alias_id(&mut self, alias_id: u32);
+}
+
+/// A fresh alias id that means the entity is not an alias of anything.
+///
+/// Note that the `TypeList::alias_counter` starts at zero, so we can't use that
+/// as this sentinel. The implementation limits are such that we can't ever
+/// generate `u32::MAX` aliases, so we don't need to worryabout running into
+/// this value in practice either.
+const NO_ALIAS: u32 = u32::MAX;
+
+macro_rules! define_type_id {
+    ($name:ident, $data:ty, $list:ident, $type_str:expr) => {
+        #[doc = "Represents a unique identifier for a "]
+        #[doc = $type_str]
+        #[doc = " type known to a [`crate::Validator`]."]
+        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+        #[repr(C)] // Use fixed field layout to ensure minimal size.
+        pub struct $name {
+            /// The index into the associated list of types.
+            index: u32,
+        }
+
+        impl TypeIdentifier for $name {
+            type Data = $data;
+
+            fn from_index(index: u32) -> Self {
+                $name { index }
+            }
+
+            fn list(types: &TypeList) -> &SnapshotList<Self::Data> {
+                &types.$list
+            }
+
+            fn list_mut(types: &mut TypeList) -> &mut SnapshotList<Self::Data> {
+                &mut types.$list
+            }
+
+            fn index(&self) -> usize {
+                usize::try_from(self.index).unwrap()
+            }
+        }
+
+        impl Aliasable for $name {
+            fn alias_id(&self) -> u32 {
+                NO_ALIAS
+            }
+
+            fn set_alias_id(&mut self, _: u32) {}
+        }
+
+        // The size of type IDs was seen to have a large-ish impact in #844, so
+        // this assert ensures that it stays relatively small.
+        const _: () = {
+            assert!(std::mem::size_of::<$name>() <= 4);
+        };
+    };
+}
+
+/// A core WebAssembly type, in the core WebAssembly types index space.
+pub enum CoreType {
+    /// A sub type.
+    Sub(SubType),
+
+    /// A module type.
+    ///
+    /// Does not actually appear in core Wasm at the moment. Only used for the
+    /// core types index space within components.
+    Module(ModuleType),
+}
+
+/// Represents a unique identifier for a core type type known to a
+/// [`crate::Validator`]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct CoreTypeId {
+    index: u32,
+}
+
 const _: () = {
-    assert!(std::mem::size_of::<TypeId>() <= 16);
+    assert!(std::mem::size_of::<CoreTypeId>() <= 4);
 };
 
-/// A unified type definition for validating WebAssembly modules and components.
-#[derive(Debug)]
-pub enum Type {
-    /// The definition is for a core function type.
-    Func(IndexedFuncType),
-    /// The definition is for a core array type.
-    Array(ArrayType),
-    /// The definition is for a core module type.
-    ///
-    /// This variant is only supported when parsing a component.
-    Module(Box<ModuleType>),
-    /// The definition is for a core module instance type.
-    ///
-    /// This variant is only supported when parsing a component.
-    Instance(Box<InstanceType>),
-    /// The definition is for a component type.
-    ///
-    /// This variant is only supported when parsing a component.
-    Component(Box<ComponentType>),
-    /// The definition is for a component instance type.
-    ///
-    /// This variant is only supported when parsing a component.
-    ComponentInstance(Box<ComponentInstanceType>),
-    /// The definition is for a component function type.
-    ///
-    /// This variant is only supported when parsing a component.
-    ComponentFunc(ComponentFuncType),
-    /// The definition is for a component defined type.
-    ///
-    /// This variant is only supported when parsing a component.
-    Defined(ComponentDefinedType),
-    /// This definition is for a resource type in the component model.
-    ///
-    /// Each resource is identified by a unique identifier specified here.
-    Resource(ResourceId),
+impl TypeIdentifier for CoreTypeId {
+    type Data = SubType;
+
+    fn from_index(index: u32) -> Self {
+        CoreTypeId { index }
+    }
+
+    fn list(types: &TypeList) -> &SnapshotList<Self::Data> {
+        &types.core_types
+    }
+
+    fn list_mut(types: &mut TypeList) -> &mut SnapshotList<Self::Data> {
+        &mut types.core_types
+    }
+
+    fn index(&self) -> usize {
+        usize::try_from(self.index).unwrap()
+    }
 }
 
-impl Type {
-    /// Converts the type to a core function type.
-    pub fn as_func_type(&self) -> Option<&IndexedFuncType> {
+impl TypeData for SubType {
+    type Id = CoreTypeId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        // TODO(#1036): calculate actual size for func, array, struct.
+        let size = 1 + match &self.composite_type {
+            CompositeType::Func(ty) => 1 + (ty.params().len() + ty.results().len()) as u32,
+            CompositeType::Array(_) => 2,
+            CompositeType::Struct(ty) => 1 + 2 * ty.fields.len() as u32,
+        };
+        TypeInfo::core(size)
+    }
+}
+
+impl CoreType {
+    /// Get the underlying `SubType` or panic.
+    pub fn unwrap_sub(&self) -> &SubType {
         match self {
-            Self::Func(ty) => Some(ty),
-            _ => None,
+            CoreType::Sub(s) => s,
+            CoreType::Module(_) => panic!("`unwrap_sub` on module type"),
         }
     }
 
-    /// Converts the type to an array type.
-    pub fn as_array_type(&self) -> Option<&ArrayType> {
-        match self {
-            Self::Array(ty) => Some(ty),
-            _ => None,
+    /// Get the underlying `FuncType` within this `SubType` or panic.
+    pub fn unwrap_func(&self) -> &IndexedFuncType {
+        match &self.unwrap_sub().composite_type {
+            CompositeType::Func(f) => f,
+            CompositeType::Array(_) | CompositeType::Struct(_) => {
+                panic!("`unwrap_func` on non-func composite type")
+            }
         }
     }
 
-    /// Converts the type to a core module type.
-    pub fn as_module_type(&self) -> Option<&ModuleType> {
+    /// Get the underlying `ModuleType` or panic.
+    pub fn unwrap_module(&self) -> &ModuleType {
         match self {
-            Self::Module(ty) => Some(ty),
-            _ => None,
+            CoreType::Module(m) => m,
+            CoreType::Sub(_) => panic!("`unwrap_module` on a subtype"),
+        }
+    }
+}
+
+macro_rules! define_wrapper_id {
+    (
+        $(#[$outer_attrs:meta])*
+        pub enum $name:ident {
+            $(
+                #[unwrap = $unwrap:ident]
+                $(#[$inner_attrs:meta])*
+                $variant:ident ( $inner:ty ) ,
+            )*
+        }
+    ) => {
+        $(#[$outer_attrs])*
+        pub enum $name {
+            $(
+                $(#[$inner_attrs])*
+                $variant ( $inner ) ,
+            )*
+        }
+
+        $(
+            impl From<$inner> for $name {
+                #[inline]
+                fn from(x: $inner) -> Self {
+                    Self::$variant(x)
+                }
+            }
+
+            impl TryFrom<$name> for $inner {
+                type Error = ();
+
+                #[inline]
+                fn try_from(x: $name) -> Result<Self, Self::Error> {
+                    match x {
+                        $name::$variant(x) => Ok(x),
+                        _ => Err(())
+                    }
+                }
+            }
+        )*
+
+        impl $name {
+            $(
+                #[doc = "Unwrap a `"]
+                #[doc = stringify!($inner)]
+                #[doc = "` or panic."]
+                #[inline]
+                pub fn $unwrap(self) -> $inner {
+                    <$inner>::try_from(self).unwrap()
+                }
+            )*
+        }
+    };
+}
+
+macro_rules! define_transitive_conversions {
+    (
+        $(
+            $outer:ty,
+            $middle:ty,
+            $inner:ty,
+            $unwrap:ident;
+        )*
+    ) => {
+        $(
+            impl From<$inner> for $outer {
+                #[inline]
+                fn from(x: $inner) -> Self {
+                    <$middle>::from(x).into()
+                }
+            }
+
+            impl TryFrom<$outer> for $inner {
+                type Error = ();
+
+                #[inline]
+                fn try_from(x: $outer) -> Result<Self, Self::Error> {
+                    let middle = <$middle>::try_from(x)?;
+                    <$inner>::try_from(middle)
+                }
+            }
+
+            impl $outer {
+                #[doc = "Unwrap a `"]
+                #[doc = stringify!($inner)]
+                #[doc = "` or panic."]
+                #[inline]
+                pub fn $unwrap(self) -> $inner {
+                    <$inner>::try_from(self).unwrap()
+                }
+            }
+        )*
+    };
+}
+
+define_wrapper_id! {
+    /// An identifier pointing to any kind of type, component or core.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub enum AnyTypeId {
+        #[unwrap = unwrap_component_core_type]
+        /// A core type.
+        Core(ComponentCoreTypeId),
+
+        #[unwrap = unwrap_component_any_type]
+        /// A component type.
+        Component(ComponentAnyTypeId),
+    }
+}
+
+define_transitive_conversions! {
+    AnyTypeId, ComponentCoreTypeId, CoreTypeId, unwrap_core_type;
+    AnyTypeId, ComponentCoreTypeId, ComponentCoreModuleTypeId, unwrap_component_core_module_type;
+    AnyTypeId, ComponentAnyTypeId, AliasableResourceId, unwrap_aliasable_resource;
+    AnyTypeId, ComponentAnyTypeId, ComponentDefinedTypeId, unwrap_component_defined_type;
+    AnyTypeId, ComponentAnyTypeId, ComponentFuncTypeId, unwrap_component_func_type;
+    AnyTypeId, ComponentAnyTypeId, ComponentInstanceTypeId, unwrap_component_instance_type;
+    AnyTypeId, ComponentAnyTypeId, ComponentTypeId, unwrap_component_type;
+}
+
+impl AnyTypeId {
+    /// Peel off one layer of aliasing from this type and return the aliased
+    /// inner type, or `None` if this type is not aliasing anything.
+    pub fn peel_alias(&self, types: &Types) -> Option<Self> {
+        match *self {
+            Self::Core(id) => id.peel_alias(types).map(Self::Core),
+            Self::Component(id) => types.peel_alias(id).map(Self::Component),
+        }
+    }
+}
+
+define_wrapper_id! {
+    /// An identifier for a core type or a core module's type.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub enum ComponentCoreTypeId {
+        #[unwrap = unwrap_sub]
+        /// A core type.
+        Sub(CoreTypeId),
+
+        #[unwrap = unwrap_module]
+        /// A core module's type.
+        Module(ComponentCoreModuleTypeId),
+    }
+}
+
+impl ComponentCoreTypeId {
+    /// Peel off one layer of aliasing from this type and return the aliased
+    /// inner type, or `None` if this type is not aliasing anything.
+    pub fn peel_alias(&self, types: &Types) -> Option<Self> {
+        match *self {
+            Self::Sub(_) => None,
+            Self::Module(id) => types.peel_alias(id).map(Self::Module),
+        }
+    }
+}
+
+/// An aliasable resource identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AliasableResourceId {
+    id: ResourceId,
+    alias_id: u32,
+}
+
+impl Aliasable for AliasableResourceId {
+    fn alias_id(&self) -> u32 {
+        self.alias_id
+    }
+
+    fn set_alias_id(&mut self, alias_id: u32) {
+        self.alias_id = alias_id;
+    }
+}
+
+impl AliasableResourceId {
+    /// Create a new instance with the specified resource ID and `self`'s alias
+    /// ID.
+    pub fn with_resource_id(&self, id: ResourceId) -> Self {
+        Self {
+            id,
+            alias_id: self.alias_id,
         }
     }
 
-    /// Converts the type to a core module instance type.
-    pub fn as_instance_type(&self) -> Option<&InstanceType> {
+    /// Get the underlying resource.
+    pub fn resource(&self) -> ResourceId {
+        self.id
+    }
+
+    pub(crate) fn resource_mut(&mut self) -> &mut ResourceId {
+        &mut self.id
+    }
+}
+
+define_wrapper_id! {
+    /// An identifier for any kind of component type.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    pub enum ComponentAnyTypeId {
+        #[unwrap = unwrap_resource]
+        /// The type is a resource with the specified id.
+        Resource(AliasableResourceId),
+
+        #[unwrap = unwrap_defined]
+        /// The type is a defined type with the specified id.
+        Defined(ComponentDefinedTypeId),
+
+        #[unwrap = unwrap_func]
+        /// The type is a function type with the specified id.
+        Func(ComponentFuncTypeId),
+
+        #[unwrap = unwrap_instance]
+        /// The type is an instance type with the specified id.
+        Instance(ComponentInstanceTypeId),
+
+        #[unwrap = unwrap_component]
+        /// The type is a component type with the specified id.
+        Component(ComponentTypeId),
+    }
+}
+
+impl Aliasable for ComponentAnyTypeId {
+    fn alias_id(&self) -> u32 {
         match self {
-            Self::Instance(ty) => Some(ty),
-            _ => None,
+            ComponentAnyTypeId::Resource(x) => x.alias_id(),
+            ComponentAnyTypeId::Defined(x) => x.alias_id(),
+            ComponentAnyTypeId::Func(x) => x.alias_id(),
+            ComponentAnyTypeId::Instance(x) => x.alias_id(),
+            ComponentAnyTypeId::Component(x) => x.alias_id(),
         }
     }
 
-    /// Converts the type to a component type.
-    pub fn as_component_type(&self) -> Option<&ComponentType> {
+    fn set_alias_id(&mut self, alias_id: u32) {
         match self {
-            Self::Component(ty) => Some(ty),
-            _ => None,
+            ComponentAnyTypeId::Resource(x) => x.set_alias_id(alias_id),
+            ComponentAnyTypeId::Defined(x) => x.set_alias_id(alias_id),
+            ComponentAnyTypeId::Func(x) => x.set_alias_id(alias_id),
+            ComponentAnyTypeId::Instance(x) => x.set_alias_id(alias_id),
+            ComponentAnyTypeId::Component(x) => x.set_alias_id(alias_id),
+        }
+    }
+}
+
+impl ComponentAnyTypeId {
+    pub(crate) fn info(&self, types: &TypeList) -> TypeInfo {
+        match *self {
+            Self::Resource(_) => TypeInfo::new(),
+            Self::Defined(id) => types[id].type_info(types),
+            Self::Func(id) => types[id].type_info(types),
+            Self::Instance(id) => types[id].type_info(types),
+            Self::Component(id) => types[id].type_info(types),
         }
     }
 
-    /// Converts the type to a component instance type.
-    pub fn as_component_instance_type(&self) -> Option<&ComponentInstanceType> {
+    pub(crate) fn desc(&self) -> &'static str {
         match self {
-            Self::ComponentInstance(ty) => Some(ty),
-            _ => None,
+            Self::Resource(_) => "resource",
+            Self::Defined(_) => "defined type",
+            Self::Func(_) => "func",
+            Self::Instance(_) => "instance",
+            Self::Component(_) => "component",
+        }
+    }
+}
+
+define_type_id!(
+    RecGroupId,
+    Range<CoreTypeId>,
+    rec_group_elements,
+    "recursion group"
+);
+
+impl TypeData for Range<CoreTypeId> {
+    type Id = RecGroupId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        let size = self.end.index() - self.start.index();
+        TypeInfo::core(u32::try_from(size).unwrap())
+    }
+}
+
+define_type_id!(ComponentTypeId, ComponentType, components, "component");
+
+define_type_id!(
+    ComponentValueTypeId,
+    ComponentValType,
+    component_values,
+    "component value"
+);
+
+define_type_id!(
+    ComponentInstanceTypeId,
+    ComponentInstanceType,
+    component_instances,
+    "component instance"
+);
+
+define_type_id!(
+    ComponentFuncTypeId,
+    ComponentFuncType,
+    component_funcs,
+    "component function"
+);
+
+define_type_id!(
+    ComponentCoreInstanceTypeId,
+    InstanceType,
+    core_instances,
+    "component's core instance"
+);
+
+define_type_id!(
+    ComponentCoreModuleTypeId,
+    ModuleType,
+    core_modules,
+    "component's core module"
+);
+
+/// Represents a unique identifier for a component type type known to a
+/// [`crate::Validator`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct ComponentDefinedTypeId {
+    index: u32,
+    alias_id: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<ComponentDefinedTypeId>() <= 8);
+};
+
+impl TypeIdentifier for ComponentDefinedTypeId {
+    type Data = ComponentDefinedType;
+
+    fn from_index(index: u32) -> Self {
+        ComponentDefinedTypeId {
+            index,
+            alias_id: NO_ALIAS,
         }
     }
 
-    /// Converts the type to a component function type.
-    pub fn as_component_func_type(&self) -> Option<&ComponentFuncType> {
-        match self {
-            Self::ComponentFunc(ty) => Some(ty),
-            _ => None,
-        }
+    fn list(types: &TypeList) -> &SnapshotList<Self::Data> {
+        &types.component_defined_types
     }
 
-    /// Converts the type to a component defined type.
-    pub fn as_defined_type(&self) -> Option<&ComponentDefinedType> {
-        match self {
-            Self::Defined(ty) => Some(ty),
-            _ => None,
-        }
+    fn list_mut(types: &mut TypeList) -> &mut SnapshotList<Self::Data> {
+        &mut types.component_defined_types
     }
 
-    /// Converts this type to a resource type, returning the corresponding id.
-    pub fn as_resource(&self) -> Option<ResourceId> {
-        match self {
-            Self::Resource(id) => Some(*id),
-            _ => None,
-        }
+    fn index(&self) -> usize {
+        usize::try_from(self.index).unwrap()
+    }
+}
+
+impl Aliasable for ComponentDefinedTypeId {
+    fn alias_id(&self) -> u32 {
+        self.alias_id
     }
 
-    pub(crate) fn type_size(&self) -> u32 {
-        match self {
-            Self::Func(ty) => 1 + (ty.params().len() + ty.results().len()) as u32,
-            Self::Array(_) => 2, // 2 is a guess.
-            Self::Module(ty) => ty.type_size,
-            Self::Instance(ty) => ty.type_size,
-            Self::Component(ty) => ty.type_size,
-            Self::ComponentInstance(ty) => ty.type_size,
-            Self::ComponentFunc(ty) => ty.type_size,
-            Self::Defined(ty) => ty.type_size(),
-            Self::Resource(_) => 1,
-        }
+    fn set_alias_id(&mut self, alias_id: u32) {
+        self.alias_id = alias_id;
+    }
+}
+
+/// Metadata about a type and its transitive structure.
+///
+/// Currently contains two properties:
+///
+/// * The "size" of a type - a proxy to the recursive size of a type if
+///   everything in the type were unique (e.g. no shared references). Not an
+///   approximation of runtime size, but instead of type-complexity size if
+///   someone were to visit each element of the type individually. For example
+///   `u32` has size 1 and `(list u32)` has size 2 (roughly). Used to prevent
+///   massive trees of types.
+///
+/// * Whether or not a type contains a "borrow" transitively inside of it. For
+///   example `(borrow $t)` and `(list (borrow $t))` both contain borrows, but
+///   `(list u32)` does not. Used to validate that component function results do
+///   not contain borrows.
+///
+/// Currently this is represented as a compact 32-bit integer to ensure that
+/// `TypeId`, which this is stored in, remains relatively small. The maximum
+/// type size allowed in wasmparser is 1M at this time which is 20 bits of
+/// information, and then one more bit is used for whether or not a borrow is
+/// used. Currently this uses the low 24 bits for the type size and the MSB for
+/// the borrow bit.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+// Only public because it shows up in a public trait's `doc(hidden)` method.
+#[doc(hidden)]
+pub struct TypeInfo(u32);
+
+impl TypeInfo {
+    /// Creates a new blank set of type information.
+    ///
+    /// Defaults to size 1 to ensure that this consumes space in the final type
+    /// structure.
+    pub(crate) fn new() -> TypeInfo {
+        TypeInfo::_new(1, false)
+    }
+
+    /// Creates a new blank set of information about a leaf "borrow" type which
+    /// has size 1.
+    pub(crate) fn borrow() -> TypeInfo {
+        TypeInfo::_new(1, true)
+    }
+
+    /// Creates type information corresponding to a core type of the `size`
+    /// specified, meaning no borrows are contained within.
+    pub(crate) fn core(size: u32) -> TypeInfo {
+        TypeInfo::_new(size, false)
+    }
+
+    fn _new(size: u32, contains_borrow: bool) -> TypeInfo {
+        assert!(size < (1 << 24));
+        TypeInfo(size | ((contains_borrow as u32) << 31))
+    }
+
+    /// Combines another set of type information into this one, for example if
+    /// this is a record which has `other` as a field.
+    ///
+    /// Updates the size of `self` and whether or not this type contains a
+    /// borrow based on whether `other` contains a borrow.
+    ///
+    /// Returns an error if the type size would exceed this crate's static limit
+    /// of a type size.
+    pub(crate) fn combine(&mut self, other: TypeInfo, offset: usize) -> Result<()> {
+        *self = TypeInfo::_new(
+            super::combine_type_sizes(self.size(), other.size(), offset)?,
+            self.contains_borrow() || other.contains_borrow(),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn size(&self) -> u32 {
+        self.0 & 0xffffff
+    }
+
+    pub(crate) fn contains_borrow(&self) -> bool {
+        (self.0 >> 31) != 0
     }
 }
 
@@ -298,34 +778,39 @@ pub enum ComponentValType {
     /// The value type is one of the primitive types.
     Primitive(PrimitiveValType),
     /// The type is represented with the given type identifier.
-    Type(TypeId),
+    Type(ComponentDefinedTypeId),
+}
+
+impl TypeData for ComponentValType {
+    type Id = ComponentValueTypeId;
+
+    fn type_info(&self, types: &TypeList) -> TypeInfo {
+        match self {
+            ComponentValType::Primitive(_) => TypeInfo::new(),
+            ComponentValType::Type(id) => types[*id].type_info(types),
+        }
+    }
 }
 
 impl ComponentValType {
-    pub(crate) fn requires_realloc(&self, types: &TypeList) -> bool {
+    pub(crate) fn contains_ptr(&self, types: &TypeList) -> bool {
         match self {
-            ComponentValType::Primitive(ty) => ty.requires_realloc(),
-            ComponentValType::Type(ty) => types[*ty]
-                .as_defined_type()
-                .unwrap()
-                .requires_realloc(types),
+            ComponentValType::Primitive(ty) => ty.contains_ptr(),
+            ComponentValType::Type(ty) => types[*ty].contains_ptr(types),
         }
     }
 
     fn push_wasm_types(&self, types: &TypeList, lowered_types: &mut LoweredTypes) -> bool {
         match self {
             Self::Primitive(ty) => push_primitive_wasm_types(ty, lowered_types),
-            Self::Type(id) => types[*id]
-                .as_defined_type()
-                .unwrap()
-                .push_wasm_types(types, lowered_types),
+            Self::Type(id) => types[*id].push_wasm_types(types, lowered_types),
         }
     }
 
-    pub(crate) fn type_size(&self) -> u32 {
+    pub(crate) fn info(&self, types: &TypeList) -> TypeInfo {
         match self {
-            Self::Primitive(_) => 1,
-            Self::Type(id) => id.type_size,
+            Self::Primitive(_) => TypeInfo::new(),
+            Self::Type(id) => types[*id].type_info(types),
         }
     }
 }
@@ -334,7 +819,7 @@ impl ComponentValType {
 #[derive(Debug, Clone, Copy)]
 pub enum EntityType {
     /// The entity is a function.
-    Func(TypeId),
+    Func(CoreTypeId),
     /// The entity is a table.
     Table(TableType),
     /// The entity is a memory.
@@ -342,7 +827,7 @@ pub enum EntityType {
     /// The entity is a global.
     Global(GlobalType),
     /// The entity is a tag.
-    Tag(TypeId),
+    Tag(CoreTypeId),
 }
 
 impl EntityType {
@@ -356,10 +841,10 @@ impl EntityType {
         }
     }
 
-    pub(crate) fn type_size(&self) -> u32 {
+    pub(crate) fn info(&self, types: &TypeList) -> TypeInfo {
         match self {
-            Self::Func(id) | Self::Tag(id) => id.type_size,
-            Self::Table(_) | Self::Memory(_) | Self::Global(_) => 1,
+            Self::Func(id) | Self::Tag(id) => types[*id].type_info(types),
+            Self::Table(_) | Self::Memory(_) | Self::Global(_) => TypeInfo::new(),
         }
     }
 }
@@ -413,12 +898,20 @@ impl ModuleImportKey for (&str, &str) {
 /// Represents a core module type.
 #[derive(Debug, Clone)]
 pub struct ModuleType {
-    /// The effective type size for the module type.
-    pub(crate) type_size: u32,
+    /// Metadata about this module type
+    pub(crate) info: TypeInfo,
     /// The imports of the module type.
     pub imports: IndexMap<(String, String), EntityType>,
     /// The exports of the module type.
     pub exports: IndexMap<String, EntityType>,
+}
+
+impl TypeData for ModuleType {
+    type Id = ComponentCoreModuleTypeId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        self.info
+    }
 }
 
 impl ModuleType {
@@ -432,9 +925,10 @@ impl ModuleType {
 
 /// Represents the kind of module instance type.
 #[derive(Debug, Clone)]
-pub enum InstanceTypeKind {
+pub enum CoreInstanceTypeKind {
     /// The instance type is the result of instantiating a module type.
-    Instantiated(TypeId),
+    Instantiated(ComponentCoreModuleTypeId),
+
     /// The instance type is the result of instantiating from exported items.
     Exports(IndexMap<String, EntityType>),
 }
@@ -442,10 +936,18 @@ pub enum InstanceTypeKind {
 /// Represents a module instance type.
 #[derive(Debug, Clone)]
 pub struct InstanceType {
-    /// The effective type size for the module instance type.
-    pub(crate) type_size: u32,
+    /// Metadata about this instance type
+    pub(crate) info: TypeInfo,
     /// The kind of module instance type.
-    pub kind: InstanceTypeKind,
+    pub kind: CoreInstanceTypeKind,
+}
+
+impl TypeData for InstanceType {
+    type Id = ComponentCoreInstanceTypeId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        self.info
+    }
 }
 
 impl InstanceType {
@@ -459,8 +961,8 @@ impl InstanceType {
         types: &'a TypeList,
     ) -> &'a IndexMap<String, EntityType> {
         match &self.kind {
-            InstanceTypeKind::Instantiated(id) => &types[*id].as_module_type().unwrap().exports,
-            InstanceTypeKind::Exports(exports) => exports,
+            CoreInstanceTypeKind::Instantiated(id) => &types[*id].exports,
+            CoreInstanceTypeKind::Exports(exports) => exports,
         }
     }
 }
@@ -469,28 +971,28 @@ impl InstanceType {
 #[derive(Debug, Clone, Copy)]
 pub enum ComponentEntityType {
     /// The entity is a core module.
-    Module(TypeId),
+    Module(ComponentCoreModuleTypeId),
     /// The entity is a function.
-    Func(TypeId),
+    Func(ComponentFuncTypeId),
     /// The entity is a value.
     Value(ComponentValType),
     /// The entity is a type.
     Type {
         /// This is the identifier of the type that was referenced when this
         /// entity was created.
-        referenced: TypeId,
+        referenced: ComponentAnyTypeId,
         /// This is the identifier of the type that was created when this type
         /// was imported or exported from the component.
         ///
         /// Note that the underlying type information for the `referenced`
         /// field and for this `created` field is the same, but these two types
         /// will hash to different values.
-        created: TypeId,
+        created: ComponentAnyTypeId,
     },
     /// The entity is a component instance.
-    Instance(TypeId),
+    Instance(ComponentInstanceTypeId),
     /// The entity is a component.
-    Component(TypeId),
+    Component(ComponentTypeId),
 }
 
 impl ComponentEntityType {
@@ -512,14 +1014,14 @@ impl ComponentEntityType {
         }
     }
 
-    pub(crate) fn type_size(&self) -> u32 {
+    pub(crate) fn info(&self, types: &TypeList) -> TypeInfo {
         match self {
-            Self::Module(ty)
-            | Self::Func(ty)
-            | Self::Type { referenced: ty, .. }
-            | Self::Instance(ty)
-            | Self::Component(ty) => ty.type_size,
-            Self::Value(ty) => ty.type_size(),
+            Self::Module(ty) => types[*ty].type_info(types),
+            Self::Func(ty) => types[*ty].type_info(types),
+            Self::Type { referenced: ty, .. } => ty.info(types),
+            Self::Instance(ty) => types[*ty].type_info(types),
+            Self::Component(ty) => types[*ty].type_info(types),
+            Self::Value(ty) => ty.info(types),
         }
     }
 }
@@ -527,8 +1029,8 @@ impl ComponentEntityType {
 /// Represents a type of a component.
 #[derive(Debug, Clone)]
 pub struct ComponentType {
-    /// The effective type size for the component type.
-    pub(crate) type_size: u32,
+    /// Metadata about this component type
+    pub(crate) info: TypeInfo,
 
     /// The imports of the component type.
     ///
@@ -580,11 +1082,19 @@ pub struct ComponentType {
     pub explicit_resources: IndexMap<ResourceId, Vec<usize>>,
 }
 
+impl TypeData for ComponentType {
+    type Id = ComponentTypeId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        self.info
+    }
+}
+
 /// Represents a type of a component instance.
 #[derive(Debug, Clone)]
 pub struct ComponentInstanceType {
-    /// The effective type size for the instance type.
-    pub(crate) type_size: u32,
+    /// Metadata about this instance type
+    pub(crate) info: TypeInfo,
 
     /// The list of exports, keyed by name, that this instance has.
     ///
@@ -630,28 +1140,54 @@ pub struct ComponentInstanceType {
     pub explicit_resources: IndexMap<ResourceId, Vec<usize>>,
 }
 
+impl TypeData for ComponentInstanceType {
+    type Id = ComponentInstanceTypeId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        self.info
+    }
+}
+
 /// Represents a type of a component function.
 #[derive(Debug, Clone)]
 pub struct ComponentFuncType {
-    /// The effective type size for the component function type.
-    pub(crate) type_size: u32,
+    /// Metadata about this function type.
+    pub(crate) info: TypeInfo,
     /// The function parameters.
     pub params: Box<[(KebabString, ComponentValType)]>,
     /// The function's results.
     pub results: Box<[(Option<KebabString>, ComponentValType)]>,
 }
 
+impl TypeData for ComponentFuncType {
+    type Id = ComponentFuncTypeId;
+
+    fn type_info(&self, _types: &TypeList) -> TypeInfo {
+        self.info
+    }
+}
+
 impl ComponentFuncType {
     /// Lowers the component function type to core parameter and result types for the
     /// canonical ABI.
-    pub(crate) fn lower(&self, types: &TypeList, import: bool) -> LoweringInfo {
+    pub(crate) fn lower(&self, types: &TypeList, is_lower: bool) -> LoweringInfo {
         let mut info = LoweringInfo::default();
 
         for (_, ty) in self.params.iter() {
-            // When `import` is false, it means we're lifting a core function,
-            // check if the parameters needs realloc
-            if !import && !info.requires_realloc {
-                info.requires_realloc = ty.requires_realloc(types);
+            // Check to see if `ty` has a pointer somewhere in it, needed for
+            // any type that transitively contains either a string or a list.
+            // In this situation lowered functions must specify `memory`, and
+            // lifted functions must specify `realloc` as well. Lifted functions
+            // gain their memory requirement through the final clause of this
+            // function.
+            if is_lower {
+                if !info.requires_memory {
+                    info.requires_memory = ty.contains_ptr(types);
+                }
+            } else {
+                if !info.requires_realloc {
+                    info.requires_realloc = ty.contains_ptr(types);
+                }
             }
 
             if !ty.push_wasm_types(types, &mut info.params) {
@@ -663,7 +1199,7 @@ impl ComponentFuncType {
                 info.requires_memory = true;
 
                 // We need realloc as well when lifting a function
-                if !import {
+                if !is_lower {
                     info.requires_realloc = true;
                 }
                 break;
@@ -671,17 +1207,19 @@ impl ComponentFuncType {
         }
 
         for (_, ty) in self.results.iter() {
-            // When `import` is true, it means we're lowering a component function,
-            // check if the result needs realloc
-            if import && !info.requires_realloc {
-                info.requires_realloc = ty.requires_realloc(types);
+            // Results of lowered functions that contains pointers must be
+            // allocated by the callee meaning that realloc is required.
+            // Results of lifted function are allocated by the guest which
+            // means that no realloc option is necessary.
+            if is_lower && !info.requires_realloc {
+                info.requires_realloc = ty.contains_ptr(types);
             }
 
             if !ty.push_wasm_types(types, &mut info.results) {
                 // Too many results to return directly, either a retptr parameter will be used (import)
                 // or a single pointer will be returned (export)
                 info.results.clear();
-                if import {
+                if is_lower {
                     info.params.max = MAX_LOWERED_TYPES;
                     assert!(info.params.push(ValType::I32));
                 } else {
@@ -711,8 +1249,8 @@ pub struct VariantCase {
 /// Represents a record type.
 #[derive(Debug, Clone)]
 pub struct RecordType {
-    /// The effective type size for the record type.
-    pub(crate) type_size: u32,
+    /// Metadata about this record type.
+    pub(crate) info: TypeInfo,
     /// The map of record fields.
     pub fields: IndexMap<KebabString, ComponentValType>,
 }
@@ -720,8 +1258,8 @@ pub struct RecordType {
 /// Represents a variant type.
 #[derive(Debug, Clone)]
 pub struct VariantType {
-    /// The effective type size for the variant type.
-    pub(crate) type_size: u32,
+    /// Metadata about this variant type.
+    pub(crate) info: TypeInfo,
     /// The map of variant cases.
     pub cases: IndexMap<KebabString, VariantCase>,
 }
@@ -729,18 +1267,9 @@ pub struct VariantType {
 /// Represents a tuple type.
 #[derive(Debug, Clone)]
 pub struct TupleType {
-    /// The effective type size for the tuple type.
-    pub(crate) type_size: u32,
+    /// Metadata about this tuple type.
+    pub(crate) info: TypeInfo,
     /// The types of the tuple.
-    pub types: Box<[ComponentValType]>,
-}
-
-/// Represents a union type.
-#[derive(Debug, Clone)]
-pub struct UnionType {
-    /// The inclusive type count for the union type.
-    pub(crate) type_size: u32,
-    /// The types of the union.
     pub types: Box<[ComponentValType]>,
 }
 
@@ -761,8 +1290,6 @@ pub enum ComponentDefinedType {
     Flags(IndexSet<KebabString>),
     /// The type is an enumeration.
     Enum(IndexSet<KebabString>),
-    /// The type is a union.
-    Union(UnionType),
     /// The type is an `option`.
     Option(ComponentValType),
     /// The type is a `result`.
@@ -773,47 +1300,49 @@ pub enum ComponentDefinedType {
         err: Option<ComponentValType>,
     },
     /// The type is an owned handle to the specified resource.
-    Own(TypeId),
+    Own(AliasableResourceId),
     /// The type is a borrowed handle to the specified resource.
-    Borrow(TypeId),
+    Borrow(AliasableResourceId),
 }
 
-impl ComponentDefinedType {
-    pub(crate) fn requires_realloc(&self, types: &TypeList) -> bool {
+impl TypeData for ComponentDefinedType {
+    type Id = ComponentDefinedTypeId;
+
+    fn type_info(&self, types: &TypeList) -> TypeInfo {
         match self {
-            Self::Primitive(ty) => ty.requires_realloc(),
-            Self::Record(r) => r.fields.values().any(|ty| ty.requires_realloc(types)),
-            Self::Variant(v) => v.cases.values().any(|case| {
-                case.ty
-                    .map(|ty| ty.requires_realloc(types))
-                    .unwrap_or(false)
-            }),
-            Self::List(_) => true,
-            Self::Tuple(t) => t.types.iter().any(|ty| ty.requires_realloc(types)),
-            Self::Union(u) => u.types.iter().any(|ty| ty.requires_realloc(types)),
-            Self::Flags(_) | Self::Enum(_) | Self::Own(_) | Self::Borrow(_) => false,
-            Self::Option(ty) => ty.requires_realloc(types),
+            Self::Primitive(_) | Self::Flags(_) | Self::Enum(_) | Self::Own(_) => TypeInfo::new(),
+            Self::Borrow(_) => TypeInfo::borrow(),
+            Self::Record(r) => r.info,
+            Self::Variant(v) => v.info,
+            Self::Tuple(t) => t.info,
+            Self::List(ty) | Self::Option(ty) => ty.info(types),
             Self::Result { ok, err } => {
-                ok.map(|ty| ty.requires_realloc(types)).unwrap_or(false)
-                    || err.map(|ty| ty.requires_realloc(types)).unwrap_or(false)
+                let default = TypeInfo::new();
+                let mut info = ok.map(|ty| ty.type_info(types)).unwrap_or(default);
+                info.combine(err.map(|ty| ty.type_info(types)).unwrap_or(default), 0)
+                    .unwrap();
+                info
             }
         }
     }
+}
 
-    pub(crate) fn type_size(&self) -> u32 {
+impl ComponentDefinedType {
+    pub(crate) fn contains_ptr(&self, types: &TypeList) -> bool {
         match self {
-            Self::Primitive(_)
-            | Self::Flags(_)
-            | Self::Enum(_)
-            | Self::Own(_)
-            | Self::Borrow(_) => 1,
-            Self::Record(r) => r.type_size,
-            Self::Variant(v) => v.type_size,
-            Self::Tuple(t) => t.type_size,
-            Self::Union(u) => u.type_size,
-            Self::List(ty) | Self::Option(ty) => ty.type_size(),
+            Self::Primitive(ty) => ty.contains_ptr(),
+            Self::Record(r) => r.fields.values().any(|ty| ty.contains_ptr(types)),
+            Self::Variant(v) => v
+                .cases
+                .values()
+                .any(|case| case.ty.map(|ty| ty.contains_ptr(types)).unwrap_or(false)),
+            Self::List(_) => true,
+            Self::Tuple(t) => t.types.iter().any(|ty| ty.contains_ptr(types)),
+            Self::Flags(_) | Self::Enum(_) | Self::Own(_) | Self::Borrow(_) => false,
+            Self::Option(ty) => ty.contains_ptr(types),
             Self::Result { ok, err } => {
-                ok.map(|ty| ty.type_size()).unwrap_or(1) + err.map(|ty| ty.type_size()).unwrap_or(1)
+                ok.map(|ty| ty.contains_ptr(types)).unwrap_or(false)
+                    || err.map(|ty| ty.contains_ptr(types)).unwrap_or(false)
             }
         }
     }
@@ -839,7 +1368,6 @@ impl ComponentDefinedType {
                 (0..(names.len() + 31) / 32).all(|_| lowered_types.push(ValType::I32))
             }
             Self::Enum(_) | Self::Own(_) | Self::Borrow(_) => lowered_types.push(ValType::I32),
-            Self::Union(u) => Self::push_variant_wasm_types(u.types.iter(), types, lowered_types),
             Self::Option(ty) => {
                 Self::push_variant_wasm_types([ty].into_iter(), types, lowered_types)
             }
@@ -904,7 +1432,6 @@ impl ComponentDefinedType {
             ComponentDefinedType::Flags(_) => "flags",
             ComponentDefinedType::Option(_) => "option",
             ComponentDefinedType::List(_) => "list",
-            ComponentDefinedType::Union(_) => "union",
             ComponentDefinedType::Result { .. } => "result",
             ComponentDefinedType::Own(_) => "own",
             ComponentDefinedType::Borrow(_) => "borrow",
@@ -934,7 +1461,7 @@ pub struct ResourceId {
     //
     // The 32-bit storage here should ideally be enough for any component
     // containing resources. If memory usage becomes an issue (this struct is
-    // 12 bytes instead of 8 or 4) then this coudl get folded into the globally
+    // 12 bytes instead of 8 or 4) then this could get folded into the globally
     // unique id with everything using an atomic increment perhaps.
     contextually_unique_id: u32,
 }
@@ -983,227 +1510,332 @@ impl<'a> TypesRef<'a> {
         }
     }
 
-    fn types(&self, core: bool) -> Option<&'a [TypeId]> {
-        Some(match &self.kind {
-            TypesRefKind::Module(module) => {
-                if core {
-                    &module.types
-                } else {
-                    return None;
-                }
-            }
-            TypesRefKind::Component(component) => {
-                if core {
-                    &component.core_types
-                } else {
-                    &component.types
-                }
-            }
-        })
-    }
-
     /// Gets a type based on its type id.
     ///
     /// Returns `None` if the type id is unknown.
-    pub fn type_from_id(&self, id: TypeId) -> Option<&'a Type> {
-        self.list.get(id.index)
+    pub fn get<T>(&self, id: T) -> Option<&'a T::Data>
+    where
+        T: TypeIdentifier,
+    {
+        self.list.get(id)
+    }
+
+    /// Gets a core WebAssembly type id from a type index.
+    ///
+    /// Note that this is in contrast to [`TypesRef::component_type_at`] which
+    /// gets a component type from its index.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn core_type_at(&self, index: u32) -> ComponentCoreTypeId {
+        match &self.kind {
+            TypesRefKind::Module(module) => ComponentCoreTypeId::Sub(module.types[index as usize]),
+            TypesRefKind::Component(component) => component.core_types[index as usize],
+        }
     }
 
     /// Gets a type id from a type index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn id_from_type_index(&self, index: u32, core: bool) -> Option<TypeId> {
-        self.types(core)?.get(index as usize).copied()
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid type index or if this type information
+    /// represents a core module.
+    pub fn component_any_type_at(&self, index: u32) -> ComponentAnyTypeId {
+        match &self.kind {
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.types[index as usize],
+        }
     }
 
-    /// Gets a type at the given type index.
+    /// Gets a component type id from a type index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn type_at(&self, index: u32, core: bool) -> Option<&'a Type> {
-        self.type_from_id(self.id_from_type_index(index, core)?)
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid component type index or if this type
+    /// information represents a core module.
+    pub fn component_type_at(&self, index: u32) -> ComponentTypeId {
+        match self.component_any_type_at(index) {
+            ComponentAnyTypeId::Component(id) => id,
+            _ => panic!("not a component type"),
+        }
     }
 
-    /// Gets a defined core function type at the given type index.
+    /// Gets a type id from a type index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn func_type_at(&self, index: u32) -> Option<&'a IndexedFuncType> {
-        match self.type_at(index, true)? {
-            Type::Func(ty) => Some(ty),
-            _ => None,
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index or if this type
+    /// information represents a core module.
+    pub fn component_defined_type_at(&self, index: u32) -> ComponentDefinedTypeId {
+        match self.component_any_type_at(index) {
+            ComponentAnyTypeId::Defined(id) => id,
+            _ => panic!("not a defined type"),
+        }
+    }
+
+    /// Returns the number of core types defined so far.
+    pub fn core_type_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.types.len() as u32,
+            TypesRefKind::Component(component) => component.core_types.len() as u32,
+        }
+    }
+
+    /// Returns the number of component types defined so far.
+    pub fn component_type_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(_module) => 0,
+            TypesRefKind::Component(component) => component.types.len() as u32,
         }
     }
 
     /// Gets the type of a table at the given table index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn table_at(&self, index: u32) -> Option<TableType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn table_at(&self, index: u32) -> TableType {
         let tables = match &self.kind {
             TypesRefKind::Module(module) => &module.tables,
             TypesRefKind::Component(component) => &component.core_tables,
         };
+        tables[index as usize]
+    }
 
-        tables.get(index as usize).copied()
+    /// Returns the number of tables defined so far.
+    pub fn table_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.tables.len() as u32,
+            TypesRefKind::Component(component) => component.core_tables.len() as u32,
+        }
     }
 
     /// Gets the type of a memory at the given memory index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn memory_at(&self, index: u32) -> Option<MemoryType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn memory_at(&self, index: u32) -> MemoryType {
         let memories = match &self.kind {
             TypesRefKind::Module(module) => &module.memories,
             TypesRefKind::Component(component) => &component.core_memories,
         };
 
-        memories.get(index as usize).copied()
+        memories[index as usize]
+    }
+
+    /// Returns the number of memories defined so far.
+    pub fn memory_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.memories.len() as u32,
+            TypesRefKind::Component(component) => component.core_memories.len() as u32,
+        }
     }
 
     /// Gets the type of a global at the given global index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn global_at(&self, index: u32) -> Option<GlobalType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn global_at(&self, index: u32) -> GlobalType {
         let globals = match &self.kind {
             TypesRefKind::Module(module) => &module.globals,
             TypesRefKind::Component(component) => &component.core_globals,
         };
 
-        globals.get(index as usize).copied()
+        globals[index as usize]
+    }
+
+    /// Returns the number of globals defined so far.
+    pub fn global_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.globals.len() as u32,
+            TypesRefKind::Component(component) => component.core_globals.len() as u32,
+        }
     }
 
     /// Gets the type of a tag at the given tag index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn tag_at(&self, index: u32) -> Option<&'a IndexedFuncType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn tag_at(&self, index: u32) -> CoreTypeId {
         let tags = match &self.kind {
             TypesRefKind::Module(module) => &module.tags,
             TypesRefKind::Component(component) => &component.core_tags,
         };
+        tags[index as usize]
+    }
 
-        Some(
-            self.list[*tags.get(index as usize)?]
-                .as_func_type()
-                .unwrap(),
-        )
+    /// Returns the number of tags defined so far.
+    pub fn tag_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.tags.len() as u32,
+            TypesRefKind::Component(component) => component.core_tags.len() as u32,
+        }
     }
 
     /// Gets the type of a core function at the given function index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn function_at(&self, index: u32) -> Option<&'a IndexedFuncType> {
-        let id = match &self.kind {
-            TypesRefKind::Module(module) => {
-                &module.types[*module.functions.get(index as usize)? as usize]
-            }
-            TypesRefKind::Component(component) => component.core_funcs.get(index as usize)?,
-        };
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn core_function_at(&self, index: u32) -> CoreTypeId {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.types[module.functions[index as usize] as usize],
+            TypesRefKind::Component(component) => component.core_funcs[index as usize],
+        }
+    }
 
-        match &self.list[*id] {
-            Type::Func(ty) => Some(ty),
-            _ => None,
+    /// Gets the count of core functions defined so far.
+    ///
+    /// Note that this includes imported functions, defined functions, and for
+    /// components lowered/aliased functions.
+    pub fn function_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.functions.len() as u32,
+            TypesRefKind::Component(component) => component.core_funcs.len() as u32,
         }
     }
 
     /// Gets the type of an element segment at the given element segment index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn element_at(&self, index: u32) -> Option<RefType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn element_at(&self, index: u32) -> RefType {
         match &self.kind {
-            TypesRefKind::Module(module) => module.element_types.get(index as usize).copied(),
-            TypesRefKind::Component(_) => None,
+            TypesRefKind::Module(module) => module.element_types[index as usize],
+            TypesRefKind::Component(_) => {
+                panic!("no elements on a component")
+            }
+        }
+    }
+
+    /// Returns the number of elements defined so far.
+    pub fn element_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(module) => module.element_types.len() as u32,
+            TypesRefKind::Component(_) => 0,
         }
     }
 
     /// Gets the type of a component function at the given function index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn component_function_at(&self, index: u32) -> Option<&'a ComponentFuncType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn component_function_at(&self, index: u32) -> ComponentFuncTypeId {
         match &self.kind {
-            TypesRefKind::Module(_) => None,
-            TypesRefKind::Component(component) => Some(
-                self.list[*component.funcs.get(index as usize)?]
-                    .as_component_func_type()
-                    .unwrap(),
-            ),
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.funcs[index as usize],
+        }
+    }
+
+    /// Returns the number of component functions defined so far.
+    pub fn component_function_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(_module) => 0,
+            TypesRefKind::Component(component) => component.funcs.len() as u32,
         }
     }
 
     /// Gets the type of a module at the given module index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn module_at(&self, index: u32) -> Option<&'a ModuleType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn module_at(&self, index: u32) -> ComponentCoreModuleTypeId {
         match &self.kind {
-            TypesRefKind::Module(_) => None,
-            TypesRefKind::Component(component) => Some(
-                self.list[*component.core_modules.get(index as usize)?]
-                    .as_module_type()
-                    .unwrap(),
-            ),
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.core_modules[index as usize],
+        }
+    }
+
+    /// Returns the number of core wasm modules defined so far.
+    pub fn module_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(_module) => 0,
+            TypesRefKind::Component(component) => component.core_modules.len() as u32,
         }
     }
 
     /// Gets the type of a module instance at the given module instance index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn instance_at(&self, index: u32) -> Option<&'a InstanceType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn core_instance_at(&self, index: u32) -> ComponentCoreInstanceTypeId {
         match &self.kind {
-            TypesRefKind::Module(_) => None,
-            TypesRefKind::Component(component) => {
-                let id = component.core_instances.get(index as usize)?;
-                match &self.list[*id] {
-                    Type::Instance(ty) => Some(ty),
-                    _ => None,
-                }
-            }
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.core_instances[index as usize],
+        }
+    }
+
+    /// Returns the number of core wasm instances defined so far.
+    pub fn core_instance_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(_module) => 0,
+            TypesRefKind::Component(component) => component.core_instances.len() as u32,
         }
     }
 
     /// Gets the type of a component at the given component index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn component_at(&self, index: u32) -> Option<&'a ComponentType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn component_at(&self, index: u32) -> ComponentTypeId {
         match &self.kind {
-            TypesRefKind::Module(_) => None,
-            TypesRefKind::Component(component) => Some(
-                self.list[*component.components.get(index as usize)?]
-                    .as_component_type()
-                    .unwrap(),
-            ),
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.components[index as usize],
+        }
+    }
+
+    /// Returns the number of components defined so far.
+    pub fn component_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(_module) => 0,
+            TypesRefKind::Component(component) => component.components.len() as u32,
         }
     }
 
     /// Gets the type of an component instance at the given component instance index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn component_instance_at(&self, index: u32) -> Option<TypeId> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn component_instance_at(&self, index: u32) -> ComponentInstanceTypeId {
         match &self.kind {
-            TypesRefKind::Module(_) => None,
-            TypesRefKind::Component(component) => component.instances.get(index as usize).copied(),
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.instances[index as usize],
+        }
+    }
+
+    /// Returns the number of component instances defined so far.
+    pub fn component_instance_count(&self) -> u32 {
+        match &self.kind {
+            TypesRefKind::Module(_module) => 0,
+            TypesRefKind::Component(component) => component.instances.len() as u32,
         }
     }
 
     /// Gets the type of a value at the given value index.
     ///
-    /// Returns `None` if the type index is out of bounds or the type has not
-    /// been parsed yet.
-    pub fn value_at(&self, index: u32) -> Option<ComponentValType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn value_at(&self, index: u32) -> ComponentValType {
         match &self.kind {
-            TypesRefKind::Module(_) => None,
-            TypesRefKind::Component(component) => {
-                component.values.get(index as usize).map(|(r, _)| *r)
-            }
+            TypesRefKind::Module(_) => panic!("not a component"),
+            TypesRefKind::Component(component) => component.values[index as usize].0,
         }
     }
 
@@ -1260,6 +1892,27 @@ impl<'a> TypesRef<'a> {
             TypesRefKind::Component(component) => Some(*component.exports.get(name)?),
         }
     }
+
+    /// Attempts to lookup the type id that `ty` is an alias of.
+    ///
+    /// Returns `None` if `ty` wasn't listed as aliasing a prior type.
+    pub fn peel_alias<T>(&self, ty: T) -> Option<T>
+    where
+        T: Aliasable,
+    {
+        self.list.peel_alias(ty)
+    }
+}
+
+impl<T> Index<T> for TypesRef<'_>
+where
+    T: TypeIdentifier,
+{
+    type Output = T::Data;
+
+    fn index(&self, index: T) -> &Self::Output {
+        &self.list[index]
+    }
 }
 
 impl Types {
@@ -1291,29 +1944,54 @@ impl Types {
     /// Gets a type based on its type id.
     ///
     /// Returns `None` if the type id is unknown.
-    pub fn type_from_id(&self, id: TypeId) -> Option<&Type> {
-        self.as_ref().type_from_id(id)
+    pub fn get<T>(&self, id: T) -> Option<&T::Data>
+    where
+        T: TypeIdentifier,
+    {
+        self.as_ref().get(id)
     }
 
-    /// Gets a type id from a type index.
+    /// Gets a core WebAssembly type at the given type index.
     ///
-    /// Returns `None` if the type index is out of bounds.
-    pub fn id_from_type_index(&self, index: u32, core: bool) -> Option<TypeId> {
-        self.as_ref().id_from_type_index(index, core)
+    /// Note that this is in contrast to [`TypesRef::component_type_at`] which
+    /// gets a component type from its index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index.
+    pub fn core_type_at(&self, index: u32) -> ComponentCoreTypeId {
+        self.as_ref().core_type_at(index)
     }
 
-    /// Gets a type at the given type index.
+    /// Gets a component WebAssembly type at the given type index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn type_at(&self, index: u32, core: bool) -> Option<&Type> {
-        self.as_ref().type_at(index, core)
+    /// Note that this is in contrast to [`TypesRef::core_type_at`] which gets a
+    /// core type from its index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid type index.
+    pub fn component_any_type_at(&self, index: u32) -> ComponentAnyTypeId {
+        self.as_ref().component_any_type_at(index)
     }
 
-    /// Gets a defined core function type at the given type index.
+    /// Gets a component type at the given type index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn func_type_at(&self, index: u32) -> Option<&IndexedFuncType> {
-        self.as_ref().func_type_at(index)
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid component type index.
+    pub fn component_type_at(&self, index: u32) -> ComponentTypeId {
+        self.as_ref().component_type_at(index)
+    }
+
+    /// Gets a component type from the given component type index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid defined type index or if this type
+    /// information represents a core module.
+    pub fn component_defined_type_at(&self, index: u32) -> ComponentDefinedTypeId {
+        self.as_ref().component_defined_type_at(index)
     }
 
     /// Gets the count of core types.
@@ -1326,8 +2004,10 @@ impl Types {
 
     /// Gets the type of a table at the given table index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn table_at(&self, index: u32) -> Option<TableType> {
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index.
+    pub fn table_at(&self, index: u32) -> TableType {
         self.as_ref().table_at(index)
     }
 
@@ -1341,103 +2021,99 @@ impl Types {
 
     /// Gets the type of a memory at the given memory index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn memory_at(&self, index: u32) -> Option<MemoryType> {
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index.
+    pub fn memory_at(&self, index: u32) -> MemoryType {
         self.as_ref().memory_at(index)
     }
 
     /// Gets the count of imported and defined memories.
-    pub fn memory_count(&self) -> usize {
-        match &self.kind {
-            TypesKind::Module(module) => module.memories.len(),
-            TypesKind::Component(component) => component.core_memories.len(),
-        }
+    pub fn memory_count(&self) -> u32 {
+        self.as_ref().memory_count()
     }
 
     /// Gets the type of a global at the given global index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn global_at(&self, index: u32) -> Option<GlobalType> {
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index.
+    pub fn global_at(&self, index: u32) -> GlobalType {
         self.as_ref().global_at(index)
     }
 
     /// Gets the count of imported and defined globals.
-    pub fn global_count(&self) -> usize {
-        match &self.kind {
-            TypesKind::Module(module) => module.globals.len(),
-            TypesKind::Component(component) => component.core_globals.len(),
-        }
+    pub fn global_count(&self) -> u32 {
+        self.as_ref().global_count()
     }
 
     /// Gets the type of a tag at the given tag index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn tag_at(&self, index: u32) -> Option<&IndexedFuncType> {
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index.
+    pub fn tag_at(&self, index: u32) -> CoreTypeId {
         self.as_ref().tag_at(index)
     }
 
     /// Gets the count of imported and defined tags.
-    pub fn tag_count(&self) -> usize {
-        match &self.kind {
-            TypesKind::Module(module) => module.tags.len(),
-            TypesKind::Component(component) => component.core_tags.len(),
-        }
+    pub fn tag_count(&self) -> u32 {
+        self.as_ref().tag_count()
     }
 
     /// Gets the type of a core function at the given function index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn function_at(&self, index: u32) -> Option<&IndexedFuncType> {
-        self.as_ref().function_at(index)
+    /// # Panics
+    ///
+    /// Panics if `index` is not a valid function index.
+    pub fn core_function_at(&self, index: u32) -> CoreTypeId {
+        self.as_ref().core_function_at(index)
     }
 
-    /// Gets the count of imported and defined core functions.
+    /// Gets the count of core functions defined so far.
     ///
-    /// The count also includes aliased core functions in components.
-    pub fn function_count(&self) -> usize {
-        match &self.kind {
-            TypesKind::Module(module) => module.functions.len(),
-            TypesKind::Component(component) => component.core_funcs.len(),
-        }
+    /// Note that this includes imported functions, defined functions, and for
+    /// components lowered/aliased functions.
+    pub fn core_function_count(&self) -> u32 {
+        self.as_ref().function_count()
     }
 
     /// Gets the type of an element segment at the given element segment index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn element_at(&self, index: u32) -> Option<RefType> {
-        match &self.kind {
-            TypesKind::Module(module) => module.element_types.get(index as usize).copied(),
-            TypesKind::Component(_) => None,
-        }
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds.
+    pub fn element_at(&self, index: u32) -> RefType {
+        self.as_ref().element_at(index)
     }
 
     /// Gets the count of element segments.
-    pub fn element_count(&self) -> usize {
-        match &self.kind {
-            TypesKind::Module(module) => module.element_types.len(),
-            TypesKind::Component(_) => 0,
-        }
+    pub fn element_count(&self) -> u32 {
+        self.as_ref().element_count()
     }
 
     /// Gets the type of a component function at the given function index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn component_function_at(&self, index: u32) -> Option<&ComponentFuncType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn component_function_at(&self, index: u32) -> ComponentFuncTypeId {
         self.as_ref().component_function_at(index)
     }
 
     /// Gets the count of imported, exported, or aliased component functions.
-    pub fn component_function_count(&self) -> usize {
-        match &self.kind {
-            TypesKind::Module(_) => 0,
-            TypesKind::Component(component) => component.funcs.len(),
-        }
+    pub fn component_function_count(&self) -> u32 {
+        self.as_ref().component_function_count()
     }
 
     /// Gets the type of a module at the given module index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn module_at(&self, index: u32) -> Option<&ModuleType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn module_at(&self, index: u32) -> ComponentCoreModuleTypeId {
         self.as_ref().module_at(index)
     }
 
@@ -1451,13 +2127,16 @@ impl Types {
 
     /// Gets the type of a module instance at the given module instance index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn instance_at(&self, index: u32) -> Option<&InstanceType> {
-        self.as_ref().instance_at(index)
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn core_instance_at(&self, index: u32) -> ComponentCoreInstanceTypeId {
+        self.as_ref().core_instance_at(index)
     }
 
     /// Gets the count of imported, exported, or aliased core module instances.
-    pub fn instance_count(&self) -> usize {
+    pub fn core_instance_count(&self) -> usize {
         match &self.kind {
             TypesKind::Module(_) => 0,
             TypesKind::Component(component) => component.core_instances.len(),
@@ -1466,8 +2145,11 @@ impl Types {
 
     /// Gets the type of a component at the given component index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn component_at(&self, index: u32) -> Option<&ComponentType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn component_at(&self, index: u32) -> ComponentTypeId {
         self.as_ref().component_at(index)
     }
 
@@ -1481,8 +2163,11 @@ impl Types {
 
     /// Gets the type of an component instance at the given component instance index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn component_instance_at(&self, index: u32) -> Option<TypeId> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn component_instance_at(&self, index: u32) -> ComponentInstanceTypeId {
         self.as_ref().component_instance_at(index)
     }
 
@@ -1496,8 +2181,11 @@ impl Types {
 
     /// Gets the type of a value at the given value index.
     ///
-    /// Returns `None` if the index is out of bounds.
-    pub fn value_at(&self, index: u32) -> Option<ComponentValType> {
+    /// # Panics
+    ///
+    /// This will panic if the `index` provided is out of bounds or if this type
+    /// information represents a core module.
+    pub fn value_at(&self, index: u32) -> ComponentValType {
         self.as_ref().value_at(index)
     }
 
@@ -1532,8 +2220,22 @@ impl Types {
     /// Attempts to lookup the type id that `ty` is an alias of.
     ///
     /// Returns `None` if `ty` wasn't listed as aliasing a prior type.
-    pub fn peel_alias(&self, ty: TypeId) -> Option<TypeId> {
+    pub fn peel_alias<T>(&self, ty: T) -> Option<T>
+    where
+        T: Aliasable,
+    {
         self.list.peel_alias(ty)
+    }
+}
+
+impl<T> Index<T> for Types
+where
+    T: TypeIdentifier,
+{
+    type Output = T::Data;
+
+    fn index(&self, id: T) -> &Self::Output {
+        &self.list[id]
     }
 }
 
@@ -1548,7 +2250,10 @@ impl Types {
 ///
 /// Otherwise, though, this type behaves as if it were a large `Vec<T>`, but
 /// it's represented by lists of contiguous chunks.
-pub(crate) struct SnapshotList<T> {
+//
+// Only public because it shows up in a public trait's `doc(hidden)` method.
+#[doc(hidden)]
+pub struct SnapshotList<T> {
     // All previous snapshots, the "head" of the list that this type represents.
     // The first entry in this pair is the starting index for all elements
     // contained in the list, and the second element is the list itself. Note
@@ -1565,15 +2270,10 @@ pub(crate) struct SnapshotList<T> {
 
     // The current list of types for the current snapshot that are being built.
     cur: Vec<T>,
-
-    unique_mappings: HashMap<u32, u32>,
-    unique_counter: u32,
 }
 
 struct Snapshot<T> {
     prior_types: usize,
-    unique_counter: u32,
-    unique_mappings: HashMap<u32, u32>,
     items: Vec<T>,
 }
 
@@ -1608,9 +2308,10 @@ impl<T> SnapshotList<T> {
         self.cur.len() + self.snapshots_total
     }
 
-    /// Reserve space for an additional count of items.
-    pub(crate) fn reserve(&mut self, additional: usize) {
-        self.cur.reserve(additional);
+    /// Same as `Vec::truncate` but can only truncate uncommitted elements.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        assert!(len >= self.snapshots_total);
+        self.cur.truncate(len - self.snapshots_total);
     }
 
     /// Commits previously pushed types into this snapshot vector, and returns a
@@ -1623,18 +2324,12 @@ impl<T> SnapshotList<T> {
         // If the current chunk has new elements, commit them in to an
         // `Arc`-wrapped vector in the snapshots list. Note the `shrink_to_fit`
         // ahead of time to hopefully keep memory usage lower than it would
-        // otherwise be. Additionally note that the `unique_counter` is bumped
-        // here to ensure that the previous value of the unique counter is
-        // never used for an actual type so it's suitable for lookup via a
-        // binary search.
+        // otherwise be.
         let len = self.cur.len();
         if len > 0 {
-            self.unique_counter += 1;
             self.cur.shrink_to_fit();
             self.snapshots.push(Arc::new(Snapshot {
                 prior_types: self.snapshots_total,
-                unique_counter: self.unique_counter - 1,
-                unique_mappings: mem::take(&mut self.unique_mappings),
                 items: mem::take(&mut self.cur),
             }));
             self.snapshots_total += len;
@@ -1642,51 +2337,8 @@ impl<T> SnapshotList<T> {
         SnapshotList {
             snapshots: self.snapshots.clone(),
             snapshots_total: self.snapshots_total,
-            unique_mappings: HashMap::new(),
-            unique_counter: self.unique_counter,
             cur: Vec::new(),
         }
-    }
-
-    /// Modifies a `TypeId` to have the same contents but a fresh new unique id.
-    ///
-    /// This is used during aliasing with components to assign types a unique
-    /// identifier that isn't equivalent to anything else but still
-    /// points to the same underlying type.
-    pub fn with_unique(&mut self, mut ty: TypeId) -> TypeId {
-        self.unique_mappings
-            .insert(self.unique_counter, ty.unique_id);
-        ty.unique_id = self.unique_counter;
-        self.unique_counter += 1;
-        ty
-    }
-
-    /// Attempts to lookup the type id that `ty` is an alias of.
-    ///
-    /// Returns `None` if `ty` wasn't listed as aliasing a prior type.
-    pub fn peel_alias(&self, ty: TypeId) -> Option<TypeId> {
-        // The unique counter in each snapshot is the unique counter at the
-        // time of the snapshot so it's guaranteed to never be used, meaning
-        // that `Ok` should never show up here. With an `Err` it's where the
-        // index would be placed meaning that the index in question is the
-        // smallest value over the unique id's value, meaning that slot has the
-        // mapping we're interested in.
-        let i = match self
-            .snapshots
-            .binary_search_by_key(&ty.unique_id, |snapshot| snapshot.unique_counter)
-        {
-            Ok(_) => unreachable!(),
-            Err(i) => i,
-        };
-
-        // If the `i` index is beyond the snapshot array then lookup in the
-        // current mappings instead since it may refer to a type not snapshot
-        // yet.
-        let unique_id = match self.snapshots.get(i) {
-            Some(snapshot) => *snapshot.unique_mappings.get(&ty.unique_id)?,
-            None => *self.unique_mappings.get(&ty.unique_id)?,
-        };
-        Some(TypeId { unique_id, ..ty })
     }
 }
 
@@ -1699,12 +2351,15 @@ impl<T> Index<usize> for SnapshotList<T> {
     }
 }
 
-impl<T> Index<TypeId> for SnapshotList<T> {
+impl<T, U> Index<U> for SnapshotList<T>
+where
+    U: TypeIdentifier<Data = T>,
+{
     type Output = T;
 
     #[inline]
-    fn index(&self, id: TypeId) -> &T {
-        self.get(id.index).unwrap()
+    fn index(&self, id: U) -> &T {
+        self.get(id.index()).unwrap()
     }
 }
 
@@ -1714,14 +2369,530 @@ impl<T> Default for SnapshotList<T> {
             snapshots: Vec::new(),
             snapshots_total: 0,
             cur: Vec::new(),
-            unique_counter: 1,
-            unique_mappings: HashMap::new(),
         }
     }
 }
 
 /// A snapshot list of types.
-pub(crate) type TypeList = SnapshotList<Type>;
+///
+/// Note that the snapshot lists below do not correspond with index spaces. Many
+/// different kinds of types are in the same index space (e.g. all of the
+/// component model's {component, instance, defined, func} types are in the same
+/// index space). However, we store each of them in their own type-specific
+/// snapshot list and give each of them their own identifier type.
+#[derive(Default)]
+// Only public because it shows up in a public trait's `doc(hidden)` method.
+#[doc(hidden)]
+pub struct TypeList {
+    // Keeps track of which `alias_id` is an alias of which other `alias_id`.
+    alias_mappings: HashMap<u32, u32>,
+    // Counter for generating new `alias_id`s.
+    alias_counter: u32,
+    // Snapshots of previously committed `TypeList`s' aliases.
+    alias_snapshots: Vec<TypeListAliasSnapshot>,
+
+    // Core Wasm types.
+    //
+    // A primary map from `CoreTypeId` to `SubType`.
+    core_types: SnapshotList<SubType>,
+    // The id of each core Wasm type's rec group.
+    //
+    // A secondary map from `CoreTypeId` to `RecGroupId`.
+    core_type_to_rec_group: SnapshotList<RecGroupId>,
+    // The supertype of each core type.
+    //
+    // A secondary map from `coreTypeId` to `Option<CoreTypeId>`.
+    core_type_to_supertype: SnapshotList<Option<CoreTypeId>>,
+    // A primary map from `RecGroupId` to the range of the rec group's elements
+    // within `core_types`.
+    rec_group_elements: SnapshotList<Range<CoreTypeId>>,
+    // A hash map from rec group elements to their canonical `RecGroupId`.
+    //
+    // This is `None` when a list is "committed" meaning that no more insertions
+    // can happen.
+    canonical_rec_groups: Option<HashMap<RecGroup, RecGroupId>>,
+
+    // Component model types.
+    components: SnapshotList<ComponentType>,
+    component_defined_types: SnapshotList<ComponentDefinedType>,
+    component_values: SnapshotList<ComponentValType>,
+    component_instances: SnapshotList<ComponentInstanceType>,
+    component_funcs: SnapshotList<ComponentFuncType>,
+    core_modules: SnapshotList<ModuleType>,
+    core_instances: SnapshotList<InstanceType>,
+}
+
+#[derive(Clone, Debug)]
+struct TypeListAliasSnapshot {
+    // The `alias_counter` at the time that this snapshot was taken.
+    alias_counter: u32,
+
+    // The alias mappings in this snapshot.
+    alias_mappings: HashMap<u32, u32>,
+}
+
+struct TypeListCheckpoint {
+    core_types: usize,
+    components: usize,
+    component_defined_types: usize,
+    component_values: usize,
+    component_instances: usize,
+    component_funcs: usize,
+    core_modules: usize,
+    core_instances: usize,
+    core_type_to_rec_group: usize,
+    core_type_to_supertype: usize,
+    rec_group_elements: usize,
+    canonical_rec_groups: usize,
+}
+
+impl TypeList {
+    pub fn get<T>(&self, id: T) -> Option<&T::Data>
+    where
+        T: TypeIdentifier,
+    {
+        T::list(self).get(id.index())
+    }
+
+    pub fn push<T>(&mut self, ty: T) -> T::Id
+    where
+        T: TypeData,
+    {
+        let index = u32::try_from(T::Id::list(self).len()).unwrap();
+        let id = T::Id::from_index(index);
+        T::Id::list_mut(self).push(ty);
+        id
+    }
+
+    /// Intern the given recursion group (that has already been canonicalized)
+    /// and return its associated id and whether this was a new recursion group
+    /// or not.
+    pub fn intern_canonical_rec_group(&mut self, rec_group: RecGroup) -> (bool, RecGroupId) {
+        let canonical_rec_groups = self
+            .canonical_rec_groups
+            .as_mut()
+            .expect("cannot intern into a committed list");
+        let entry = match canonical_rec_groups.entry(rec_group) {
+            Entry::Occupied(e) => return (false, *e.get()),
+            Entry::Vacant(e) => e,
+        };
+
+        let rec_group_id = self.rec_group_elements.len();
+        let rec_group_id = u32::try_from(rec_group_id).unwrap();
+        let rec_group_id = RecGroupId::from_index(rec_group_id);
+
+        let start = self.core_types.len();
+        let start = u32::try_from(start).unwrap();
+        let start = CoreTypeId::from_index(start);
+
+        for ty in entry.key().types() {
+            debug_assert_eq!(self.core_types.len(), self.core_type_to_supertype.len());
+            debug_assert_eq!(self.core_types.len(), self.core_type_to_rec_group.len());
+
+            self.core_type_to_supertype
+                .push(ty.supertype_idx.map(|idx| match idx.unpack() {
+                    UnpackedIndex::RecGroup(offset) => CoreTypeId::from_index(start.index + offset),
+                    UnpackedIndex::Id(id) => id,
+                    UnpackedIndex::Module(_) => unreachable!("in canonical form"),
+                }));
+            let mut ty = ty.clone();
+            ty.remap_indices(&mut |index| {
+                match index.unpack() {
+                    UnpackedIndex::Id(_) => {}
+                    UnpackedIndex::Module(_) => unreachable!(),
+                    UnpackedIndex::RecGroup(offset) => {
+                        *index = UnpackedIndex::Id(CoreTypeId::from_index(start.index + offset))
+                            .pack()
+                            .unwrap();
+                    }
+                };
+                Ok(())
+            })
+            .expect("cannot fail");
+            self.core_types.push(ty);
+            self.core_type_to_rec_group.push(rec_group_id);
+        }
+
+        let end = self.core_types.len();
+        let end = u32::try_from(end).unwrap();
+        let end = CoreTypeId::from_index(end);
+
+        let range = start..end;
+
+        self.rec_group_elements.push(range.clone());
+
+        entry.insert(rec_group_id);
+        return (true, rec_group_id);
+    }
+
+    /// Get the `CoreTypeId` for a local index into a rec group.
+    pub fn rec_group_local_id(
+        &self,
+        rec_group: RecGroupId,
+        index: u32,
+        offset: usize,
+    ) -> Result<CoreTypeId> {
+        let elems = &self[rec_group];
+        let len = elems.end.index() - elems.start.index();
+        let len = u32::try_from(len).unwrap();
+        if index < len {
+            let id = u32::try_from(elems.start.index()).unwrap() + index;
+            let id = CoreTypeId::from_index(id);
+            Ok(id)
+        } else {
+            bail!(
+                offset,
+                "unknown type {index}: type index out of rec group bounds"
+            )
+        }
+    }
+
+    /// Get the id of the rec group that the given type id was defined within.
+    pub fn rec_group_id_of(&self, id: CoreTypeId) -> RecGroupId {
+        self.core_type_to_rec_group[id.index()]
+    }
+
+    /// Get the super type of the given type id, if any.
+    pub fn supertype_of(&self, id: CoreTypeId) -> Option<CoreTypeId> {
+        self.core_type_to_supertype[id.index()]
+    }
+
+    /// Get the `CoreTypeId` for a canonicalized `PackedIndex`.
+    ///
+    /// Panics when given a non-canonicalized `PackedIndex`.
+    pub fn at_canonicalized_packed_index(
+        &self,
+        rec_group: RecGroupId,
+        index: PackedIndex,
+        offset: usize,
+    ) -> Result<CoreTypeId> {
+        self.at_canonicalized_unpacked_index(rec_group, index.unpack(), offset)
+    }
+
+    /// Get the `CoreTypeId` for a canonicalized `UnpackedIndex`.
+    ///
+    /// Panics when given a non-canonicalized `PackedIndex`.
+    pub fn at_canonicalized_unpacked_index(
+        &self,
+        rec_group: RecGroupId,
+        index: UnpackedIndex,
+        offset: usize,
+    ) -> Result<CoreTypeId> {
+        match index {
+            UnpackedIndex::Module(_) => panic!("not canonicalized"),
+            UnpackedIndex::Id(id) => Ok(id),
+            UnpackedIndex::RecGroup(idx) => self.rec_group_local_id(rec_group, idx, offset),
+        }
+    }
+
+    /// Does `a` structurally match `b`?
+    pub fn matches(&self, a: CoreTypeId, b: CoreTypeId) -> bool {
+        let a = WithRecGroup::new(self, a);
+        let a = WithRecGroup::map(a, |a| &self[a]);
+
+        let b = WithRecGroup::new(self, b);
+        let b = WithRecGroup::map(b, |b| &self[b]);
+
+        Matches::matches(self, a, b)
+    }
+
+    /// Is `a == b` or was `a` declared (potentially transitively) to be a
+    /// subtype of `b`?
+    pub fn id_is_subtype(&self, mut a: CoreTypeId, b: CoreTypeId) -> bool {
+        loop {
+            if a == b {
+                return true;
+            }
+
+            // TODO: maintain supertype vectors and implement this check in O(1)
+            // instead of O(n) time.
+            a = match self.supertype_of(a) {
+                Some(a) => a,
+                None => return false,
+            };
+        }
+    }
+
+    /// Like `id_is_subtype` but for `RefType`s.
+    ///
+    /// Both `a` and `b` must be canonicalized already.
+    pub fn reftype_is_subtype(&self, a: RefType, b: RefType) -> bool {
+        // NB: Don't need `RecGroupId`s since we are calling from outside of the
+        // rec group, and so any `PackedIndex`es we encounter have already been
+        // canonicalized to `CoreTypeId`s directly.
+        self.reftype_is_subtype_impl(a, None, b, None)
+    }
+
+    /// Implementation of `RefType` and `HeapType` subtyping.
+    ///
+    /// Panics if we need rec groups but aren't given them. Rec groups only need
+    /// to be passed in when checking subtyping of `RefType`s that we encounter
+    /// while validating a rec group itself.
+    pub(crate) fn reftype_is_subtype_impl(
+        &self,
+        a: RefType,
+        a_group: Option<RecGroupId>,
+        b: RefType,
+        b_group: Option<RecGroupId>,
+    ) -> bool {
+        if a == b && a_group == b_group {
+            return true;
+        }
+
+        if a.is_nullable() && !b.is_nullable() {
+            return false;
+        }
+
+        let core_type_id = |group: Option<RecGroupId>, index: UnpackedIndex| -> CoreTypeId {
+            if let Some(id) = index.as_core_type_id() {
+                id
+            } else {
+                self.at_canonicalized_unpacked_index(group.unwrap(), index, usize::MAX)
+                    .expect("type references are checked during canonicalization")
+            }
+        };
+
+        let subtype = |group, index| -> &SubType {
+            let id = core_type_id(group, index);
+            &self[id]
+        };
+
+        use HeapType as HT;
+        match (a.heap_type(), b.heap_type()) {
+            (a, b) if a == b => true,
+
+            (HT::Eq | HT::I31 | HT::Struct | HT::Array | HT::None, HT::Any) => true,
+            (HT::I31 | HT::Struct | HT::Array | HT::None, HT::Eq) => true,
+            (HT::NoExtern, HT::Extern) => true,
+            (HT::NoFunc, HT::Func) => true,
+            (HT::None, HT::I31 | HT::Array | HT::Struct) => true,
+
+            (HT::Concrete(a), HT::Eq | HT::Any) => matches!(
+                subtype(a_group, a).composite_type,
+                CompositeType::Array(_) | CompositeType::Struct(_)
+            ),
+
+            (HT::Concrete(a), HT::Struct) => {
+                matches!(subtype(a_group, a).composite_type, CompositeType::Struct(_))
+            }
+
+            (HT::Concrete(a), HT::Array) => {
+                matches!(subtype(a_group, a).composite_type, CompositeType::Array(_))
+            }
+
+            (HT::Concrete(a), HT::Func) => {
+                matches!(subtype(a_group, a).composite_type, CompositeType::Func(_))
+            }
+
+            (HT::Concrete(a), HT::Concrete(b)) => {
+                self.id_is_subtype(core_type_id(a_group, a), core_type_id(b_group, b))
+            }
+
+            (HT::None, HT::Concrete(b)) => matches!(
+                subtype(b_group, b).composite_type,
+                CompositeType::Array(_) | CompositeType::Struct(_)
+            ),
+
+            (HT::NoFunc, HT::Concrete(b)) => {
+                matches!(subtype(b_group, b).composite_type, CompositeType::Func(_))
+            }
+
+            // Nothing else matches. (Avoid full wildcard matches so that
+            // adding/modifying variants is easier in the future.)
+            (HT::Concrete(_), _)
+            | (HT::Func, _)
+            | (HT::Extern, _)
+            | (HT::Any, _)
+            | (HT::None, _)
+            | (HT::NoExtern, _)
+            | (HT::NoFunc, _)
+            | (HT::Eq, _)
+            | (HT::Struct, _)
+            | (HT::Array, _)
+            | (HT::I31, _) => false,
+        }
+    }
+
+    /// Like `id_is_subtype` but for `RefType`s.
+    ///
+    /// Both `a` and `b` must be canonicalized already.
+    pub fn valtype_is_subtype(&self, a: ValType, b: ValType) -> bool {
+        match (a, b) {
+            (a, b) if a == b => true,
+            (ValType::Ref(a), ValType::Ref(b)) => self.reftype_is_subtype(a, b),
+            (ValType::Ref(_), _)
+            | (ValType::I32, _)
+            | (ValType::I64, _)
+            | (ValType::F32, _)
+            | (ValType::F64, _)
+            | (ValType::V128, _) => false,
+        }
+    }
+
+    fn checkpoint(&self) -> TypeListCheckpoint {
+        let TypeList {
+            alias_mappings: _,
+            alias_counter: _,
+            alias_snapshots: _,
+            core_types,
+            components,
+            component_defined_types,
+            component_values,
+            component_instances,
+            component_funcs,
+            core_modules,
+            core_instances,
+            core_type_to_rec_group,
+            core_type_to_supertype,
+            rec_group_elements,
+            canonical_rec_groups,
+        } = self;
+
+        TypeListCheckpoint {
+            core_types: core_types.len(),
+            components: components.len(),
+            component_defined_types: component_defined_types.len(),
+            component_values: component_values.len(),
+            component_instances: component_instances.len(),
+            component_funcs: component_funcs.len(),
+            core_modules: core_modules.len(),
+            core_instances: core_instances.len(),
+            core_type_to_rec_group: core_type_to_rec_group.len(),
+            core_type_to_supertype: core_type_to_supertype.len(),
+            rec_group_elements: rec_group_elements.len(),
+            canonical_rec_groups: canonical_rec_groups.as_ref().map(|m| m.len()).unwrap_or(0),
+        }
+    }
+
+    fn reset_to_checkpoint(&mut self, checkpoint: TypeListCheckpoint) {
+        let TypeList {
+            alias_mappings: _,
+            alias_counter: _,
+            alias_snapshots: _,
+            core_types,
+            components,
+            component_defined_types,
+            component_values,
+            component_instances,
+            component_funcs,
+            core_modules,
+            core_instances,
+            core_type_to_rec_group,
+            core_type_to_supertype,
+            rec_group_elements,
+            canonical_rec_groups,
+        } = self;
+
+        core_types.truncate(checkpoint.core_types);
+        components.truncate(checkpoint.components);
+        component_defined_types.truncate(checkpoint.component_defined_types);
+        component_values.truncate(checkpoint.component_values);
+        component_instances.truncate(checkpoint.component_instances);
+        component_funcs.truncate(checkpoint.component_funcs);
+        core_modules.truncate(checkpoint.core_modules);
+        core_instances.truncate(checkpoint.core_instances);
+        core_type_to_rec_group.truncate(checkpoint.core_type_to_rec_group);
+        core_type_to_supertype.truncate(checkpoint.core_type_to_supertype);
+        rec_group_elements.truncate(checkpoint.rec_group_elements);
+
+        if let Some(canonical_rec_groups) = canonical_rec_groups {
+            assert_eq!(
+                canonical_rec_groups.len(),
+                checkpoint.canonical_rec_groups,
+                "checkpointing does not support resetting `canonical_rec_groups` (it would require a \
+                 proper immutable and persistent hash map) so adding new groups is disallowed"
+            );
+        }
+    }
+
+    pub fn commit(&mut self) -> TypeList {
+        // Note that the `alias_counter` is bumped here to ensure that the
+        // previous value of the unique counter is never used for an actual type
+        // so it's suitable for lookup via a binary search.
+        let alias_counter = self.alias_counter;
+        self.alias_counter += 1;
+
+        self.alias_snapshots.push(TypeListAliasSnapshot {
+            alias_counter,
+            alias_mappings: mem::take(&mut self.alias_mappings),
+        });
+
+        TypeList {
+            alias_mappings: HashMap::new(),
+            alias_counter: self.alias_counter,
+            alias_snapshots: self.alias_snapshots.clone(),
+            core_types: self.core_types.commit(),
+            components: self.components.commit(),
+            component_defined_types: self.component_defined_types.commit(),
+            component_values: self.component_values.commit(),
+            component_instances: self.component_instances.commit(),
+            component_funcs: self.component_funcs.commit(),
+            core_modules: self.core_modules.commit(),
+            core_instances: self.core_instances.commit(),
+            core_type_to_rec_group: self.core_type_to_rec_group.commit(),
+            core_type_to_supertype: self.core_type_to_supertype.commit(),
+            rec_group_elements: self.rec_group_elements.commit(),
+            canonical_rec_groups: None,
+        }
+    }
+
+    /// See `SnapshotList::with_unique`.
+    pub fn with_unique<T>(&mut self, mut ty: T) -> T
+    where
+        T: Aliasable,
+    {
+        self.alias_mappings
+            .insert(self.alias_counter, ty.alias_id());
+        ty.set_alias_id(self.alias_counter);
+        self.alias_counter += 1;
+        ty
+    }
+
+    /// Attempts to lookup the type id that `ty` is an alias of.
+    ///
+    /// Returns `None` if `ty` wasn't listed as aliasing a prior type.
+    pub fn peel_alias<T>(&self, mut ty: T) -> Option<T>
+    where
+        T: Aliasable,
+    {
+        let alias_id = ty.alias_id();
+
+        // The unique counter in each snapshot is the unique counter at the
+        // time of the snapshot so it's guaranteed to never be used, meaning
+        // that `Ok` should never show up here. With an `Err` it's where the
+        // index would be placed meaning that the index in question is the
+        // smallest value over the unique id's value, meaning that slot has the
+        // mapping we're interested in.
+        let i = match self
+            .alias_snapshots
+            .binary_search_by_key(&alias_id, |snapshot| snapshot.alias_counter)
+        {
+            Ok(_) => unreachable!(),
+            Err(i) => i,
+        };
+
+        // If the `i` index is beyond the snapshot array then lookup in the
+        // current mappings instead since it may refer to a type not snapshot
+        // yet.
+        ty.set_alias_id(match self.alias_snapshots.get(i) {
+            Some(snapshot) => *snapshot.alias_mappings.get(&alias_id)?,
+            None => *self.alias_mappings.get(&alias_id)?,
+        });
+        Some(ty)
+    }
+}
+
+impl<T> Index<T> for TypeList
+where
+    T: TypeIdentifier,
+{
+    type Output = T::Data;
+
+    fn index(&self, id: T) -> &Self::Output {
+        let arena = T::list(self);
+        &arena[id.index()]
+    }
+}
 
 /// Thin wrapper around `TypeList` which provides an allocator of unique ids for
 /// types contained within this list.
@@ -1740,11 +2911,13 @@ pub(crate) struct TypeAlloc {
 impl Default for TypeAlloc {
     fn default() -> TypeAlloc {
         static NEXT_GLOBAL_ID: AtomicU64 = AtomicU64::new(0);
-        TypeAlloc {
+        let mut ret = TypeAlloc {
             list: TypeList::default(),
             globally_unique_id: NEXT_GLOBAL_ID.fetch_add(1, Ordering::Relaxed),
             next_resource_id: 0,
-        }
+        };
+        ret.list.canonical_rec_groups = Some(Default::default());
+        ret
     }
 }
 
@@ -1767,26 +2940,25 @@ impl TypeAlloc {
     ///
     /// The returned identifier is unique within this `TypeAlloc` and won't be
     /// hash-equivalent to anything else.
-    pub fn push_ty(&mut self, ty: Type) -> TypeId {
-        let index = self.list.len();
-        let type_size = ty.type_size();
-        self.list.push(ty);
-        TypeId {
-            index,
-            type_size,
-            unique_id: 0,
-        }
+    pub fn push_ty<T>(&mut self, ty: T) -> T::Id
+    where
+        T: TypeData,
+    {
+        self.list.push(ty)
     }
 
     /// Allocates a new unique resource identifier.
     ///
     /// Note that uniqueness is only a property within this `TypeAlloc`.
-    pub fn alloc_resource_id(&mut self) -> ResourceId {
+    pub fn alloc_resource_id(&mut self) -> AliasableResourceId {
         let contextually_unique_id = self.next_resource_id;
         self.next_resource_id = self.next_resource_id.checked_add(1).unwrap();
-        ResourceId {
-            globally_unique_id: self.globally_unique_id,
-            contextually_unique_id,
+        AliasableResourceId {
+            id: ResourceId {
+                globally_unique_id: self.globally_unique_id,
+                contextually_unique_id,
+            },
+            alias_id: NO_ALIAS,
         }
     }
 
@@ -1796,98 +2968,123 @@ impl TypeAlloc {
     /// Free variables are defined as resources. Any resource, perhaps
     /// transitively, referred to but not defined by `id` is added to the `set`
     /// and returned.
-    pub fn free_variables_type_id(&self, id: TypeId, set: &mut IndexSet<ResourceId>) {
+    pub fn free_variables_any_type_id(
+        &self,
+        id: ComponentAnyTypeId,
+        set: &mut IndexSet<ResourceId>,
+    ) {
+        match id {
+            ComponentAnyTypeId::Resource(r) => {
+                set.insert(r.resource());
+            }
+            ComponentAnyTypeId::Defined(id) => {
+                self.free_variables_component_defined_type_id(id, set)
+            }
+            ComponentAnyTypeId::Func(id) => self.free_variables_component_func_type_id(id, set),
+            ComponentAnyTypeId::Instance(id) => {
+                self.free_variables_component_instance_type_id(id, set)
+            }
+            ComponentAnyTypeId::Component(id) => self.free_variables_component_type_id(id, set),
+        }
+    }
+
+    pub fn free_variables_component_defined_type_id(
+        &self,
+        id: ComponentDefinedTypeId,
+        set: &mut IndexSet<ResourceId>,
+    ) {
         match &self[id] {
-            // Core wasm constructs cannot reference resources.
-            Type::Func(_) | Type::Array(_) | Type::Module(_) | Type::Instance(_) => {}
-
-            // Recurse on the imports/exports of components, but remove the
-            // imported and defined resources within the component itself.
-            //
-            // Technically this needs to add all the free variables of the
-            // exports, remove the defined resources, then add the free
-            // variables of imports, then remove the imported resources. Given
-            // prior validation of component types, however, the defined
-            // and imported resources are disjoint and imports can't refer to
-            // defined resources, so doing this all in one go should be
-            // equivalent.
-            Type::Component(i) => {
-                for ty in i.imports.values().chain(i.exports.values()) {
-                    self.free_variables_component_entity(ty, set);
-                }
-                for (id, _path) in i.imported_resources.iter().chain(&i.defined_resources) {
-                    set.remove(id);
-                }
-            }
-
-            // Like components, add in all the free variables of referenced
-            // types but then remove those defined by this component instance
-            // itself.
-            Type::ComponentInstance(i) => {
-                for ty in i.exports.values() {
-                    self.free_variables_component_entity(ty, set);
-                }
-                for id in i.defined_resources.iter() {
-                    set.remove(id);
-                }
-            }
-
-            Type::Resource(r) => {
-                set.insert(*r);
-            }
-
-            Type::ComponentFunc(i) => {
-                for ty in i
-                    .params
-                    .iter()
-                    .map(|(_, ty)| ty)
-                    .chain(i.results.iter().map(|(_, ty)| ty))
-                {
+            ComponentDefinedType::Primitive(_)
+            | ComponentDefinedType::Flags(_)
+            | ComponentDefinedType::Enum(_) => {}
+            ComponentDefinedType::Record(r) => {
+                for ty in r.fields.values() {
                     self.free_variables_valtype(ty, set);
                 }
             }
-
-            Type::Defined(i) => match i {
-                ComponentDefinedType::Primitive(_)
-                | ComponentDefinedType::Flags(_)
-                | ComponentDefinedType::Enum(_) => {}
-                ComponentDefinedType::Record(r) => {
-                    for ty in r.fields.values() {
-                        self.free_variables_valtype(ty, set);
-                    }
-                }
-                ComponentDefinedType::Tuple(r) => {
-                    for ty in r.types.iter() {
-                        self.free_variables_valtype(ty, set);
-                    }
-                }
-                ComponentDefinedType::Union(r) => {
-                    for ty in r.types.iter() {
-                        self.free_variables_valtype(ty, set);
-                    }
-                }
-                ComponentDefinedType::Variant(r) => {
-                    for ty in r.cases.values() {
-                        if let Some(ty) = &ty.ty {
-                            self.free_variables_valtype(ty, set);
-                        }
-                    }
-                }
-                ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
+            ComponentDefinedType::Tuple(r) => {
+                for ty in r.types.iter() {
                     self.free_variables_valtype(ty, set);
                 }
-                ComponentDefinedType::Result { ok, err } => {
-                    if let Some(ok) = ok {
-                        self.free_variables_valtype(ok, set);
-                    }
-                    if let Some(err) = err {
-                        self.free_variables_valtype(err, set);
+            }
+            ComponentDefinedType::Variant(r) => {
+                for ty in r.cases.values() {
+                    if let Some(ty) = &ty.ty {
+                        self.free_variables_valtype(ty, set);
                     }
                 }
-                ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
-                    self.free_variables_type_id(*id, set);
+            }
+            ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
+                self.free_variables_valtype(ty, set);
+            }
+            ComponentDefinedType::Result { ok, err } => {
+                if let Some(ok) = ok {
+                    self.free_variables_valtype(ok, set);
                 }
-            },
+                if let Some(err) = err {
+                    self.free_variables_valtype(err, set);
+                }
+            }
+            ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
+                set.insert(id.resource());
+            }
+        }
+    }
+
+    pub fn free_variables_component_type_id(
+        &self,
+        id: ComponentTypeId,
+        set: &mut IndexSet<ResourceId>,
+    ) {
+        let i = &self[id];
+        // Recurse on the imports/exports of components, but remove the
+        // imported and defined resources within the component itself.
+        //
+        // Technically this needs to add all the free variables of the
+        // exports, remove the defined resources, then add the free
+        // variables of imports, then remove the imported resources. Given
+        // prior validation of component types, however, the defined
+        // and imported resources are disjoint and imports can't refer to
+        // defined resources, so doing this all in one go should be
+        // equivalent.
+        for ty in i.imports.values().chain(i.exports.values()) {
+            self.free_variables_component_entity(ty, set);
+        }
+        for (id, _path) in i.imported_resources.iter().chain(&i.defined_resources) {
+            set.remove(id);
+        }
+    }
+
+    pub fn free_variables_component_instance_type_id(
+        &self,
+        id: ComponentInstanceTypeId,
+        set: &mut IndexSet<ResourceId>,
+    ) {
+        let i = &self[id];
+        // Like components, add in all the free variables of referenced
+        // types but then remove those defined by this component instance
+        // itself.
+        for ty in i.exports.values() {
+            self.free_variables_component_entity(ty, set);
+        }
+        for id in i.defined_resources.iter() {
+            set.remove(id);
+        }
+    }
+
+    pub fn free_variables_component_func_type_id(
+        &self,
+        id: ComponentFuncTypeId,
+        set: &mut IndexSet<ResourceId>,
+    ) {
+        let i = &self[id];
+        for ty in i
+            .params
+            .iter()
+            .map(|(_, ty)| ty)
+            .chain(i.results.iter().map(|(_, ty)| ty))
+        {
+            self.free_variables_valtype(ty, set);
         }
     }
 
@@ -1898,12 +3095,14 @@ impl TypeAlloc {
         set: &mut IndexSet<ResourceId>,
     ) {
         match ty {
-            ComponentEntityType::Module(id)
-            | ComponentEntityType::Func(id)
-            | ComponentEntityType::Instance(id)
-            | ComponentEntityType::Component(id) => self.free_variables_type_id(*id, set),
+            ComponentEntityType::Module(_) => {}
+            ComponentEntityType::Func(id) => self.free_variables_component_func_type_id(*id, set),
+            ComponentEntityType::Instance(id) => {
+                self.free_variables_component_instance_type_id(*id, set)
+            }
+            ComponentEntityType::Component(id) => self.free_variables_component_type_id(*id, set),
             ComponentEntityType::Type { created, .. } => {
-                self.free_variables_type_id(*created, set);
+                self.free_variables_any_type_id(*created, set);
             }
             ComponentEntityType::Value(ty) => self.free_variables_valtype(ty, set),
         }
@@ -1913,7 +3112,7 @@ impl TypeAlloc {
     fn free_variables_valtype(&self, ty: &ComponentValType, set: &mut IndexSet<ResourceId>) {
         match ty {
             ComponentValType::Primitive(_) => {}
-            ComponentValType::Type(id) => self.free_variables_type_id(*id, set),
+            ComponentValType::Type(id) => self.free_variables_component_defined_type_id(*id, set),
         }
     }
 
@@ -1921,8 +3120,12 @@ impl TypeAlloc {
     /// via the provided `set`.
     ///
     /// This requires that `id` is a `Defined` type.
-    pub(crate) fn type_named_type_id(&self, id: TypeId, set: &HashSet<TypeId>) -> bool {
-        let ty = self[id].as_defined_type().unwrap();
+    pub(crate) fn type_named_type_id(
+        &self,
+        id: ComponentDefinedTypeId,
+        set: &HashSet<ComponentAnyTypeId>,
+    ) -> bool {
+        let ty = &self[id];
         match ty {
             // Primitives are always considered named
             ComponentDefinedType::Primitive(_) => true,
@@ -1932,8 +3135,7 @@ impl TypeAlloc {
             ComponentDefinedType::Flags(_)
             | ComponentDefinedType::Enum(_)
             | ComponentDefinedType::Record(_)
-            | ComponentDefinedType::Union(_)
-            | ComponentDefinedType::Variant(_) => set.contains(&id),
+            | ComponentDefinedType::Variant(_) => set.contains(&id.into()),
 
             // All types below here are allowed to be anonymous, but their
             // own components must be appropriately named.
@@ -1955,11 +3157,17 @@ impl TypeAlloc {
 
             // own/borrow themselves don't have to be named, but the resource
             // they refer to must be named.
-            ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => set.contains(id),
+            ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
+                set.contains(&(*id).into())
+            }
         }
     }
 
-    pub(crate) fn type_named_valtype(&self, ty: &ComponentValType, set: &HashSet<TypeId>) -> bool {
+    pub(crate) fn type_named_valtype(
+        &self,
+        ty: &ComponentValType,
+        set: &HashSet<ComponentAnyTypeId>,
+    ) -> bool {
         match ty {
             ComponentValType::Primitive(_) => true,
             ComponentValType::Type(id) => self.type_named_type_id(*id, set),
@@ -1972,186 +3180,222 @@ impl TypeAlloc {
 ///
 /// This currently exists to abstract over `TypeAlloc` and `SubtypeArena` which
 /// both need to perform remapping operations.
-pub(crate) trait Remap: Index<TypeId, Output = Type> {
+pub trait Remap
+where
+    Self: Index<ComponentTypeId, Output = ComponentType>,
+    Self: Index<ComponentDefinedTypeId, Output = ComponentDefinedType>,
+    Self: Index<ComponentInstanceTypeId, Output = ComponentInstanceType>,
+    Self: Index<ComponentFuncTypeId, Output = ComponentFuncType>,
+{
     /// Pushes a new anonymous type within this object, returning an identifier
     /// which can be used to refer to it.
-    fn push_ty(&mut self, ty: Type) -> TypeId;
+    fn push_ty<T>(&mut self, ty: T) -> T::Id
+    where
+        T: TypeData;
 
-    /// Applies a resource and type renaming map to the `id` specified,
-    /// returning `true` if the `id` was modified or `false` if it didn't need
-    /// changing.
-    ///
-    /// This will recursively modify the structure of the `id` specified and
-    /// update all references to resources found. The resource identifier keys
-    /// in the `map` specified will become the corresponding value, in addition
-    /// to any existing types in `map` becoming different tyeps.
-    ///
-    /// The `id` argument will be rewritten to a new identifier if `true` is
-    /// returned.
-    fn remap_type_id(&mut self, id: &mut TypeId, map: &mut Remapping) -> bool {
-        if let Some(new) = map.types.get(id) {
-            let changed = *new != *id;
-            *id = *new;
-            return changed;
+    /// Apply `map` to the keys of `tmp`, setting `*any_changed = true` if any
+    /// keys were remapped.
+    fn map_map(
+        tmp: &mut IndexMap<ResourceId, Vec<usize>>,
+        any_changed: &mut bool,
+        map: &Remapping,
+    ) {
+        for (id, path) in mem::take(tmp) {
+            let id = match map.resources.get(&id) {
+                Some(id) => {
+                    *any_changed = true;
+                    *id
+                }
+                None => id,
+            };
+            tmp.insert(id, path);
         }
+    }
 
-        // This function attempts what ends up probably being a relatively
-        // minor optimization where a new `id` isn't manufactured unless
-        // something about the type actually changed. That means that if the
-        // type doesn't actually use any resources, for example, then no new
-        // id is allocated.
-        let mut any_changed = false;
-
-        let map_map = |tmp: &mut IndexMap<ResourceId, Vec<usize>>,
-                       any_changed: &mut bool,
-                       map: &mut Remapping| {
-            for (id, path) in mem::take(tmp) {
-                let id = match map.resources.get(&id) {
-                    Some(id) => {
-                        *any_changed = true;
-                        *id
-                    }
-                    None => id,
-                };
-                tmp.insert(id, path);
-            }
-        };
-
-        let ty = match &self[*id] {
-            // Core wasm functions/modules/instances don't have resource types
-            // in them.
-            Type::Func(_) | Type::Array(_) | Type::Module(_) | Type::Instance(_) => return false,
-
-            Type::Component(i) => {
-                let mut tmp = i.clone();
-                for ty in tmp.imports.values_mut().chain(tmp.exports.values_mut()) {
-                    if self.remap_component_entity(ty, map) {
-                        any_changed = true;
-                    }
-                }
-                for (id, _) in tmp
-                    .imported_resources
-                    .iter_mut()
-                    .chain(&mut tmp.defined_resources)
-                {
-                    if let Some(new) = map.resources.get(id) {
-                        *id = *new;
-                        any_changed = true;
-                    }
-                }
-                map_map(&mut tmp.explicit_resources, &mut any_changed, map);
-                Type::Component(tmp)
-            }
-
-            Type::ComponentInstance(i) => {
-                let mut tmp = i.clone();
-                for ty in tmp.exports.values_mut() {
-                    if self.remap_component_entity(ty, map) {
-                        any_changed = true;
-                    }
-                }
-                for id in tmp.defined_resources.iter_mut() {
-                    if let Some(new) = map.resources.get(id) {
-                        *id = *new;
-                        any_changed = true;
-                    }
-                }
-                map_map(&mut tmp.explicit_resources, &mut any_changed, map);
-                Type::ComponentInstance(tmp)
-            }
-
-            Type::Resource(id) => {
-                let id = match map.resources.get(id).copied() {
-                    Some(id) => id,
-                    None => return false,
-                };
-                any_changed = true;
-                Type::Resource(id)
-            }
-
-            Type::ComponentFunc(i) => {
-                let mut tmp = i.clone();
-                for ty in tmp
-                    .params
-                    .iter_mut()
-                    .map(|(_, ty)| ty)
-                    .chain(tmp.results.iter_mut().map(|(_, ty)| ty))
-                {
-                    if self.remap_valtype(ty, map) {
-                        any_changed = true;
-                    }
-                }
-                Type::ComponentFunc(tmp)
-            }
-            Type::Defined(i) => {
-                let mut tmp = i.clone();
-                match &mut tmp {
-                    ComponentDefinedType::Primitive(_)
-                    | ComponentDefinedType::Flags(_)
-                    | ComponentDefinedType::Enum(_) => {}
-                    ComponentDefinedType::Record(r) => {
-                        for ty in r.fields.values_mut() {
-                            if self.remap_valtype(ty, map) {
-                                any_changed = true;
-                            }
-                        }
-                    }
-                    ComponentDefinedType::Tuple(r) => {
-                        for ty in r.types.iter_mut() {
-                            if self.remap_valtype(ty, map) {
-                                any_changed = true;
-                            }
-                        }
-                    }
-                    ComponentDefinedType::Union(r) => {
-                        for ty in r.types.iter_mut() {
-                            if self.remap_valtype(ty, map) {
-                                any_changed = true;
-                            }
-                        }
-                    }
-                    ComponentDefinedType::Variant(r) => {
-                        for ty in r.cases.values_mut() {
-                            if let Some(ty) = &mut ty.ty {
-                                if self.remap_valtype(ty, map) {
-                                    any_changed = true;
-                                }
-                            }
-                        }
-                    }
-                    ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
-                        if self.remap_valtype(ty, map) {
-                            any_changed = true;
-                        }
-                    }
-                    ComponentDefinedType::Result { ok, err } => {
-                        if let Some(ok) = ok {
-                            if self.remap_valtype(ok, map) {
-                                any_changed = true;
-                            }
-                        }
-                        if let Some(err) = err {
-                            if self.remap_valtype(err, map) {
-                                any_changed = true;
-                            }
-                        }
-                    }
-                    ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
-                        if self.remap_type_id(id, map) {
-                            any_changed = true;
-                        }
-                    }
-                }
-                Type::Defined(tmp)
-            }
-        };
-
+    /// If `any_changed` is true, push `ty`, update `map` to point `id` to the
+    /// new type ID, set `id` equal to the new type ID, and return `true`.
+    /// Otherwise, update `map` to point `id` to itself and return `false`.
+    fn insert_if_any_changed<T>(
+        &mut self,
+        map: &mut Remapping,
+        any_changed: bool,
+        id: &mut T::Id,
+        ty: T,
+    ) -> bool
+    where
+        T: TypeData,
+        T::Id: Into<ComponentAnyTypeId>,
+    {
         let new = if any_changed { self.push_ty(ty) } else { *id };
-        let prev = map.types.insert(*id, new);
-        assert!(prev.is_none());
+        map.types.insert((*id).into(), new.into());
         let changed = *id != new;
         *id = new;
         changed
+    }
+
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
+    fn remap_component_any_type_id(
+        &mut self,
+        id: &mut ComponentAnyTypeId,
+        map: &mut Remapping,
+    ) -> bool {
+        match id {
+            ComponentAnyTypeId::Resource(id) => self.remap_resource_id(id, map),
+            ComponentAnyTypeId::Defined(id) => self.remap_component_defined_type_id(id, map),
+            ComponentAnyTypeId::Func(id) => self.remap_component_func_type_id(id, map),
+            ComponentAnyTypeId::Instance(id) => self.remap_component_instance_type_id(id, map),
+            ComponentAnyTypeId::Component(id) => self.remap_component_type_id(id, map),
+        }
+    }
+
+    /// If `map` indicates `id` should be remapped, update it and return `true`.
+    /// Otherwise, do nothing and return `false`.
+    fn remap_resource_id(&mut self, id: &mut AliasableResourceId, map: &Remapping) -> bool {
+        if let Some(changed) = map.remap_id(id) {
+            return changed;
+        }
+
+        match map.resources.get(&id.resource()) {
+            None => false,
+            Some(new_id) => {
+                *id.resource_mut() = *new_id;
+                true
+            }
+        }
+    }
+
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
+    fn remap_component_type_id(&mut self, id: &mut ComponentTypeId, map: &mut Remapping) -> bool {
+        if let Some(changed) = map.remap_id(id) {
+            return changed;
+        }
+
+        let mut any_changed = false;
+        let mut ty = self[*id].clone();
+        for ty in ty.imports.values_mut().chain(ty.exports.values_mut()) {
+            any_changed |= self.remap_component_entity(ty, map);
+        }
+        for (id, _) in ty
+            .imported_resources
+            .iter_mut()
+            .chain(&mut ty.defined_resources)
+        {
+            if let Some(new) = map.resources.get(id) {
+                *id = *new;
+                any_changed = true;
+            }
+        }
+        Self::map_map(&mut ty.explicit_resources, &mut any_changed, map);
+        self.insert_if_any_changed(map, any_changed, id, ty)
+    }
+
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
+    fn remap_component_defined_type_id(
+        &mut self,
+        id: &mut ComponentDefinedTypeId,
+        map: &mut Remapping,
+    ) -> bool {
+        if let Some(changed) = map.remap_id(id) {
+            return changed;
+        }
+
+        let mut any_changed = false;
+        let mut tmp = self[*id].clone();
+        match &mut tmp {
+            ComponentDefinedType::Primitive(_)
+            | ComponentDefinedType::Flags(_)
+            | ComponentDefinedType::Enum(_) => {}
+            ComponentDefinedType::Record(r) => {
+                for ty in r.fields.values_mut() {
+                    any_changed |= self.remap_valtype(ty, map);
+                }
+            }
+            ComponentDefinedType::Tuple(r) => {
+                for ty in r.types.iter_mut() {
+                    any_changed |= self.remap_valtype(ty, map);
+                }
+            }
+            ComponentDefinedType::Variant(r) => {
+                for ty in r.cases.values_mut() {
+                    if let Some(ty) = &mut ty.ty {
+                        any_changed |= self.remap_valtype(ty, map);
+                    }
+                }
+            }
+            ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
+                any_changed |= self.remap_valtype(ty, map);
+            }
+            ComponentDefinedType::Result { ok, err } => {
+                if let Some(ok) = ok {
+                    any_changed |= self.remap_valtype(ok, map);
+                }
+                if let Some(err) = err {
+                    any_changed |= self.remap_valtype(err, map);
+                }
+            }
+            ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
+                any_changed |= self.remap_resource_id(id, map);
+            }
+        }
+        self.insert_if_any_changed(map, any_changed, id, tmp)
+    }
+
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
+    fn remap_component_instance_type_id(
+        &mut self,
+        id: &mut ComponentInstanceTypeId,
+        map: &mut Remapping,
+    ) -> bool {
+        if let Some(changed) = map.remap_id(id) {
+            return changed;
+        }
+
+        let mut any_changed = false;
+        let mut tmp = self[*id].clone();
+        for ty in tmp.exports.values_mut() {
+            any_changed |= self.remap_component_entity(ty, map);
+        }
+        for id in tmp.defined_resources.iter_mut() {
+            if let Some(new) = map.resources.get(id) {
+                *id = *new;
+                any_changed = true;
+            }
+        }
+        Self::map_map(&mut tmp.explicit_resources, &mut any_changed, map);
+        self.insert_if_any_changed(map, any_changed, id, tmp)
+    }
+
+    /// Recursively search for any resource types reachable from `id`, updating
+    /// it and `map` if any are found and remapped, returning `true` iff at last
+    /// one is remapped.
+    fn remap_component_func_type_id(
+        &mut self,
+        id: &mut ComponentFuncTypeId,
+        map: &mut Remapping,
+    ) -> bool {
+        if let Some(changed) = map.remap_id(id) {
+            return changed;
+        }
+
+        let mut any_changed = false;
+        let mut tmp = self[*id].clone();
+        for ty in tmp
+            .params
+            .iter_mut()
+            .map(|(_, ty)| ty)
+            .chain(tmp.results.iter_mut().map(|(_, ty)| ty))
+        {
+            any_changed |= self.remap_valtype(ty, map);
+        }
+        self.insert_if_any_changed(map, any_changed, id, tmp)
     }
 
     /// Same as `remap_type_id`, but works with `ComponentEntityType`.
@@ -2161,21 +3405,24 @@ pub(crate) trait Remap: Index<TypeId, Output = Type> {
         map: &mut Remapping,
     ) -> bool {
         match ty {
-            ComponentEntityType::Module(id)
-            | ComponentEntityType::Func(id)
-            | ComponentEntityType::Instance(id)
-            | ComponentEntityType::Component(id) => self.remap_type_id(id, map),
+            ComponentEntityType::Module(_) => {
+                // Can't reference resources.
+                false
+            }
+            ComponentEntityType::Func(id) => self.remap_component_func_type_id(id, map),
+            ComponentEntityType::Instance(id) => self.remap_component_instance_type_id(id, map),
+            ComponentEntityType::Component(id) => self.remap_component_type_id(id, map),
             ComponentEntityType::Type {
                 referenced,
                 created,
             } => {
-                let changed = self.remap_type_id(referenced, map);
+                let mut changed = self.remap_component_any_type_id(referenced, map);
                 if *referenced == *created {
                     *created = *referenced;
-                    changed
                 } else {
-                    self.remap_type_id(created, map) || changed
+                    changed |= self.remap_component_any_type_id(created, map);
                 }
+                changed
             }
             ComponentEntityType::Value(ty) => self.remap_valtype(ty, map),
         }
@@ -2185,34 +3432,69 @@ pub(crate) trait Remap: Index<TypeId, Output = Type> {
     fn remap_valtype(&mut self, ty: &mut ComponentValType, map: &mut Remapping) -> bool {
         match ty {
             ComponentValType::Primitive(_) => false,
-            ComponentValType::Type(id) => self.remap_type_id(id, map),
+            ComponentValType::Type(id) => self.remap_component_defined_type_id(id, map),
         }
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Remapping {
+/// Utility for mapping equivalent `ResourceId`s to each other and (when paired with the `Remap` trait)
+/// non-destructively edit type lists to reflect those mappings.
+#[derive(Debug, Default)]
+pub struct Remapping {
     /// A mapping from old resource ID to new resource ID.
     pub(crate) resources: HashMap<ResourceId, ResourceId>,
 
     /// A mapping filled in during the remapping process which records how a
     /// type was remapped, if applicable. This avoids remapping multiple
     /// references to the same type and instead only processing it once.
-    types: HashMap<TypeId, TypeId>,
+    types: HashMap<ComponentAnyTypeId, ComponentAnyTypeId>,
 }
 
 impl Remap for TypeAlloc {
-    fn push_ty(&mut self, ty: Type) -> TypeId {
-        <TypeAlloc>::push_ty(self, ty)
+    fn push_ty<T>(&mut self, ty: T) -> T::Id
+    where
+        T: TypeData,
+    {
+        <TypeList>::push(self, ty)
     }
 }
 
-impl Index<TypeId> for TypeAlloc {
-    type Output = Type;
+impl<T> Index<T> for TypeAlloc
+where
+    T: TypeIdentifier,
+{
+    type Output = T::Data;
 
     #[inline]
-    fn index(&self, id: TypeId) -> &Type {
+    fn index(&self, id: T) -> &T::Data {
         &self.list[id]
+    }
+}
+
+impl Remapping {
+    /// Add a mapping from the specified old resource ID to the new resource ID
+    pub fn add(&mut self, old: ResourceId, new: ResourceId) {
+        self.resources.insert(old, new);
+    }
+
+    /// Clear the type cache while leaving the resource mappings intact.
+    pub fn reset_type_cache(&mut self) {
+        self.types.clear()
+    }
+
+    fn remap_id<T>(&self, id: &mut T) -> Option<bool>
+    where
+        T: Copy + Into<ComponentAnyTypeId> + TryFrom<ComponentAnyTypeId>,
+        T::Error: std::fmt::Debug,
+    {
+        let old: ComponentAnyTypeId = (*id).into();
+        let new = self.types.get(&old)?;
+        if *new == old {
+            Some(false)
+        } else {
+            *id = T::try_from(*new).expect("should never remap across different kinds");
+            Some(true)
+        }
     }
 }
 
@@ -2234,12 +3516,19 @@ impl Index<TypeId> for TypeAlloc {
 /// Note that this subtyping context also explicitly supports being created
 /// from to different lists `a` and `b` originally, for testing subtyping
 /// between two different components for example.
-pub(crate) struct SubtypeCx<'a> {
-    pub(crate) a: SubtypeArena<'a>,
-    pub(crate) b: SubtypeArena<'a>,
+pub struct SubtypeCx<'a> {
+    /// Lookup arena for first type argument
+    pub a: SubtypeArena<'a>,
+    /// Lookup arena for second type argument
+    pub b: SubtypeArena<'a>,
 }
 
 impl<'a> SubtypeCx<'a> {
+    /// Create a new instance with the specified type lists
+    pub fn new_with_refs(a: TypesRef<'a>, b: TypesRef<'a>) -> SubtypeCx<'a> {
+        Self::new(a.list, b.list)
+    }
+
     pub(crate) fn new(a: &'a TypeList, b: &'a TypeList) -> SubtypeCx<'a> {
         SubtypeCx {
             a: SubtypeArena::new(a),
@@ -2247,7 +3536,8 @@ impl<'a> SubtypeCx<'a> {
         }
     }
 
-    fn swap(&mut self) {
+    /// Swap the type lists
+    pub fn swap(&mut self) {
         mem::swap(&mut self.a, &mut self.b);
     }
 
@@ -2256,12 +3546,12 @@ impl<'a> SubtypeCx<'a> {
     ///
     /// This enables `f` to modify the internal arenas while relying on all
     /// changes being discarded after the closure finishes.
-    fn mark<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        let a_len = self.a.list.len();
-        let b_len = self.b.list.len();
+    fn with_checkpoint<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let a = self.a.list.checkpoint();
+        let b = self.b.list.checkpoint();
         let result = f(self);
-        self.a.list.truncate(a_len);
-        self.b.list.truncate(b_len);
+        self.a.list.reset_to_checkpoint(a);
+        self.b.list.reset_to_checkpoint(b);
         result
     }
 
@@ -2277,244 +3567,315 @@ impl<'a> SubtypeCx<'a> {
         use ComponentEntityType::*;
 
         match (a, b) {
-            (Module(a), Module(b)) => {
-                // For module type subtyping, all exports in the other module
-                // type must be present in this module type's exports (i.e. it
-                // can export *more* than what this module type needs).
-                // However, for imports, the check is reversed (i.e. it is okay
-                // to import *less* than what this module type needs).
-                self.swap();
-                let a_imports = &self.b[*a].as_module_type().unwrap().imports;
-                let b_imports = &self.a[*b].as_module_type().unwrap().imports;
-                for (k, a) in a_imports {
-                    match b_imports.get(k) {
-                        Some(b) => self.entity_type(b, a, offset).with_context(|| {
-                            format!("type mismatch in import `{}::{}`", k.0, k.1)
-                        })?,
-                        None => bail!(offset, "missing expected import `{}::{}`", k.0, k.1),
-                    }
-                }
-                self.swap();
-                let a = self.a[*a].as_module_type().unwrap();
-                let b = self.b[*b].as_module_type().unwrap();
-                for (k, b) in b.exports.iter() {
-                    match a.exports.get(k) {
-                        Some(a) => self
-                            .entity_type(a, b, offset)
-                            .with_context(|| format!("type mismatch in export `{k}`"))?,
-                        None => bail!(offset, "missing expected export `{k}`"),
-                    }
-                }
-                Ok(())
-            }
+            (Module(a), Module(b)) => self.module_type(*a, *b, offset),
             (Module(_), b) => bail!(offset, "expected {}, found module", b.desc()),
 
-            (Func(a), Func(b)) => {
-                let a = self.a[*a].as_component_func_type().unwrap();
-                let b = self.b[*b].as_component_func_type().unwrap();
-
-                // Note that this intentionally diverges from the upstream
-                // specification in terms of subtyping. This is a full
-                // type-equality check which ensures that the structure of `a`
-                // exactly matches the structure of `b`. The rationale for this
-                // is:
-                //
-                // * Primarily in Wasmtime subtyping based on function types is
-                //   not implemented. This includes both subtyping a host
-                //   import and additionally handling subtyping as functions
-                //   cross component boundaries. The host import subtyping (or
-                //   component export subtyping) is not clear how to handle at
-                //   all at this time. The subtyping of functions between
-                //   components can more easily be handled by extending the
-                //   `fact` compiler, but that hasn't been done yet.
-                //
-                // * The upstream specification is currently pretty
-                //   intentionally vague precisely what subtyping is allowed.
-                //   Implementing a strict check here is intended to be a
-                //   conservative starting point for the component model which
-                //   can be extended in the future if necessary.
-                //
-                // * The interaction with subtyping on bindings generation, for
-                //   example, is a tricky problem that doesn't have a clear
-                //   answer at this time.  Effectively this is more rationale
-                //   for being conservative in the first pass of the component
-                //   model.
-                //
-                // So, in conclusion, the test here (and other places that
-                // reference this comment) is for exact type equality with no
-                // differences.
-                if a.params.len() != b.params.len() {
-                    bail!(
-                        offset,
-                        "expected {} parameters, found {}",
-                        b.params.len(),
-                        a.params.len(),
-                    );
-                }
-                if a.results.len() != b.results.len() {
-                    bail!(
-                        offset,
-                        "expected {} results, found {}",
-                        b.results.len(),
-                        a.results.len(),
-                    );
-                }
-                for ((an, a), (bn, b)) in a.params.iter().zip(b.params.iter()) {
-                    if an != bn {
-                        bail!(offset, "expected parameter named `{bn}`, found `{an}`");
-                    }
-                    self.component_val_type(a, b, offset)
-                        .with_context(|| format!("type mismatch in function parameter `{an}`"))?;
-                }
-                for ((an, a), (bn, b)) in a.results.iter().zip(b.results.iter()) {
-                    if an != bn {
-                        bail!(offset, "mismatched result names");
-                    }
-                    self.component_val_type(a, b, offset)
-                        .with_context(|| "type mismatch with result type")?;
-                }
-                Ok(())
-            }
+            (Func(a), Func(b)) => self.component_func_type(*a, *b, offset),
             (Func(_), b) => bail!(offset, "expected {}, found func", b.desc()),
 
             (Value(a), Value(b)) => self.component_val_type(a, b, offset),
             (Value(_), b) => bail!(offset, "expected {}, found value", b.desc()),
 
             (Type { referenced: a, .. }, Type { referenced: b, .. }) => {
-                use self::Type::*;
-                match (&self.a[*a], &self.b[*b]) {
-                    (Defined(a), Defined(b)) => self.component_defined_type(a, b, offset),
-                    (Defined(_), Resource(_)) => bail!(offset, "expected resource, found type"),
-                    (Resource(a), Resource(b)) => {
-                        if a == b {
-                            Ok(())
-                        } else {
-                            bail!(offset, "resource types are not the same")
-                        }
-                    }
-                    (Resource(_), Defined(_)) => bail!(offset, "expected type, found resource"),
-                    _ => unreachable!(),
-                }
+                self.component_any_type_id(*a, *b, offset)
             }
             (Type { .. }, b) => bail!(offset, "expected {}, found type", b.desc()),
 
-            (Instance(a_id), Instance(b_id)) => {
-                // For instance type subtyping, all exports in the other
-                // instance type must be present in this instance type's
-                // exports (i.e. it can export *more* than what this instance
-                // type needs).
-                let a = self.a[*a_id].as_component_instance_type().unwrap();
-                let b = self.b[*b_id].as_component_instance_type().unwrap();
-
-                let mut exports = Vec::with_capacity(b.exports.len());
-                for (k, b) in b.exports.iter() {
-                    match a.exports.get(k) {
-                        Some(a) => exports.push((*a, *b)),
-                        None => bail!(offset, "missing expected export `{k}`"),
-                    }
-                }
-                for (i, (a, b)) in exports.iter().enumerate() {
-                    let err = match self.component_entity_type(a, b, offset) {
-                        Ok(()) => continue,
-                        Err(e) => e,
-                    };
-                    // On failure attach the name of this export as context to
-                    // the error message to leave a breadcrumb trail.
-                    let (name, _) = self.b[*b_id]
-                        .as_component_instance_type()
-                        .unwrap()
-                        .exports
-                        .get_index(i)
-                        .unwrap();
-                    return Err(
-                        err.with_context(|| format!("type mismatch in instance export `{name}`"))
-                    );
-                }
-                Ok(())
-            }
+            (Instance(a), Instance(b)) => self.component_instance_type(*a, *b, offset),
             (Instance(_), b) => bail!(offset, "expected {}, found instance", b.desc()),
 
-            (Component(a), Component(b)) => {
-                // Components are ... tricky. They follow the same basic
-                // structure as core wasm modules, but they also have extra
-                // logic to handle resource types. Resources are effectively
-                // abstract types so this is sort of where an ML module system
-                // in the component model becomes a reality.
-                //
-                // This also leverages the `open_instance_type` method below
-                // heavily which internally has its own quite large suite of
-                // logic. More-or-less what's happening here is:
-                //
-                // 1. Pretend that the imports of B are given as values to the
-                //    imports of A. If A didn't import anything, for example,
-                //    that's great and the subtyping definitely passes there.
-                //    This operation produces a mapping of all the resources of
-                //    A's imports to resources in B's imports.
-                //
-                // 2. This mapping is applied to all of A's exports. This means
-                //    that all exports of A referring to A's imported resources
-                //    now instead refer to B's. Note, though that A's exports
-                //    still refer to its own defined resources.
-                //
-                // 3. The same `open_instance_type` method used during the
-                //    first step is used again, but this time on the exports
-                //    in the reverse direction. This performs a similar
-                //    operation, though, by creating a mapping from B's
-                //    defined resources to A's defined resources. The map
-                //    itself is discarded as it's not needed.
-                //
-                // The order that everything passed here is intentional, but
-                // also subtle. I personally think of it as
-                // `open_instance_type` takes a list of things to satisfy a
-                // signature and produces a mapping of resources in the
-                // signature to those provided in the list of things. The
-                // order of operations then goes:
-                //
-                // * Someone thinks they have a component of type B, but they
-                //   actually have a component of type A (e.g. due to this
-                //   subtype check passing).
-                // * This person provides the imports of B and that must be
-                //   sufficient to satisfy the imports of A. This is the first
-                //   `open_instance_type` check.
-                // * Now though the resources provided by B are substituted
-                //   into A's exports since that's what was provided.
-                // * A's exports are then handed back to the original person,
-                //   and these exports must satisfy the signature required by B
-                //   since that's what they're expecting.
-                // * This is the second `open_instance_type` which, to get
-                //   resource types to line up, will map from A's defined
-                //   resources to B's defined resources.
-                //
-                // If all that passes then the resources should all line up
-                // perfectly. Any misalignment is reported as a subtyping
-                // error.
-                let b_imports = self.b[*b]
-                    .as_component_type()
-                    .unwrap()
-                    .imports
-                    .iter()
-                    .map(|(name, ty)| (name.clone(), ty.clone()))
-                    .collect();
-                self.swap();
-                let mut import_mapping =
-                    self.open_instance_type(&b_imports, *a, ExternKind::Import, offset)?;
-                self.swap();
-                self.mark(|this| {
-                    let mut a_exports = this.a[*a]
-                        .as_component_type()
-                        .unwrap()
-                        .exports
-                        .iter()
-                        .map(|(name, ty)| (name.clone(), ty.clone()))
-                        .collect::<IndexMap<_, _>>();
-                    for ty in a_exports.values_mut() {
-                        this.a.remap_component_entity(ty, &mut import_mapping);
-                    }
-                    this.open_instance_type(&a_exports, *b, ExternKind::Export, offset)?;
-                    Ok(())
-                })
-            }
+            (Component(a), Component(b)) => self.component_type(*a, *b, offset),
             (Component(_), b) => bail!(offset, "expected {}, found component", b.desc()),
+        }
+    }
+
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
+    pub fn component_type(
+        &mut self,
+        a: ComponentTypeId,
+        b: ComponentTypeId,
+        offset: usize,
+    ) -> Result<()> {
+        // Components are ... tricky. They follow the same basic
+        // structure as core wasm modules, but they also have extra
+        // logic to handle resource types. Resources are effectively
+        // abstract types so this is sort of where an ML module system
+        // in the component model becomes a reality.
+        //
+        // This also leverages the `open_instance_type` method below
+        // heavily which internally has its own quite large suite of
+        // logic. More-or-less what's happening here is:
+        //
+        // 1. Pretend that the imports of B are given as values to the
+        //    imports of A. If A didn't import anything, for example,
+        //    that's great and the subtyping definitely passes there.
+        //    This operation produces a mapping of all the resources of
+        //    A's imports to resources in B's imports.
+        //
+        // 2. This mapping is applied to all of A's exports. This means
+        //    that all exports of A referring to A's imported resources
+        //    now instead refer to B's. Note, though that A's exports
+        //    still refer to its own defined resources.
+        //
+        // 3. The same `open_instance_type` method used during the
+        //    first step is used again, but this time on the exports
+        //    in the reverse direction. This performs a similar
+        //    operation, though, by creating a mapping from B's
+        //    defined resources to A's defined resources. The map
+        //    itself is discarded as it's not needed.
+        //
+        // The order that everything passed here is intentional, but
+        // also subtle. I personally think of it as
+        // `open_instance_type` takes a list of things to satisfy a
+        // signature and produces a mapping of resources in the
+        // signature to those provided in the list of things. The
+        // order of operations then goes:
+        //
+        // * Someone thinks they have a component of type B, but they
+        //   actually have a component of type A (e.g. due to this
+        //   subtype check passing).
+        // * This person provides the imports of B and that must be
+        //   sufficient to satisfy the imports of A. This is the first
+        //   `open_instance_type` check.
+        // * Now though the resources provided by B are substituted
+        //   into A's exports since that's what was provided.
+        // * A's exports are then handed back to the original person,
+        //   and these exports must satisfy the signature required by B
+        //   since that's what they're expecting.
+        // * This is the second `open_instance_type` which, to get
+        //   resource types to line up, will map from A's defined
+        //   resources to B's defined resources.
+        //
+        // If all that passes then the resources should all line up
+        // perfectly. Any misalignment is reported as a subtyping
+        // error.
+        let b_imports = self.b[b]
+            .imports
+            .iter()
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect();
+        self.swap();
+        let mut import_mapping =
+            self.open_instance_type(&b_imports, a, ExternKind::Import, offset)?;
+        self.swap();
+        self.with_checkpoint(|this| {
+            let mut a_exports = this.a[a]
+                .exports
+                .iter()
+                .map(|(name, ty)| (name.clone(), ty.clone()))
+                .collect::<IndexMap<_, _>>();
+            for ty in a_exports.values_mut() {
+                this.a.remap_component_entity(ty, &mut import_mapping);
+            }
+            this.open_instance_type(&a_exports, b, ExternKind::Export, offset)?;
+            Ok(())
+        })
+    }
+
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
+    pub fn component_instance_type(
+        &mut self,
+        a_id: ComponentInstanceTypeId,
+        b_id: ComponentInstanceTypeId,
+        offset: usize,
+    ) -> Result<()> {
+        // For instance type subtyping, all exports in the other
+        // instance type must be present in this instance type's
+        // exports (i.e. it can export *more* than what this instance
+        // type needs).
+        let a = &self.a[a_id];
+        let b = &self.b[b_id];
+
+        let mut exports = Vec::with_capacity(b.exports.len());
+        for (k, b) in b.exports.iter() {
+            match a.exports.get(k) {
+                Some(a) => exports.push((*a, *b)),
+                None => bail!(offset, "missing expected export `{k}`"),
+            }
+        }
+        for (i, (a, b)) in exports.iter().enumerate() {
+            let err = match self.component_entity_type(a, b, offset) {
+                Ok(()) => continue,
+                Err(e) => e,
+            };
+            // On failure attach the name of this export as context to
+            // the error message to leave a breadcrumb trail.
+            let (name, _) = self.b[b_id].exports.get_index(i).unwrap();
+            return Err(err.with_context(|| format!("type mismatch in instance export `{name}`")));
+        }
+        Ok(())
+    }
+
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
+    pub fn component_func_type(
+        &mut self,
+        a: ComponentFuncTypeId,
+        b: ComponentFuncTypeId,
+        offset: usize,
+    ) -> Result<()> {
+        let a = &self.a[a];
+        let b = &self.b[b];
+
+        // Note that this intentionally diverges from the upstream
+        // specification in terms of subtyping. This is a full
+        // type-equality check which ensures that the structure of `a`
+        // exactly matches the structure of `b`. The rationale for this
+        // is:
+        //
+        // * Primarily in Wasmtime subtyping based on function types is
+        //   not implemented. This includes both subtyping a host
+        //   import and additionally handling subtyping as functions
+        //   cross component boundaries. The host import subtyping (or
+        //   component export subtyping) is not clear how to handle at
+        //   all at this time. The subtyping of functions between
+        //   components can more easily be handled by extending the
+        //   `fact` compiler, but that hasn't been done yet.
+        //
+        // * The upstream specification is currently pretty
+        //   intentionally vague precisely what subtyping is allowed.
+        //   Implementing a strict check here is intended to be a
+        //   conservative starting point for the component model which
+        //   can be extended in the future if necessary.
+        //
+        // * The interaction with subtyping on bindings generation, for
+        //   example, is a tricky problem that doesn't have a clear
+        //   answer at this time.  Effectively this is more rationale
+        //   for being conservative in the first pass of the component
+        //   model.
+        //
+        // So, in conclusion, the test here (and other places that
+        // reference this comment) is for exact type equality with no
+        // differences.
+        if a.params.len() != b.params.len() {
+            bail!(
+                offset,
+                "expected {} parameters, found {}",
+                b.params.len(),
+                a.params.len(),
+            );
+        }
+        if a.results.len() != b.results.len() {
+            bail!(
+                offset,
+                "expected {} results, found {}",
+                b.results.len(),
+                a.results.len(),
+            );
+        }
+        for ((an, a), (bn, b)) in a.params.iter().zip(b.params.iter()) {
+            if an != bn {
+                bail!(offset, "expected parameter named `{bn}`, found `{an}`");
+            }
+            self.component_val_type(a, b, offset)
+                .with_context(|| format!("type mismatch in function parameter `{an}`"))?;
+        }
+        for ((an, a), (bn, b)) in a.results.iter().zip(b.results.iter()) {
+            if an != bn {
+                bail!(offset, "mismatched result names");
+            }
+            self.component_val_type(a, b, offset)
+                .with_context(|| "type mismatch with result type")?;
+        }
+        Ok(())
+    }
+
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
+    pub fn module_type(
+        &mut self,
+        a: ComponentCoreModuleTypeId,
+        b: ComponentCoreModuleTypeId,
+        offset: usize,
+    ) -> Result<()> {
+        // For module type subtyping, all exports in the other module
+        // type must be present in this module type's exports (i.e. it
+        // can export *more* than what this module type needs).
+        // However, for imports, the check is reversed (i.e. it is okay
+        // to import *less* than what this module type needs).
+        self.swap();
+        let a_imports = &self.b[a].imports;
+        let b_imports = &self.a[b].imports;
+        for (k, a) in a_imports {
+            match b_imports.get(k) {
+                Some(b) => self
+                    .entity_type(b, a, offset)
+                    .with_context(|| format!("type mismatch in import `{}::{}`", k.0, k.1))?,
+                None => bail!(offset, "missing expected import `{}::{}`", k.0, k.1),
+            }
+        }
+        self.swap();
+        let a = &self.a[a];
+        let b = &self.b[b];
+        for (k, b) in b.exports.iter() {
+            match a.exports.get(k) {
+                Some(a) => self
+                    .entity_type(a, b, offset)
+                    .with_context(|| format!("type mismatch in export `{k}`"))?,
+                None => bail!(offset, "missing expected export `{k}`"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Tests whether `a` is a subtype of `b`.
+    ///
+    /// Errors are reported at the `offset` specified.
+    pub fn component_any_type_id(
+        &mut self,
+        a: ComponentAnyTypeId,
+        b: ComponentAnyTypeId,
+        offset: usize,
+    ) -> Result<()> {
+        match (a, b) {
+            (ComponentAnyTypeId::Resource(a), ComponentAnyTypeId::Resource(b)) => {
+                if a.resource() == b.resource() {
+                    Ok(())
+                } else {
+                    bail!(
+                        offset,
+                        "resource types are not the same ({:?} vs. {:?})",
+                        a.resource(),
+                        b.resource()
+                    )
+                }
+            }
+            (ComponentAnyTypeId::Resource(_), b) => {
+                bail!(offset, "expected {}, found resource", b.desc())
+            }
+            (ComponentAnyTypeId::Defined(a), ComponentAnyTypeId::Defined(b)) => {
+                self.component_defined_type(a, b, offset)
+            }
+            (ComponentAnyTypeId::Defined(_), b) => {
+                bail!(offset, "expected {}, found defined type", b.desc())
+            }
+
+            (ComponentAnyTypeId::Func(a), ComponentAnyTypeId::Func(b)) => {
+                self.component_func_type(a, b, offset)
+            }
+            (ComponentAnyTypeId::Func(_), b) => {
+                bail!(offset, "expected {}, found func type", b.desc())
+            }
+
+            (ComponentAnyTypeId::Instance(a), ComponentAnyTypeId::Instance(b)) => {
+                self.component_instance_type(a, b, offset)
+            }
+            (ComponentAnyTypeId::Instance(_), b) => {
+                bail!(offset, "expected {}, found instance type", b.desc())
+            }
+
+            (ComponentAnyTypeId::Component(a), ComponentAnyTypeId::Component(b)) => {
+                self.component_type(a, b, offset)
+            }
+            (ComponentAnyTypeId::Component(_), b) => {
+                bail!(offset, "expected {}, found component type", b.desc())
+            }
         }
     }
 
@@ -2544,7 +3905,7 @@ impl<'a> SubtypeCx<'a> {
     pub fn open_instance_type(
         &mut self,
         a: &IndexMap<String, ComponentEntityType>,
-        b: TypeId,
+        b: ComponentTypeId,
         kind: ExternKind,
         offset: usize,
     ) -> Result<Remapping> {
@@ -2577,7 +3938,7 @@ impl<'a> SubtypeCx<'a> {
         // this loop and are deferred below to the main subtyping check. That
         // means that `mapping` won't necessarily have a mapping for all
         // imported resources into `component_type`, but that should be ok.
-        let component_type = self.b[b].as_component_type().unwrap();
+        let component_type = &self.b[b];
         let entities = match kind {
             ExternKind::Import => &component_type.imports,
             ExternKind::Export => &component_type.exports,
@@ -2602,19 +3963,10 @@ impl<'a> SubtypeCx<'a> {
                     ComponentEntityType::Instance(id) => id,
                     _ => unreachable!(),
                 };
-                let (name, next_ty) = self.b[id]
-                    .as_component_instance_type()
-                    .unwrap()
-                    .exports
-                    .get_index(i)
-                    .unwrap();
+                let (name, next_ty) = self.b[id].exports.get_index(i).unwrap();
                 ty = *next_ty;
                 arg = match arg {
-                    Some(ComponentEntityType::Instance(id)) => self.a[*id]
-                        .as_component_instance_type()
-                        .unwrap()
-                        .exports
-                        .get(name),
+                    Some(ComponentEntityType::Instance(id)) => self.a[*id].exports.get(name),
                     _ => continue 'outer,
                 };
             }
@@ -2623,8 +3975,8 @@ impl<'a> SubtypeCx<'a> {
             // indeed the expected resource.
             if cfg!(debug_assertions) {
                 let id = match ty {
-                    ComponentEntityType::Type { created, .. } => match &self.a[created] {
-                        Type::Resource(r) => *r,
+                    ComponentEntityType::Type { created, .. } => match created {
+                        ComponentAnyTypeId::Resource(id) => id.resource(),
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),
@@ -2636,8 +3988,8 @@ impl<'a> SubtypeCx<'a> {
             // it's skipped and this'll wind up generating an error later on in
             // subtype checking below.
             if let Some(ComponentEntityType::Type { created, .. }) = arg {
-                if let Type::Resource(r) = &self.b[*created] {
-                    mapping.resources.insert(*resource, *r);
+                if let ComponentAnyTypeId::Resource(r) = created {
+                    mapping.resources.insert(*resource, r.resource());
                 }
             }
         }
@@ -2660,9 +4012,9 @@ impl<'a> SubtypeCx<'a> {
                 None => bail!(offset, "missing {} named `{name}`", kind.desc()),
             }
         }
-        let mut type_map = HashMap::new();
+        let mut type_map = HashMap::default();
         for (i, (actual, expected)) in to_typecheck.into_iter().enumerate() {
-            let result = self.mark(|this| {
+            let result = self.with_checkpoint(|this| {
                 let mut expected = expected;
                 this.b.remap_component_entity(&mut expected, &mut mapping);
                 mapping.types.clear();
@@ -2675,20 +4027,7 @@ impl<'a> SubtypeCx<'a> {
                     // satisfied. This is then used afterwards when performing
                     // type substitution to remap all component-local types to
                     // those that were provided in the imports.
-                    match (expected, actual) {
-                        (
-                            ComponentEntityType::Type {
-                                created: expected, ..
-                            },
-                            ComponentEntityType::Type {
-                                created: actual, ..
-                            },
-                        ) => {
-                            let prev = type_map.insert(expected, actual);
-                            assert!(prev.is_none());
-                        }
-                        _ => {}
-                    }
+                    self.register_type_renamings(actual, expected, &mut type_map);
                     continue;
                 }
                 Err(e) => e,
@@ -2696,7 +4035,7 @@ impl<'a> SubtypeCx<'a> {
 
             // If an error happens then attach the name of the entity to the
             // error message using the `i` iteration counter.
-            let component_type = self.b[b].as_component_type().unwrap();
+            let component_type = &self.b[b];
             let entities = match kind {
                 ExternKind::Import => &component_type.imports,
                 ExternKind::Export => &component_type.exports,
@@ -2725,11 +4064,9 @@ impl<'a> SubtypeCx<'a> {
         }
 
         match (a, b) {
-            (EntityType::Func(a), EntityType::Func(b)) => self.func_type(
-                self.a[*a].as_func_type().unwrap(),
-                self.b[*b].as_func_type().unwrap(),
-                offset,
-            ),
+            (EntityType::Func(a), EntityType::Func(b)) => {
+                self.core_func_type(self.a[*a].unwrap_func(), self.b[*b].unwrap_func(), offset)
+            }
             (EntityType::Func(_), b) => bail!(offset, "expected {}, found func", b.desc()),
             (EntityType::Table(a), EntityType::Table(b)) => {
                 if a.element_type != b.element_type {
@@ -2777,16 +4114,14 @@ impl<'a> SubtypeCx<'a> {
                 }
             }
             (EntityType::Global(_), b) => bail!(offset, "expected {}, found global", b.desc()),
-            (EntityType::Tag(a), EntityType::Tag(b)) => self.func_type(
-                self.a[*a].as_func_type().unwrap(),
-                self.b[*b].as_func_type().unwrap(),
-                offset,
-            ),
+            (EntityType::Tag(a), EntityType::Tag(b)) => {
+                self.core_func_type(self.a[*a].unwrap_func(), self.b[*b].unwrap_func(), offset)
+            }
             (EntityType::Tag(_), b) => bail!(offset, "expected {}, found tag", b.desc()),
         }
     }
 
-    fn func_type(&self, a: &IndexedFuncType, b: &IndexedFuncType, offset: usize) -> Result<()> {
+    fn core_func_type(&self, a: &IndexedFuncType, b: &IndexedFuncType, offset: usize) -> Result<()> {
         if a == b {
             Ok(())
         } else {
@@ -2810,30 +4145,24 @@ impl<'a> SubtypeCx<'a> {
             (ComponentValType::Primitive(a), ComponentValType::Primitive(b)) => {
                 self.primitive_val_type(*a, *b, offset)
             }
-            (ComponentValType::Type(a), ComponentValType::Type(b)) => self.component_defined_type(
-                self.a[*a].as_defined_type().unwrap(),
-                self.b[*b].as_defined_type().unwrap(),
-                offset,
-            ),
-            (ComponentValType::Primitive(a), ComponentValType::Type(b)) => {
-                match self.b[*b].as_defined_type().unwrap() {
-                    ComponentDefinedType::Primitive(b) => self.primitive_val_type(*a, *b, offset),
-                    b => bail!(offset, "expected {}, found {a}", b.desc()),
-                }
+            (ComponentValType::Type(a), ComponentValType::Type(b)) => {
+                self.component_defined_type(*a, *b, offset)
             }
-            (ComponentValType::Type(a), ComponentValType::Primitive(b)) => {
-                match self.a[*a].as_defined_type().unwrap() {
-                    ComponentDefinedType::Primitive(a) => self.primitive_val_type(*a, *b, offset),
-                    a => bail!(offset, "expected {b}, found {}", a.desc()),
-                }
-            }
+            (ComponentValType::Primitive(a), ComponentValType::Type(b)) => match &self.b[*b] {
+                ComponentDefinedType::Primitive(b) => self.primitive_val_type(*a, *b, offset),
+                b => bail!(offset, "expected {}, found {a}", b.desc()),
+            },
+            (ComponentValType::Type(a), ComponentValType::Primitive(b)) => match &self.a[*a] {
+                ComponentDefinedType::Primitive(a) => self.primitive_val_type(*a, *b, offset),
+                a => bail!(offset, "expected {b}, found {}", a.desc()),
+            },
         }
     }
 
     fn component_defined_type(
         &self,
-        a: &ComponentDefinedType,
-        b: &ComponentDefinedType,
+        a: ComponentDefinedTypeId,
+        b: ComponentDefinedTypeId,
         offset: usize,
     ) -> Result<()> {
         use ComponentDefinedType::*;
@@ -2841,7 +4170,7 @@ impl<'a> SubtypeCx<'a> {
         // Note that the implementation of subtyping here diverges from the
         // upstream specification intentionally, see the documentation on
         // function subtyping for more information.
-        match (a, b) {
+        match (&self.a[a], &self.b[b]) {
             (Primitive(a), Primitive(b)) => self.primitive_val_type(*a, *b, offset),
             (Primitive(a), b) => bail!(offset, "expected {}, found {a}", b.desc()),
             (Record(a), Record(b)) => {
@@ -2910,22 +4239,6 @@ impl<'a> SubtypeCx<'a> {
                 Ok(())
             }
             (Tuple(_), b) => bail!(offset, "expected {}, found tuple", b.desc()),
-            (Union(a), Union(b)) => {
-                if a.types.len() != b.types.len() {
-                    bail!(
-                        offset,
-                        "expected {} types, found {}",
-                        b.types.len(),
-                        a.types.len(),
-                    );
-                }
-                for (i, (a, b)) in a.types.iter().zip(b.types.iter()).enumerate() {
-                    self.component_val_type(a, b, offset)
-                        .with_context(|| format!("type mismatch in tuple field {i}"))?;
-                }
-                Ok(())
-            }
-            (Union(_), b) => bail!(offset, "expected {}, found union", b.desc()),
             (at @ Flags(a), Flags(b)) | (at @ Enum(a), Enum(b)) => {
                 let desc = match at {
                     Flags(_) => "flags",
@@ -2960,9 +4273,7 @@ impl<'a> SubtypeCx<'a> {
             }
             (Result { .. }, b) => bail!(offset, "expected {}, found result", b.desc()),
             (Own(a), Own(b)) | (Borrow(a), Borrow(b)) => {
-                let a = self.a[*a].as_resource().unwrap();
-                let b = self.b[*b].as_resource().unwrap();
-                if a == b {
+                if a.resource() == b.resource() {
                     Ok(())
                 } else {
                     bail!(offset, "resource types are not the same")
@@ -2991,6 +4302,35 @@ impl<'a> SubtypeCx<'a> {
             bail!(offset, "expected primitive `{b}` found primitive `{a}`")
         }
     }
+
+    fn register_type_renamings(
+        &self,
+        actual: ComponentEntityType,
+        expected: ComponentEntityType,
+        type_map: &mut HashMap<ComponentAnyTypeId, ComponentAnyTypeId>,
+    ) {
+        match (expected, actual) {
+            (
+                ComponentEntityType::Type {
+                    created: expected, ..
+                },
+                ComponentEntityType::Type {
+                    created: actual, ..
+                },
+            ) => {
+                let prev = type_map.insert(expected, actual);
+                assert!(prev.is_none());
+            }
+            (ComponentEntityType::Instance(expected), ComponentEntityType::Instance(actual)) => {
+                let actual = &self.a[actual];
+                for (name, expected) in self.b[expected].exports.iter() {
+                    let actual = actual.exports[name];
+                    self.register_type_renamings(actual, *expected, type_map);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A helper typed used purely during subtyping as part of `SubtypeCx`.
@@ -3002,42 +4342,48 @@ impl<'a> SubtypeCx<'a> {
 /// This is intended to have arena-like behavior where everything pushed onto
 /// `self.list` is thrown away after a subtyping computation is performed. All
 /// new types pushed into this arena are purely temporary.
-pub(crate) struct SubtypeArena<'a> {
+pub struct SubtypeArena<'a> {
     types: &'a TypeList,
-    list: Vec<Type>,
+    list: TypeList,
 }
 
 impl<'a> SubtypeArena<'a> {
     fn new(types: &'a TypeList) -> SubtypeArena<'a> {
         SubtypeArena {
             types,
-            list: Vec::new(),
+            list: TypeList::default(),
         }
     }
 }
 
-impl Index<TypeId> for SubtypeArena<'_> {
-    type Output = Type;
+impl<T> Index<T> for SubtypeArena<'_>
+where
+    T: TypeIdentifier,
+{
+    type Output = T::Data;
 
-    fn index(&self, id: TypeId) -> &Type {
-        if id.index < self.types.len() {
+    fn index(&self, id: T) -> &T::Data {
+        let index = id.index();
+        if index < T::list(self.types).len() {
             &self.types[id]
         } else {
-            &self.list[id.index - self.types.len()]
+            let temp_index = index - T::list(self.types).len();
+            let temp_index = u32::try_from(temp_index).unwrap();
+            let temp_id = T::from_index(temp_index);
+            &self.list[temp_id]
         }
     }
 }
 
 impl Remap for SubtypeArena<'_> {
-    fn push_ty(&mut self, ty: Type) -> TypeId {
-        let index = self.list.len() + self.types.len();
-        let type_size = ty.type_size();
+    fn push_ty<T>(&mut self, ty: T) -> T::Id
+    where
+        T: TypeData,
+    {
+        let index = T::Id::list(&self.list).len() + T::Id::list(self.types).len();
+        let index = u32::try_from(index).unwrap();
         self.list.push(ty);
-        TypeId {
-            index,
-            type_size,
-            unique_id: 0,
-        }
+        T::Id::from_index(index)
     }
 }
 

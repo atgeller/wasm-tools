@@ -1,14 +1,18 @@
 //! The WebAssembly component tool command line interface.
 
-use anyhow::{bail, Context, Result};
-use clap::Parser;
-use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use wasm_encoder::{Encode, Section};
+
+use anyhow::{bail, Context, Result};
+use clap::Parser;
+
 use wasm_tools::Output;
-use wit_component::{ComponentEncoder, DecodedWasm, StringEncoding, WitPrinter};
-use wit_parser::{PackageId, Resolve, UnresolvedPackage};
+use wit_component::{
+    embed_component_metadata, is_wasm_binary_or_wat, parse_wit_from_path, ComponentEncoder,
+    DecodedWasm, Linker, StringEncoding, WitPrinter,
+};
+use wit_parser::{Resolve, UnresolvedPackage};
 
 /// WebAssembly wit-based component tooling.
 #[derive(Parser)]
@@ -16,6 +20,8 @@ pub enum Opts {
     New(NewOpts),
     Wit(WitOpts),
     Embed(EmbedOpts),
+    Targets(TargetsOpts),
+    Link(LinkOpts),
 }
 
 impl Opts {
@@ -24,6 +30,8 @@ impl Opts {
             Opts::New(new) => new.run(),
             Opts::Wit(wit) => wit.run(),
             Opts::Embed(embed) => embed.run(),
+            Opts::Targets(targets) => targets.run(),
+            Opts::Link(link) => link.run(),
         }
     }
 
@@ -32,6 +40,8 @@ impl Opts {
             Opts::New(new) => new.general_opts(),
             Opts::Wit(wit) => wit.general_opts(),
             Opts::Embed(embed) => embed.general_opts(),
+            Opts::Targets(targets) => targets.general_opts(),
+            Opts::Link(link) => link.general_opts(),
         }
     }
 }
@@ -43,10 +53,14 @@ fn parse_optionally_name_file(s: &str) -> (&str, &str) {
         Some(path) => (name_or_path, path),
         None => {
             let name = Path::new(name_or_path)
-                .file_stem()
+                .file_name()
                 .unwrap()
                 .to_str()
                 .unwrap();
+            let name = match name.find('.') {
+                Some(i) => &name[..i],
+                None => name,
+            };
             (name, name_or_path)
         }
     }
@@ -96,6 +110,10 @@ pub struct NewOpts {
     /// Print the output in the WebAssembly text format instead of binary.
     #[clap(long, short = 't')]
     wat: bool,
+
+    /// Use memory.grow to realloc memory and stack allocation.
+    #[clap(long)]
+    realloc_via_memory_grow: bool,
 }
 
 impl NewOpts {
@@ -113,6 +131,8 @@ impl NewOpts {
         for (name, wasm) in self.adapters.iter() {
             encoder = encoder.adapter(name, wasm)?;
         }
+
+        encoder = encoder.realloc_via_memory_grow(self.realloc_via_memory_grow);
 
         let bytes = encoder
             .encode()
@@ -181,6 +201,10 @@ pub struct EmbedOpts {
     /// like to work with an interface in the component model.
     #[clap(long)]
     dummy: bool,
+
+    /// Print the output in the WebAssembly text format instead of binary.
+    #[clap(long, short = 't')]
+    wat: bool,
 }
 
 impl EmbedOpts {
@@ -195,27 +219,146 @@ impl EmbedOpts {
         } else {
             Some(self.io.parse_input_wasm()?)
         };
-        let (resolve, id) = parse_wit(&self.wit)?;
+        let (resolve, id) = parse_wit_from_path(self.wit)?;
         let world = resolve.select_world(id, self.world.as_deref())?;
 
-        let encoded = wit_component::metadata::encode(
+        let mut wasm = wasm.unwrap_or_else(|| wit_component::dummy_module(&resolve, world));
+
+        embed_component_metadata(
+            &mut wasm,
             &resolve,
             world,
             self.encoding.unwrap_or(StringEncoding::UTF8),
-            None,
         )?;
-
-        let section = wasm_encoder::CustomSection {
-            name: "component-type".into(),
-            data: Cow::Borrowed(&encoded),
-        };
-        let mut wasm = wasm.unwrap_or_else(|| wit_component::dummy_module(&resolve, world));
-        wasm.push(section.id());
-        section.encode(&mut wasm);
 
         self.io.output(Output::Wasm {
             bytes: &wasm,
-            wat: false,
+            wat: self.wat,
+        })?;
+
+        Ok(())
+    }
+}
+
+fn parse_optionally_name_library(s: &str) -> (&str, &str) {
+    let mut parts = s.splitn(2, '=');
+    let name_or_path = parts.next().unwrap();
+    match parts.next() {
+        Some(path) => (name_or_path, path),
+        None => {
+            let name = Path::new(name_or_path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            (name, name_or_path)
+        }
+    }
+}
+
+fn parse_library(s: &str) -> Result<(String, Vec<u8>)> {
+    let (name, path) = parse_optionally_name_library(s);
+    let wasm = wat::parse_file(path)?;
+    Ok((name.to_string(), wasm))
+}
+
+/// Link one or more dynamic library modules, producing a component
+///
+/// This is similar to the `new` subcommand, except that it accepts an arbitrary number of input modules rather
+/// than a single "main" module.  Those modules are expected to conform to the [dynamic linking
+/// convention](https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md).
+///
+/// The resulting component's type will be the union of the types found in any `component-type*` custom sections in
+/// the input modules.
+///
+/// Note that the order in which input libraries are listed determines priority in cases where more than one
+/// library exports the same symbol.
+///
+/// See
+/// https://github.com/WebAssembly/component-model/blob/main/design/mvp/examples/SharedEverythingDynamicLinking.md
+/// for further details.
+#[derive(Parser)]
+pub struct LinkOpts {
+    /// Input libraries to link
+    #[clap(value_name = "[NAME=]MODULE", value_parser = parse_library)]
+    inputs: Vec<(String, Vec<u8>)>,
+
+    /// Input library to link and make available for dynamic resolution via `dlopen` (may be repeated)
+    #[clap(long, value_name = "[NAME=]MODULE", value_parser = parse_library)]
+    dl_openable: Vec<(String, Vec<u8>)>,
+
+    /// The path to an adapter module to satisfy imports not otherwise bound to
+    /// WIT interfaces.
+    ///
+    /// An adapter module can be used to translate the `wasi_snapshot_preview1`
+    /// ABI, for example, to one that uses the component model. The first
+    /// `[NAME=]` specified in the argument is inferred from the name of file
+    /// specified by `MODULE` if not present and is the name of the import
+    /// module that's being implemented (e.g. `wasi_snapshot_preview1.wasm`.
+    ///
+    /// The second part of this argument, optionally specified, is the interface
+    /// that this adapter module imports. If not specified then the interface
+    /// imported is inferred from the adapter module itself.
+    #[clap(long = "adapt", value_name = "[NAME=]MODULE", value_parser = parse_adapter)]
+    adapters: Vec<(String, Vec<u8>)>,
+
+    /// Size of stack (in bytes) to allocate in the synthesized main module
+    #[clap(long)]
+    stack_size: Option<u32>,
+
+    #[clap(flatten)]
+    output: wasm_tools::OutputArg,
+
+    #[clap(flatten)]
+    general: wasm_tools::GeneralOpts,
+
+    /// Skip validation of the output component.
+    #[clap(long)]
+    skip_validation: bool,
+
+    /// Print the output in the WebAssembly text format instead of binary.
+    #[clap(long, short = 't')]
+    wat: bool,
+
+    /// Generate trapping stubs for any missing functions
+    #[clap(long)]
+    stub_missing_functions: bool,
+}
+
+impl LinkOpts {
+    fn general_opts(&self) -> &wasm_tools::GeneralOpts {
+        &self.general
+    }
+
+    /// Executes the application.
+    fn run(self) -> Result<()> {
+        let mut linker = Linker::default()
+            .validate(!self.skip_validation)
+            .stub_missing_functions(self.stub_missing_functions);
+
+        if let Some(stack_size) = self.stack_size {
+            linker = linker.stack_size(stack_size);
+        }
+
+        for (name, wasm) in &self.inputs {
+            linker = linker.library(name, wasm, false)?;
+        }
+
+        for (name, wasm) in &self.dl_openable {
+            linker = linker.library(name, wasm, true)?;
+        }
+
+        for (name, wasm) in &self.adapters {
+            linker = linker.adapter(name, wasm)?;
+        }
+
+        let bytes = linker
+            .encode()
+            .context("failed to encode a component from modules")?;
+
+        self.output.output(Output::Wasm {
+            bytes: &bytes,
+            wat: self.wat,
         })?;
 
         Ok(())
@@ -250,18 +393,45 @@ pub struct WitOpts {
     output: wasm_tools::OutputArg,
 
     /// Emit a WebAssembly binary representation instead of the WIT text format.
-    #[clap(short, long, conflicts_with = "wat")]
+    #[clap(short, long, conflicts_with = "wat", conflicts_with = "out_dir")]
     wasm: bool,
 
     /// Emit a WebAssembly textual representation instead of the WIT text
     /// format.
-    #[clap(short = 't', long, conflicts_with = "wasm")]
+    #[clap(short = 't', long, conflicts_with = "wasm", conflicts_with = "out_dir")]
     wat: bool,
+
+    /// Do not include doc comments when emitting WIT text.
+    #[clap(long)]
+    no_docs: bool,
+
+    /// Emit the entire WIT resolution graph instead of just the "top level"
+    /// package to the output directory specified.
+    ///
+    /// The output directory will contain textual WIT files which represent all
+    /// packages known from the input.
+    #[clap(
+        long,
+        conflicts_with = "wasm",
+        conflicts_with = "wat",
+        conflicts_with = "output"
+    )]
+    out_dir: Option<PathBuf>,
 
     /// Skips the validation performed when using the `--wasm` and `--wat`
     /// options.
     #[clap(long)]
     skip_validation: bool,
+
+    /// Emit the WIT document as JSON instead of text.
+    #[clap(
+        short,
+        long,
+        conflicts_with = "wasm",
+        conflicts_with = "out_dir",
+        conflicts_with = "wat"
+    )]
+    json: bool,
 }
 
 impl WitOpts {
@@ -292,7 +462,7 @@ impl WitOpts {
                     decode_wasm(&bytes).context("failed to decode WIT document")?
                 }
                 _ => {
-                    let (resolve, id) = parse_wit(input)?;
+                    let (resolve, id) = parse_wit_from_path(input)?;
                     DecodedWasm::WitPackage(resolve, id)
                 }
             },
@@ -302,7 +472,7 @@ impl WitOpts {
                     .read_to_end(&mut stdin)
                     .context("failed to read <stdin>")?;
 
-                if is_wasm(&stdin) {
+                if is_wasm_binary_or_wat(&stdin) {
                     let bytes = wat::parse_bytes(&stdin).map_err(|mut e| {
                         e.set_path("<stdin>");
                         e
@@ -324,6 +494,10 @@ impl WitOpts {
 
         // Now that the WIT document has been decoded, it's time to emit it.
         // This interprets all of the output options and performs such a task.
+        if self.json {
+            self.emit_json(&decoded)?;
+            return Ok(());
+        }
         if self.wasm || self.wat {
             self.emit_wasm(&decoded)?;
         } else {
@@ -334,8 +508,9 @@ impl WitOpts {
 
     fn emit_wasm(&self, decoded: &DecodedWasm) -> Result<()> {
         assert!(self.wasm || self.wat);
+        assert!(self.out_dir.is_none());
 
-        let bytes = wit_component::encode(decoded.resolve(), decoded.package())?;
+        let bytes = wit_component::encode(None, decoded.resolve(), decoded.package())?;
         if !self.skip_validation {
             wasmparser::Validator::new_with_features(wasmparser::WasmFeatures {
                 component_model: true,
@@ -352,72 +527,112 @@ impl WitOpts {
 
     fn emit_wit(&self, decoded: &DecodedWasm) -> Result<()> {
         assert!(!self.wasm && !self.wat);
-        if self.wat {
-            bail!("the `--wat` option can only be combined with `--wasm`");
+
+        let resolve = decoded.resolve();
+        let main = decoded.package();
+
+        let mut printer = WitPrinter::default();
+        printer.emit_docs(!self.no_docs);
+
+        match &self.out_dir {
+            Some(dir) => {
+                assert!(self.output.output_path().is_none());
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("failed to create directory: {dir:?}"))?;
+
+                // Classify all packages by name to determine how to name their
+                // output directories.
+                let mut names = HashMap::new();
+                for (_id, pkg) in resolve.packages.iter() {
+                    let cnt = names
+                        .entry(&pkg.name.name)
+                        .or_insert(HashMap::new())
+                        .entry(&pkg.name.namespace)
+                        .or_insert(0);
+                    *cnt += 1;
+                }
+
+                for (id, pkg) in resolve.packages.iter() {
+                    let output = printer.print(resolve, id)?;
+                    let out_dir = if id == main {
+                        dir.clone()
+                    } else {
+                        let dir = dir.join("deps");
+                        let packages_with_same_name = &names[&pkg.name.name];
+                        if packages_with_same_name.len() == 1 {
+                            dir.join(&pkg.name.name)
+                        } else {
+                            let packages_with_same_namespace =
+                                packages_with_same_name[&pkg.name.namespace];
+                            if packages_with_same_namespace == 1 {
+                                dir.join(format!("{}:{}", pkg.name.namespace, pkg.name.name))
+                            } else {
+                                dir.join(pkg.name.to_string())
+                            }
+                        }
+                    };
+                    std::fs::create_dir_all(&out_dir)
+                        .with_context(|| format!("failed to create directory: {out_dir:?}"))?;
+                    let path = out_dir.join("main.wit");
+                    std::fs::write(&path, &output)
+                        .with_context(|| format!("failed to write file: {path:?}"))?;
+                    println!("Writing: {}", path.display());
+                }
+            }
+            None => {
+                let output = printer.print(resolve, main)?;
+                self.output.output(Output::Wat(&output))?;
+            }
         }
 
-        let output = WitPrinter::default().print(decoded.resolve(), decoded.package())?;
-        self.output.output(Output::Wat(&output))?;
+        Ok(())
+    }
+
+    fn emit_json(&self, decoded: &DecodedWasm) -> Result<()> {
+        assert!(!self.wasm && !self.wat);
+
+        let resolve = decoded.resolve();
+        let output = serde_json::to_string_pretty(&resolve)?;
+        self.output.output(Output::Json(&output))?;
+
         Ok(())
     }
 }
 
-fn parse_wit(path: &Path) -> Result<(Resolve, PackageId)> {
-    let mut resolve = Resolve::default();
-    let id = if path.is_dir() {
-        resolve.push_dir(&path)?.0
-    } else {
-        let contents =
-            std::fs::read(&path).with_context(|| format!("failed to read file {path:?}"))?;
-        if is_wasm(&contents) {
-            let bytes = wat::parse_bytes(&contents).map_err(|mut e| {
-                e.set_path(path);
-                e
-            })?;
-            match wit_component::decode(&bytes)? {
-                DecodedWasm::Component(..) => {
-                    bail!("specified path is a component, not a wit package")
-                }
-                DecodedWasm::WitPackage(resolve, pkg) => return Ok((resolve, pkg)),
-            }
-        } else {
-            let text = match std::str::from_utf8(&contents) {
-                Ok(s) => s,
-                Err(_) => bail!("input file is not valid utf-8"),
-            };
-            let pkg = UnresolvedPackage::parse(&path, text)?;
-            resolve.push(pkg)?
-        }
-    };
-    Ok((resolve, id))
+/// Tool for verifying whether a component conforms to a world.
+#[derive(Parser)]
+pub struct TargetsOpts {
+    #[clap(flatten)]
+    general: wasm_tools::GeneralOpts,
+
+    /// The WIT package containing the `world` used to test a component for conformance.
+    ///
+    /// This can either be a directory or a path to a single `*.wit` file.
+    wit: PathBuf,
+
+    /// The world used to test whether a component conforms to its signature.
+    #[clap(short, long)]
+    world: Option<String>,
+
+    #[clap(flatten)]
+    input: wasm_tools::InputArg,
 }
 
-/// Test to see if a string is probably a `*.wat` text syntax.
-///
-/// This briefly lexes past whitespace and comments as a `*.wat` file to see if
-/// we can find a left-paren. If that fails then it's probably `*.wit` instead.
-fn is_wasm(bytes: &[u8]) -> bool {
-    use wast::lexer::{Lexer, Token};
-
-    if bytes.starts_with(b"\0asm") {
-        return true;
-    }
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return true,
-    };
-
-    let mut lexer = Lexer::new(text);
-
-    while let Some(next) = lexer.next() {
-        match next {
-            Ok(Token::Whitespace(_)) | Ok(Token::BlockComment(_)) | Ok(Token::LineComment(_)) => {}
-            Ok(Token::LParen(_)) => return true,
-            _ => break,
-        }
+impl TargetsOpts {
+    fn general_opts(&self) -> &wasm_tools::GeneralOpts {
+        &self.general
     }
 
-    false
+    /// Executes the application.
+    fn run(self) -> Result<()> {
+        let (resolve, package_id) = parse_wit_from_path(&self.wit)?;
+        let world = resolve.select_world(package_id, self.world.as_deref())?;
+        let component_to_test = self.input.parse_wasm()?;
+
+        wit_component::targets(&resolve, world, &component_to_test)?;
+
+        Ok(())
+    }
 }
 
 fn decode_wasm(bytes: &[u8]) -> Result<DecodedWasm> {

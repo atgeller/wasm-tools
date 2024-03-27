@@ -1,8 +1,8 @@
-package foo:foo
+package foo:foo;
 
 interface foo {}
 
 world bar {
-  export foo
-  export foo
+  export foo;
+  export foo;
 }

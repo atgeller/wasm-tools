@@ -1,8 +1,8 @@
 // parse-fail
 
-package foo:foo
+package foo:foo;
 
 interface foo {
-  foo: func()
-  foo: func()
+  foo: func();
+  foo: func();
 }

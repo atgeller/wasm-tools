@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::fs::File;
+use std::io::IsTerminal;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use termcolor::{Ansi, ColorChoice, NoColor, StandardStream, WriteColor};
@@ -41,12 +42,8 @@ impl GeneralOpts {
 // and then the methods are used to read the arguments,
 #[derive(clap::Parser)]
 pub struct InputOutput {
-    /// Input file to process.
-    ///
-    /// If not provided or if this is `-` then stdin is read entirely and
-    /// processed. Note that for most subcommands this input can either be a
-    /// binary `*.wasm` file or a textual format `*.wat` file.
-    input: Option<PathBuf>,
+    #[clap(flatten)]
+    input: InputArg,
 
     #[clap(flatten)]
     output: OutputArg,
@@ -56,21 +53,17 @@ pub struct InputOutput {
 }
 
 #[derive(clap::Parser)]
-pub struct OutputArg {
-    /// Where to place output.
+pub struct InputArg {
+    /// Input file to process.
     ///
-    /// If not provided then stdout is used.
-    #[clap(short, long)]
-    output: Option<PathBuf>,
+    /// If not provided or if this is `-` then stdin is read entirely and
+    /// processed. Note that for most subcommands this input can either be a
+    /// binary `*.wasm` file or a textual format `*.wat` file.
+    input: Option<PathBuf>,
 }
 
-pub enum Output<'a> {
-    Wat(&'a str),
-    Wasm { bytes: &'a [u8], wat: bool },
-}
-
-impl InputOutput {
-    pub fn parse_input_wasm(&self) -> Result<Vec<u8>> {
+impl InputArg {
+    pub fn parse_wasm(&self) -> Result<Vec<u8>> {
         if let Some(path) = &self.input {
             if path != Path::new("-") {
                 let bytes = wat::parse_file(path)?;
@@ -87,6 +80,27 @@ impl InputOutput {
         })?;
         Ok(bytes.into_owned())
     }
+}
+
+#[derive(clap::Parser)]
+pub struct OutputArg {
+    /// Where to place output.
+    ///
+    /// If not provided then stdout is used.
+    #[clap(short, long)]
+    output: Option<PathBuf>,
+}
+
+pub enum Output<'a> {
+    Wat(&'a str),
+    Wasm { bytes: &'a [u8], wat: bool },
+    Json(&'a str),
+}
+
+impl InputOutput {
+    pub fn parse_input_wasm(&self) -> Result<Vec<u8>> {
+        self.input.parse_wasm()
+    }
 
     pub fn output(&self, bytes: Output<'_>) -> Result<()> {
         self.output.output(bytes)
@@ -101,7 +115,7 @@ impl InputOutput {
     }
 
     pub fn input_path(&self) -> Option<&Path> {
-        self.input.as_deref()
+        self.input.input.as_deref()
     }
 
     pub fn general_opts(&self) -> &GeneralOpts {
@@ -123,16 +137,18 @@ impl OutputArg {
                             .context(format!("failed to write `{}`", path.display()))?;
                     }
                     None => {
-                        if atty::is(atty::Stream::Stdout) {
+                        let mut stdout = std::io::stdout();
+                        if stdout.is_terminal() {
                             bail!("cannot print binary wasm output to a terminal, pass the `-t` flag to print the text format");
                         }
-                        std::io::stdout()
+                        stdout
                             .write_all(bytes)
                             .context("failed to write to stdout")?;
                     }
                 }
                 Ok(())
             }
+            Output::Json(s) => self.output_str(s),
         }
     }
 
@@ -164,7 +180,8 @@ impl OutputArg {
                 }
             }
             None => {
-                if color == ColorChoice::Auto && !atty::is(atty::Stream::Stdout) {
+                let stdout = std::io::stdout();
+                if color == ColorChoice::Auto && !stdout.is_terminal() {
                     Ok(Box::new(StandardStream::stdout(ColorChoice::Never)))
                 } else {
                     Ok(Box::new(StandardStream::stdout(color)))

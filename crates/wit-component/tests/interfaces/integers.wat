@@ -44,8 +44,13 @@
           (export (;18;) "multi-ret" (func (type 19)))
         )
       )
-      (export (;0;) (interface "foo:foo/integers") (instance (type 0)))
-      (type (;1;)
+      (export (;0;) "foo:foo/integers" (instance (type 0)))
+    )
+  )
+  (export (;1;) "integers" (type 0))
+  (type (;2;)
+    (component
+      (type (;0;)
         (component
           (type (;0;)
             (instance
@@ -90,14 +95,14 @@
               (export (;18;) "multi-ret" (func (type 19)))
             )
           )
-          (import (interface "foo:foo/integers") (instance (;0;) (type 0)))
+          (import "foo:foo/integers" (instance (;0;) (type 0)))
         )
       )
-      (export (;0;) (interface "foo:foo/integers-world") (component (type 1)))
+      (export (;0;) "foo:foo/integers-world" (component (type 0)))
     )
   )
+  (export (;3;) "integers-world" (type 2))
   (@producers
     (processed-by "wit-component" "$CARGO_PKG_VERSION")
   )
-  (export (;1;) (interface "foo:foo/wit") (type 0))
 )

@@ -1,7 +1,9 @@
-package foo:foo
+package foo:foo;
 
 interface foo {
-  record f {}
+  record f {
+    f: u32,
+  }
 
   record r {
     f: f,
@@ -10,6 +12,6 @@ interface foo {
 
 world module {
   export x: interface {
-    use foo.{r}
+    use foo.{r};
   }
 }

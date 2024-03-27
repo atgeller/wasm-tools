@@ -1,13 +1,15 @@
-package foo:foo
+package foo:foo;
 
 interface foo {
-  record foo {}
+  record foo {
+    f: u8,
+  }
 }
 
 world module {
   export bar: interface {
-    use foo.{foo as bar}
+    use foo.{foo as bar};
 
-    foo: func() -> bar
+    foo: func() -> bar;
   }
 }

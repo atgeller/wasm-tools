@@ -1,8 +1,8 @@
-package foo:foo
-
-interface foo {
-}
+package foo:foo;
 
 interface bar {
+}
+
+interface foo {
 }
 
